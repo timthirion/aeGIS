@@ -13,8 +13,6 @@ crate-type = ["cdylib", "rlib"]
 [[bin]]
 name = "aegis"
 path = "src/main.rs"
-# Skip the native binary on wasm; it depends on winit's native event loop.
-required-features = []
 
 [dependencies]
 # Core renderer + GPU
@@ -24,8 +22,8 @@ thiserror = "2"
 log = "0.4"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-winit = "0.30"
-pollster = "0.4"
+winit = "0.29"
+pollster = "0.3"
 env_logger = "0.11"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
@@ -36,7 +34,12 @@ web-sys = { version = "0.3", features = [
   "Document",
   "Element",
   "HtmlCanvasElement",
+  "HtmlElement",
   "Window",
+  "ResizeObserver",
+  "ResizeObserverEntry",
+  "DomRect",
+  "DomRectReadOnly",
   "console",
 ] }
 console_error_panic_hook = "0.1"
