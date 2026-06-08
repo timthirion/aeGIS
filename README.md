@@ -1,7 +1,7 @@
 # aeGIS
 
-[![CI](https://github.com/timthirion/aegis/actions/workflows/ci.yml/badge.svg)](https://github.com/timthirion/aegis/actions/workflows/ci.yml)
-[![Live demo](https://img.shields.io/badge/live-demo-brightgreen.svg)](https://timthirion.github.io/aegis/)
+[![CI](https://github.com/timthirion/aeGIS/actions/workflows/ci.yml/badge.svg)](https://github.com/timthirion/aeGIS/actions/workflows/ci.yml)
+[![Live demo](https://img.shields.io/badge/live-demo-brightgreen.svg)](https://timthirion.github.io/aeGIS/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Rust 2021](https://img.shields.io/badge/rust-2021_edition-orange.svg)](https://doc.rust-lang.org/edition-guide/rust-2021/index.html)
 [![WebGPU](https://img.shields.io/badge/runs_in-WebGPU-purple.svg)](https://wgpu.rs)
@@ -41,7 +41,7 @@ Early. The repo carries the project conventions
 ([`plans/0001-foundation.md`](plans/0001-foundation.md)) whose first
 milestone (`M0` — pixels on screen, native + web) ships a fullscreen-
 triangle gradient via `wgpu`. Live at
-[**timthirion.github.io/aegis**](https://timthirion.github.io/aegis/).
+[**timthirion.github.io/aeGIS**](https://timthirion.github.io/aeGIS/).
 
 See [`plans/ROADMAP.md`](plans/ROADMAP.md) for direction.
 

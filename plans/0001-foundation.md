@@ -3,7 +3,7 @@
 - **Status:** active
 - **Last updated:** 2026-06-08
 - **Last touched on:** M0 landed — wgpu surface + clear pass in both targets;
-  Pages deploy live at timthirion.github.io/aegis
+  Pages deploy live at timthirion.github.io/aeGIS
 
 ## Goal
 
@@ -125,7 +125,7 @@ tab; `cargo test` + `cargo clippy --all-targets -- -D warnings` +
 `cargo check --target wasm32-unknown-unknown --lib` all green.
   _Build-verified 2026-06-08: native `cargo run` builds + spawns the
   window cleanly; `wasm-pack build --target web` clean; CI green;
-  Pages deploy live at https://timthirion.github.io/aegis/.
+  Pages deploy live at https://timthirion.github.io/aeGIS/.
   **Visual confirmation pending** — I can't drive a real browser /
   desktop window from this environment; the bindings + bundle build
   correctly but the embedder should open both targets once to confirm

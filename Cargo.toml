@@ -4,7 +4,7 @@ version = "0.0.1"
 edition = "2021"
 license = "Apache-2.0"
 description = "Open-source GIS in Rust — pan, zoom, query a map in the browser or natively, from one codebase."
-repository = "https://github.com/timthirion/aegis"
+repository = "https://github.com/timthirion/aeGIS"
 readme = "README.md"
 
 [lib]
