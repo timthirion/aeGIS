@@ -2,8 +2,8 @@
 
 - **Status:** active
 - **Last updated:** 2026-06-08
-- **Last touched on:** M1.5 "first tile" — Chicago at z=10 fetched from
-  OSM + rendered via the textured-quad pass in both targets
+- **Last touched on:** M1/M2 interactive — drag-to-pan, wheel-to-zoom-
+  around-cursor, multi-tile rendering, mpsc-driven async tile cache
 
 ## Goal
 
@@ -149,7 +149,7 @@ in a separate plan if/when needed.
   uses `::new_without_display_handle()` as its base for cross-target
   compatibility.
 
-### M1 — Camera + viewport + Web Mercator math
+### M1 — Camera + viewport + Web Mercator math ✅ DONE
 
 - [x] `core::crs` — forward + inverse Spherical Mercator (`lonlat_to_world`
       / `world_to_lonlat`) + tile-coordinate math
@@ -163,17 +163,35 @@ in a separate plan if/when needed.
       quadrants around (0°, 0°) each fall into their expected tile,
       Chicago at z=10 = `(10, 262, 380)` and the corresponding OSM
       URL is `tile.openstreetmap.org/10/262/380.png`.
-- [ ] `visible_tiles(camera, viewport) -> Vec<TileId>` — depends on
-      the camera (next sub-item).
-- [ ] `core::camera` — pan + zoom + wheel state; produces a
-      `Mat4` for the WGSL projection uniform.
-- [ ] Input glue: native `winit` mouse drag → camera pan; web canvas
-      pointer events → same.
-- [ ] Render the visible-tile rectangle outlines as a debug overlay
-      (no tile fetch yet — proves the tile-selection math).
+- [x] `Camera::visible_tiles(canvas) -> Vec<TileId>` — selects tiles
+      at `round(zoom)`, clamps indices to `[0, n-1]` per axis. Tests
+      pin "z=0 has exactly one tile" + "Chicago z=10 800×600 viewport
+      contains the Chicago tile and a reasonable [4, 16] count."
+      **Limitation:** antimeridian-wrap not handled — documented as
+      deferred to a wrap-aware iteration.
+- [x] `core::camera` — `pan(dx, dy)` (mouse-drag convention),
+      `zoom_at(delta, cursor, canvas)` (wheel-around-cursor; the
+      world point under the cursor stays pinned). `tile_ndc_rect`
+      gives the renderer per-tile screen quads at any fractional
+      zoom. The `Mat4` projection uniform turned out unnecessary —
+      the renderer reads `tile_ndc_rect` directly per tile.
+- [x] Input glue: native `winit` left-mouse-drag → `camera.pan`,
+      mouse-wheel → `camera.zoom_at`. Web pointer events
+      (`pointerdown`/`move`/`up`/`cancel`/`leave`) → same, with
+      `WheelEvent.delta_y` inverted so scroll-down = zoom-out
+      (matches every browser map's convention).
+- [ ] ~~Render the visible-tile rectangle outlines as a debug overlay
+      (no tile fetch yet — proves the tile-selection math).~~ Skipped:
+      M1/M2 lands the visible-tile-selection + actual-tile-rendering
+      together (the wireframe debug overlay would only have been
+      useful before fetches worked, which is no longer the state we
+      pass through).
 
 **Done when:** pan and zoom interactively in both targets show the
-correct visible-tile grid as wireframe overlays at every zoom level.
+correct visible-tile grid. _Confirmed buildable 2026-06-08: native +
+wasm clean, 22 tests passing, wasm bundle 312 KB after wasm-opt.
+**Visual confirmation pending** — embedder should drag + scroll on
+the live URL to confirm the interaction feels right._
 
 ### M1.5 — First tile (the "we have a map" stop) ✅ DONE
 
@@ -231,17 +249,28 @@ the same fetch behaviour with no `Send` requirement, in ~20 lines.
       chosen as the M2 source for dev/low-volume traffic only; the
       Protomaps PMTiles path lands in plan 0004 (Phase 4).
 - [x] Single-tile blocking fetch (native) + async fetch (web) —
-      shipped in M1.5. The channel-driven multi-tile version comes
-      next.
-- [x] PNG decode → `wgpu::Texture` upload — shipped in M1.5 for one
-      tile.
-- [x] `shaders/tile.wgsl` textured-quad pass — shipped in M1.5 for
-      one tile. The "one draw per visible tile" generalisation comes
-      with the camera (M1 next).
+      shipped in M1.5.
+- [x] PNG decode → `wgpu::Texture` upload — generalised from M1.5's
+      one-tile path to a keyed `HashMap<TileId, TileBinding>` in the
+      multi-tile renderer (M1/M2 commit).
+- [x] `shaders/tile.wgsl` textured-quad pass — generalised to take a
+      per-tile NDC-rect uniform; one draw call per visible tile.
+- [x] Channel-driven multi-tile async fetcher — `Renderer` owns an
+      `mpsc::channel<(TileId, Result<DecodedTile, String>)>`; each
+      visible tile not yet loaded triggers a background fetch
+      (`std::thread::spawn` native / `wasm_bindgen_futures::spawn_local`
+      web) whose closure posts the decoded result back. `requested`
+      HashSet de-dupes in-flight requests. `drain_completed_fetches`
+      uploads results each frame.
+- [ ] LRU eviction by tile-count — deferred. Tiles accumulate
+      indefinitely for now; at zoom 10 over the metro Chicago area
+      the working set is small (~15 tiles), and even pan-around-the-
+      city stays well under a few hundred. Eviction lands when M3
+      (vector overlay) increases per-tile memory or when zoom-in /
+      zoom-out behaviour produces growth across multiple zoom levels.
 - [ ] `core::tile::source` — `RasterTileSource` trait abstracting
       the URL builder; OSM is one impl, Protomaps another (Phase 4).
-- [ ] Channel-driven multi-tile async fetcher with in-memory LRU
-      cache keyed by `(source, z, x, y)`.
+      Deferred until the second source actually exists.
 - [ ] Attribution overlay: an HTML `<div>` (web) or `winit` window
       title bar entry (native) carrying the required attribution
       string. `attributionsFor(layer)` API placeholder.

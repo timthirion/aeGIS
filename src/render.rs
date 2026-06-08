@@ -1,17 +1,39 @@
-//! Renderer core — owns the wgpu `Device`, `Queue`, `Surface`, and the
-//! pipelines. Platform-agnostic; the native and web entry points
-//! construct one and call `render()` per frame.
+//! Renderer core — owns the wgpu `Device`, `Queue`, `Surface`, the
+//! pipelines, the camera, and the tile cache.
 //!
-//! M0 was a single clear pass. M1.5 ("first tile") adds the textured-
-//! quad tile pass on top: when [`Renderer::set_tile`] has been called,
-//! `render()` draws the tile; otherwise the M0 gradient still shows as
-//! a loading/fallback state.
+//! ## Architecture
+//!
+//! Each frame the renderer:
+//! 1. **Drains** any tile-fetch completions that arrived since the last
+//!    frame and uploads the bytes to GPU textures.
+//! 2. **Ensures** the currently-visible tile set has been requested
+//!    (spawning background fetches for anything not already loaded or
+//!    in flight).
+//! 3. **Draws** every visible loaded tile as a quad in screen-NDC,
+//!    using the camera's `tile_ndc_rect` to position each one. The
+//!    M0 gradient stays as the fallback when no tiles are loaded yet
+//!    (initial frame on a cold cache).
+//!
+//! ## Threading
+//!
+//! Native fetches spawn a `std::thread` per request and post their
+//! result back via `std::sync::mpsc`. Web fetches use
+//! `wasm_bindgen_futures::spawn_local` — single-threaded but
+//! `mpsc::Sender` still works as the in-process handoff.
+
+use std::collections::{HashMap, HashSet};
+use std::sync::mpsc;
 
 use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
 
+use crate::camera::Camera;
+use crate::tile::{self, DecodedTile, TileId, CHICAGO_LONLAT};
+
 const CLEAR_SHADER: &str = include_str!("shaders/clear.wgsl");
 const TILE_SHADER: &str = include_str!("shaders/tile.wgsl");
+
+const TILE_UNIFORM_SIZE: u64 = std::mem::size_of::<TileUniforms>() as u64;
 
 /// Construct a wgpu instance suitable for both native and browser targets.
 pub fn make_instance() -> wgpu::Instance {
@@ -24,16 +46,20 @@ pub fn make_instance() -> wgpu::Instance {
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default, Pod, Zeroable)]
 struct TileUniforms {
-    // (sx, sy): aspect-correction multipliers in NDC. Padded to 16 B.
-    scale: [f32; 2],
-    _padding: [f32; 2],
+    /// Tile quad rect in NDC: (x_min, y_min, x_max, y_max).
+    rect: [f32; 4],
 }
 
-/// A raster tile that's been uploaded to the GPU and is ready to render.
+/// A raster tile that's been uploaded to the GPU.
 struct TileBinding {
+    /// Kept alive so the bind-group's texture view stays valid.
+    _texture: wgpu::Texture,
+    uniform_buf: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
-    aspect: f32, // tile_w / tile_h — square tiles are 1.0
 }
+
+/// Fetch completion delivered to the renderer's tile-load channel.
+type TileFetchResult = (TileId, Result<DecodedTile, String>);
 
 /// The renderer's per-window/canvas state. One `Renderer` per surface;
 /// keep alive for the lifetime of the surface it owns.
@@ -48,12 +74,23 @@ pub struct Renderer {
     tile_pipeline: wgpu::RenderPipeline,
     tile_bgl: wgpu::BindGroupLayout,
     tile_sampler: wgpu::Sampler,
-    tile_uniforms_buf: wgpu::Buffer,
-    tile: Option<TileBinding>,
+
+    /// Tiles that have been decoded + uploaded to the GPU.
+    tiles: HashMap<TileId, TileBinding>,
+    /// Tile IDs with a fetch in flight (de-dupes repeated requests
+    /// while the user pans across the same set).
+    requested: HashSet<TileId>,
+    completed_tx: mpsc::Sender<TileFetchResult>,
+    completed_rx: mpsc::Receiver<TileFetchResult>,
+
+    /// Camera state. Public for direct mutation by input handlers
+    /// (`renderer.camera.pan(...)`, `renderer.camera.zoom_at(...)`).
+    pub camera: Camera,
 }
 
 impl Renderer {
-    /// Initialise a renderer against the given surface.
+    /// Initialise a renderer against the given surface. Camera defaults
+    /// to Chicago at zoom 10 — the plan 0001 "first tile" position.
     pub async fn new(
         instance: wgpu::Instance,
         surface: wgpu::Surface<'static>,
@@ -85,12 +122,8 @@ impl Renderer {
             .expect("failed to create device");
 
         let surface_caps = surface.get_capabilities(&adapter);
-        // Prefer an sRGB surface so PNG-sourced tile pixels (sRGB-
-        // encoded per spec) render with correct gamma end-to-end: the
-        // GPU's automatic sRGB→linear on texture read + linear→sRGB on
-        // surface write cancel out. The M0 gradient was hand-tuned in
-        // linear-ish space; on an sRGB surface it reads slightly more
-        // saturated, which is fine for a fallback / loading state.
+        // Prefer sRGB surface so PNG-sourced sRGB bytes render correctly
+        // (auto sRGB↔linear conversions cancel — see M1.5 commit notes).
         let format = surface_caps
             .formats
             .iter()
@@ -156,11 +189,7 @@ impl Renderer {
             ..Default::default()
         });
 
-        let tile_uniforms_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("aegis-tile-uniforms"),
-            contents: bytemuck::bytes_of(&TileUniforms::default()),
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        });
+        let (completed_tx, completed_rx) = mpsc::channel();
 
         Renderer {
             surface,
@@ -171,8 +200,11 @@ impl Renderer {
             tile_pipeline,
             tile_bgl,
             tile_sampler,
-            tile_uniforms_buf,
-            tile: None,
+            tiles: HashMap::new(),
+            requested: HashSet::new(),
+            completed_tx,
+            completed_rx,
+            camera: Camera::new(CHICAGO_LONLAT.0, CHICAGO_LONLAT.1, 10.0),
         }
     }
 
@@ -181,8 +213,7 @@ impl Renderer {
         (self.config.width, self.config.height)
     }
 
-    /// Reconfigure the surface to a new drawable size and refresh the
-    /// tile-aspect uniform.
+    /// Reconfigure the surface to a new drawable size.
     pub fn resize(&mut self, width: u32, height: u32) {
         let (w, h) = (width.max(1), height.max(1));
         if w == self.config.width && h == self.config.height {
@@ -191,17 +222,15 @@ impl Renderer {
         self.config.width = w;
         self.config.height = h;
         self.surface.configure(&self.device, &self.config);
-        self.refresh_tile_uniforms();
     }
 
-    /// Upload an RGBA raster tile (e.g. 256×256 from PNG decode) and
-    /// bind it as the current tile. Subsequent `render()` calls draw it
-    /// in place of the fallback clear-gradient.
-    pub fn set_tile(&mut self, width: u32, height: u32, rgba: &[u8]) {
+    /// Upload an RGBA raster tile and bind it under `id`. Idempotent —
+    /// repeated calls with the same id replace the existing binding.
+    pub fn upload_tile(&mut self, id: TileId, width: u32, height: u32, rgba: &[u8]) {
         assert_eq!(
             rgba.len(),
             (width * height * 4) as usize,
-            "set_tile: rgba.len()={} doesn't match {width}×{height}×4",
+            "upload_tile {id:?}: rgba.len()={} doesn't match {width}×{height}×4",
             rgba.len()
         );
 
@@ -215,8 +244,6 @@ impl Renderer {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            // sRGB so PNG-sourced bytes are decoded to linear on sample;
-            // the surface (also sRGB) re-encodes on present.
             format: wgpu::TextureFormat::Rgba8UnormSrgb,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
@@ -242,13 +269,21 @@ impl Renderer {
         );
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
 
+        let uniform_buf = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("aegis-tile-uniform"),
+                contents: bytemuck::bytes_of(&TileUniforms::default()),
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            });
+
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("aegis-tile-bg"),
             layout: &self.tile_bgl,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: self.tile_uniforms_buf.as_entire_binding(),
+                    resource: uniform_buf.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
@@ -261,37 +296,96 @@ impl Renderer {
             ],
         });
 
-        self.tile = Some(TileBinding {
-            bind_group,
-            aspect: width as f32 / height as f32,
+        self.requested.remove(&id);
+        self.tiles.insert(
+            id,
+            TileBinding {
+                _texture: texture,
+                uniform_buf,
+                bind_group,
+            },
+        );
+    }
+
+    /// Pump any tile-fetch completions that arrived since the last
+    /// frame — uploads successful ones to the GPU; drops failures.
+    pub fn drain_completed_fetches(&mut self) {
+        loop {
+            match self.completed_rx.try_recv() {
+                Ok((id, Ok(decoded))) => {
+                    self.upload_tile(id, decoded.width, decoded.height, &decoded.rgba);
+                }
+                Ok((id, Err(e))) => {
+                    self.requested.remove(&id);
+                    log::warn!("tile fetch failed for {id:?}: {e}");
+                }
+                Err(mpsc::TryRecvError::Empty) | Err(mpsc::TryRecvError::Disconnected) => break,
+            }
+        }
+    }
+
+    /// Ensure every currently-visible tile is either loaded or has a
+    /// fetch in flight. Cheap to call every frame.
+    pub fn ensure_visible_tiles(&mut self) {
+        let visible = self.camera.visible_tiles(self.size());
+        for id in visible {
+            if self.tiles.contains_key(&id) || self.requested.contains(&id) {
+                continue;
+            }
+            self.requested.insert(id);
+            self.dispatch_tile_fetch(id);
+        }
+    }
+
+    /// Native: spawn a thread per tile request that performs the
+    /// blocking HTTP fetch + PNG decode and posts the result back on
+    /// the completion channel.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn dispatch_tile_fetch(&self, id: TileId) {
+        let tx = self.completed_tx.clone();
+        let url = id.osm_url();
+        std::thread::spawn(move || {
+            let result = tile::fetch_tile_blocking(&url);
+            let _ = tx.send((id, result));
         });
-        self.refresh_tile_uniforms();
-        log::info!("set_tile: uploaded {width}×{height} RGBA tile");
     }
 
-    fn refresh_tile_uniforms(&self) {
-        let Some(tile) = &self.tile else { return };
-        let (cw, ch) = (self.config.width as f32, self.config.height as f32);
-        let canvas_aspect = cw / ch;
-        let scale = if canvas_aspect >= tile.aspect {
-            // Canvas wider than the tile: shrink X (pillarbox the
-            // sides).
-            [tile.aspect / canvas_aspect, 1.0]
-        } else {
-            // Canvas taller than the tile: shrink Y (letterbox top +
-            // bottom).
-            [1.0, canvas_aspect / tile.aspect]
-        };
-        let u = TileUniforms {
-            scale,
-            _padding: [0.0; 2],
-        };
-        self.queue
-            .write_buffer(&self.tile_uniforms_buf, 0, bytemuck::bytes_of(&u));
+    /// Web: spawn a JS-event-loop task per tile request. Same
+    /// completion-channel handoff (mpsc works fine on wasm — it's
+    /// single-threaded but the channel synchronises within the thread).
+    #[cfg(target_arch = "wasm32")]
+    fn dispatch_tile_fetch(&self, id: TileId) {
+        let tx = self.completed_tx.clone();
+        let url = id.osm_url();
+        wasm_bindgen_futures::spawn_local(async move {
+            let result = tile::fetch_tile_web(&url).await;
+            let _ = tx.send((id, result));
+        });
     }
 
-    /// Draw one frame.
+    /// Draw one frame. Reads the camera's current state to pick + place
+    /// visible tiles; tiles not yet loaded are skipped this frame and
+    /// will appear in a subsequent frame once their fetch completes.
     pub fn render(&self) {
+        let canvas = self.size();
+        let visible = self.camera.visible_tiles(canvas);
+
+        // Pre-compute (tile, ndc_rect) pairs for every visible loaded
+        // tile, then upload each rect into its own per-tile uniform
+        // buffer. Doing the uploads in a single sweep before the render
+        // pass keeps the pass's hot loop free of queue writes.
+        let draws: Vec<(&TileId, [f32; 4])> = visible
+            .iter()
+            .filter(|id| self.tiles.contains_key(id))
+            .map(|id| (id, self.camera.tile_ndc_rect(*id, canvas)))
+            .collect();
+        for (id, rect) in &draws {
+            let binding = &self.tiles[*id];
+            let u = TileUniforms { rect: *rect };
+            self.queue
+                .write_buffer(&binding.uniform_buf, 0, bytemuck::bytes_of(&u));
+        }
+
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(t)
             | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
@@ -321,12 +415,9 @@ impl Renderer {
                     resolve_target: None,
                     depth_slice: None,
                     ops: wgpu::Operations {
-                        // Background letterbox colour: a dark
-                        // near-black (matches the UI chrome in
-                        // index.html). On the sRGB surface the GPU
-                        // re-encodes the linear value we write, so
-                        // these are linear-space coordinates for the
-                        // sRGB display target #0b0e12.
+                        // Background colour (linear-space coords for an
+                        // sRGB display target of #0b0e12 — matches the
+                        // UI chrome in index.html).
                         load: wgpu::LoadOp::Clear(wgpu::Color {
                             r: 0.0144,
                             g: 0.0181,
@@ -342,12 +433,16 @@ impl Renderer {
                 multiview_mask: None,
             });
 
-            if let Some(tile) = &self.tile {
+            if !draws.is_empty() {
                 pass.set_pipeline(&self.tile_pipeline);
-                pass.set_bind_group(0, &tile.bind_group, &[]);
-                pass.draw(0..3, 0..1);
+                for (id, _) in &draws {
+                    let binding = &self.tiles[*id];
+                    pass.set_bind_group(0, &binding.bind_group, &[]);
+                    pass.draw(0..6, 0..1);
+                }
             } else {
-                // Fallback / loading state — the M0 gradient.
+                // Cold cache (nothing loaded yet) — show the M0
+                // gradient as a "loading" state.
                 pass.set_pipeline(&self.clear_pipeline);
                 pass.draw(0..3, 0..1);
             }
@@ -453,3 +548,12 @@ fn build_tile_pipeline(
         cache: None,
     })
 }
+
+// `TILE_UNIFORM_SIZE` is `pub(crate)`-readable for future use but isn't
+// referenced from the renderer directly — keep it next to the struct
+// it describes so future bind-group-dynamic-offset code can pick it
+// up without re-deriving.
+#[allow(dead_code)]
+const _: () = {
+    let _ = TILE_UNIFORM_SIZE;
+};

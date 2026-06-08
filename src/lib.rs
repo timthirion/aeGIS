@@ -25,7 +25,7 @@ pub mod web;
 pub fn run() {
     use std::sync::Arc;
     use winit::{
-        event::{ElementState, Event, KeyEvent, WindowEvent},
+        event::{ElementState, Event, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent},
         event_loop::EventLoop,
         keyboard::{KeyCode, PhysicalKey},
         window::WindowBuilder,
@@ -50,19 +50,11 @@ pub fn run() {
         size.width.max(1),
         size.height.max(1),
     ));
+    // The renderer's `ensure_visible_tiles` fires the initial fetches
+    // automatically on the first frame — no manual prefetch needed.
 
-    // Plan 0001 "first tile" — block on a single OSM tile centred on
-    // Chicago at zoom 10. Future milestones replace this with the
-    // viewport-driven tile selector (M2) + camera-driven projection
-    // (M1).
-    let (lon, lat) = tile::CHICAGO_LONLAT;
-    let tile_id = tile::TileId::from_lonlat(10, lon, lat);
-    let url = tile_id.osm_url();
-    log::info!("fetching startup tile: {url}");
-    match tile::fetch_tile_blocking(&url) {
-        Ok(decoded) => renderer.set_tile(decoded.width, decoded.height, &decoded.rgba),
-        Err(e) => log::warn!("startup tile fetch failed ({e}); showing fallback gradient"),
-    }
+    let mut cursor_px: (f64, f64) = (0.0, 0.0);
+    let mut dragging = false;
 
     event_loop
         .run(move |event, elwt| {
@@ -82,7 +74,37 @@ pub fn run() {
                         ..
                     } => elwt.exit(),
                     WindowEvent::Resized(s) => renderer.resize(s.width, s.height),
+                    WindowEvent::MouseInput {
+                        state: btn_state,
+                        button: MouseButton::Left,
+                        ..
+                    } => {
+                        dragging = btn_state == ElementState::Pressed;
+                    }
+                    WindowEvent::CursorMoved { position, .. } => {
+                        let new_cursor = (position.x, position.y);
+                        if dragging {
+                            let dx = new_cursor.0 - cursor_px.0;
+                            let dy = new_cursor.1 - cursor_px.1;
+                            renderer.camera.pan(dx, dy);
+                        }
+                        cursor_px = new_cursor;
+                    }
+                    WindowEvent::MouseWheel { delta, .. } => {
+                        let zoom_delta = match delta {
+                            // One scroll line ≈ half a zoom step.
+                            MouseScrollDelta::LineDelta(_, y) => y as f64 * 0.5,
+                            // Trackpad: tunable to taste — 0.005 / pixel
+                            // gives ~1 zoom per 200 px of vertical pan.
+                            MouseScrollDelta::PixelDelta(p) => p.y * 0.005,
+                        };
+                        renderer
+                            .camera
+                            .zoom_at(zoom_delta, cursor_px, renderer.size());
+                    }
                     WindowEvent::RedrawRequested => {
+                        renderer.drain_completed_fetches();
+                        renderer.ensure_visible_tiles();
                         renderer.render();
                         window.request_redraw();
                     }

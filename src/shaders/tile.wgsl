@@ -1,17 +1,12 @@
-// Textured-quad pass: samples a single raster tile and draws it as a
-// fullscreen-triangle scaled to preserve the tile's aspect ratio.
-//
-// M1.5 — the "first tile" stop on plan 0001's slope toward a full
-// slippy map. M2 generalises this to N visible tiles, projected through
-// a Web Mercator camera matrix.
+// Textured-quad pass: samples one raster tile and draws it at a
+// per-tile rectangle in screen-NDC. One draw call per visible tile;
+// the rect comes from the `Camera::tile_ndc_rect` for the camera's
+// current pan/zoom state.
 
 struct Uniforms {
-    // (sx, sy): per-axis NDC scale applied to the fullscreen triangle
-    // so the tile preserves its 1:1 aspect ratio inside the canvas.
-    // The unused tile of NDC outside the scaled quad gets the clear
-    // colour (LoadOp::Clear) — letterbox / pillarbox.
-    scale: vec2<f32>,
-    _padding: vec2<f32>,
+    // Tile quad in NDC: (x_min, y_min, x_max, y_max). Padded to
+    // 16-byte alignment by being a single vec4.
+    rect: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -25,19 +20,18 @@ struct VsOut {
 
 @vertex
 fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
-    // Same fullscreen-triangle trick as `clear.wgsl` — xy ∈ {(0,0),
-    // (2,0), (0,2)}.
-    let xy = vec2<f32>(
-        f32((vi << 1u) & 2u),
-        f32(vi & 2u),
+    // 6-vertex quad as two triangles (CCW winding).
+    var positions = array<vec2<f32>, 6>(
+        vec2<f32>(0.0, 0.0), vec2<f32>(1.0, 0.0), vec2<f32>(0.0, 1.0),
+        vec2<f32>(1.0, 0.0), vec2<f32>(1.0, 1.0), vec2<f32>(0.0, 1.0),
     );
+    let p = positions[vi];
     var out: VsOut;
-    let ndc = (xy * 2.0 - 1.0) * u.scale;
+    let ndc = mix(u.rect.xy, u.rect.zw, p);
     out.clip = vec4<f32>(ndc, 0.0, 1.0);
-    // UVs: the tile is stored top-down (PNG row 0 = north edge), and
-    // WebGPU's NDC y is +up. Mapping `(1 - xy.y)` puts the texture's
-    // top row at clip-space y = +1 (top of screen).
-    out.uv = vec2<f32>(xy.x, 1.0 - xy.y);
+    // PNG row 0 = top-of-tile; map it to NDC y_max (top of quad).
+    // p.y = 1 (top of quad) → uv.y = 0 (top of texture).
+    out.uv = vec2<f32>(p.x, 1.0 - p.y);
     return out;
 }
 

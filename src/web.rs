@@ -1,13 +1,14 @@
 //! wasm-bindgen entry points for the browser build.
 //!
-//! M0: `start(host_id)` finds a host element by id, appends a `<canvas>`
+//! Single-instance for the foundation phase — the embedder-API
+//! multi-instance shape lands in M4 of plan 0001.
+//!
+//! `start(host_id)` finds a host element by id, appends a `<canvas>`
 //! sized to the host's CSS box × device pixel ratio, attaches a `wgpu`
 //! surface to it, and drives a `requestAnimationFrame` loop. A
-//! `ResizeObserver` keeps the backing-store size in sync with the host's
-//! CSS size.
-//!
-//! Single-instance for M0 — the embedder-API multi-instance shape lands
-//! in M4 ([[project-direction]] Phase 0 plan 0001).
+//! `ResizeObserver` keeps the backing-store size in sync with the
+//! host's CSS size; pointer + wheel listeners route drag-to-pan and
+//! wheel-to-zoom into the renderer's `Camera`.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -15,7 +16,6 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 
 use crate::render::{make_instance, Renderer};
-use crate::tile;
 
 #[wasm_bindgen(start)]
 pub fn on_module_load() {
@@ -48,11 +48,16 @@ fn backing_size(host: &web_sys::Element) -> (u32, u32) {
     (w.max(1), h.max(1))
 }
 
-/// State shared between the rAF tick and the resize-observer callback.
-/// Held in `Cell` (not `RefCell`) so the observer never collides with the
-/// mutable borrow held during a render.
+/// State shared between the rAF tick and the observer callbacks.
+/// Held in `Cell` (not `RefCell`) so the observer never collides with
+/// the mutable borrow held during a render.
 struct Shared {
     pending_resize: Cell<Option<(u32, u32)>>,
+    /// `(x, y)` of the most recent pointer event in **physical** pixels
+    /// (CSS px × devicePixelRatio) so the camera operates in the same
+    /// space as the wgpu surface.
+    cursor_px: Cell<(f64, f64)>,
+    dragging: Cell<bool>,
 }
 
 struct Inner {
@@ -68,19 +73,54 @@ impl Inner {
             self.canvas.set_height(h);
             self.renderer.resize(w, h);
         }
+        self.renderer.drain_completed_fetches();
+        self.renderer.ensure_visible_tiles();
         self.renderer.render();
     }
 }
 
+/// A listener kept alive for the lifetime of the widget. Drop removes
+/// the registration so a hot-reloaded wasm module doesn't accumulate
+/// duplicate handlers on the host element.
+struct ListenerHandle {
+    target: web_sys::EventTarget,
+    event: &'static str,
+    closure: Closure<dyn FnMut(web_sys::Event)>,
+}
+
+impl Drop for ListenerHandle {
+    fn drop(&mut self) {
+        let _ = self
+            .target
+            .remove_event_listener_with_callback(self.event, self.closure.as_ref().unchecked_ref());
+    }
+}
+
+fn attach(
+    target: &web_sys::EventTarget,
+    event: &'static str,
+    closure: Closure<dyn FnMut(web_sys::Event)>,
+    listeners: &mut Vec<ListenerHandle>,
+) -> Result<(), JsValue> {
+    target.add_event_listener_with_callback(event, closure.as_ref().unchecked_ref())?;
+    listeners.push(ListenerHandle {
+        target: target.clone(),
+        event,
+        closure,
+    });
+    Ok(())
+}
+
 /// A live aeGIS renderer bound to a host element. Keep this handle alive
 /// for the lifetime of the widget — dropping it stops the rAF loop and
-/// detaches the resize observer.
+/// detaches the resize observer + pointer listeners.
 #[wasm_bindgen]
 pub struct AegisInstance {
     _inner: Rc<RefCell<Inner>>,
     _raf: Rc<RefCell<Option<Closure<dyn FnMut()>>>>,
     _resize_observer: web_sys::ResizeObserver,
     _resize_cb: Closure<dyn FnMut()>,
+    _listeners: Vec<ListenerHandle>,
 }
 
 /// Attach an aeGIS renderer to the element with the given id. The host
@@ -119,6 +159,8 @@ pub async fn start(host_id: String) -> Result<AegisInstance, JsValue> {
 
     let shared = Rc::new(Shared {
         pending_resize: Cell::new(None),
+        cursor_px: Cell::new((0.0, 0.0)),
+        dragging: Cell::new(false),
     });
     let inner = Rc::new(RefCell::new(Inner {
         renderer,
@@ -151,31 +193,121 @@ pub async fn start(host_id: String) -> Result<AegisInstance, JsValue> {
     let resize_observer = web_sys::ResizeObserver::new(resize_cb.as_ref().unchecked_ref())?;
     resize_observer.observe(&host);
 
-    // Plan 0001 "first tile" — kick off a single OSM tile fetch
-    // centred on Chicago at zoom 10. The fetch is fire-and-forget;
-    // the callback runs on the JS event loop when bytes arrive, then
-    // borrows `inner` (the rAF tick can't be borrowing concurrently
-    // because JS callbacks run sequentially on the main thread).
-    let (lon, lat) = tile::CHICAGO_LONLAT;
-    let tile_id = tile::TileId::from_lonlat(10, lon, lat);
-    let url = tile_id.osm_url();
-    log::info!("fetching startup tile: {url}");
-    let inner_for_fetch = inner.clone();
-    tile::fetch_tile_async(&url, move |result| match result {
-        Ok(decoded) => {
-            inner_for_fetch.borrow_mut().renderer.set_tile(
-                decoded.width,
-                decoded.height,
-                &decoded.rgba,
-            );
-        }
-        Err(e) => log::warn!("startup tile fetch failed ({e}); showing fallback gradient"),
-    });
+    // Pointer + wheel listeners. Cursor coords come in as **CSS pixels**
+    // relative to the canvas; multiply by devicePixelRatio to match the
+    // physical-pixel space the camera works in.
+    let mut listeners: Vec<ListenerHandle> = Vec::new();
+    let canvas_target: web_sys::EventTarget = canvas.clone().into();
+
+    fn cursor_from_event(
+        e: &web_sys::MouseEvent,
+        canvas: &web_sys::HtmlCanvasElement,
+    ) -> (f64, f64) {
+        let rect = canvas.get_bounding_client_rect();
+        let dpr = web_window().device_pixel_ratio().max(1.0);
+        (
+            (e.client_x() as f64 - rect.left()) * dpr,
+            (e.client_y() as f64 - rect.top()) * dpr,
+        )
+    }
+
+    // pointerdown — start drag.
+    attach(
+        &canvas_target,
+        "pointerdown",
+        {
+            let shared = shared.clone();
+            let canvas = canvas.clone();
+            Closure::wrap(Box::new(move |e: web_sys::Event| {
+                if let Ok(m) = e.dyn_into::<web_sys::MouseEvent>() {
+                    shared.cursor_px.set(cursor_from_event(&m, &canvas));
+                    shared.dragging.set(true);
+                }
+            }) as Box<dyn FnMut(web_sys::Event)>)
+        },
+        &mut listeners,
+    )?;
+
+    // pointermove — pan while dragging.
+    attach(
+        &canvas_target,
+        "pointermove",
+        {
+            let shared = shared.clone();
+            let canvas = canvas.clone();
+            let inner = inner.clone();
+            Closure::wrap(Box::new(move |e: web_sys::Event| {
+                if let Ok(m) = e.dyn_into::<web_sys::MouseEvent>() {
+                    let new_cursor = cursor_from_event(&m, &canvas);
+                    if shared.dragging.get() {
+                        let prev = shared.cursor_px.get();
+                        let dx = new_cursor.0 - prev.0;
+                        let dy = new_cursor.1 - prev.1;
+                        inner.borrow_mut().renderer.camera.pan(dx, dy);
+                    }
+                    shared.cursor_px.set(new_cursor);
+                }
+            }) as Box<dyn FnMut(web_sys::Event)>)
+        },
+        &mut listeners,
+    )?;
+
+    // pointerup / pointercancel / pointerleave — end drag.
+    let make_release = || {
+        let shared = shared.clone();
+        Closure::wrap(Box::new(move |_e: web_sys::Event| {
+            shared.dragging.set(false);
+        }) as Box<dyn FnMut(web_sys::Event)>)
+    };
+    attach(&canvas_target, "pointerup", make_release(), &mut listeners)?;
+    attach(
+        &canvas_target,
+        "pointercancel",
+        make_release(),
+        &mut listeners,
+    )?;
+    attach(
+        &canvas_target,
+        "pointerleave",
+        make_release(),
+        &mut listeners,
+    )?;
+
+    // wheel — zoom around the cursor. Browsers' WheelEvent.deltaY is
+    // positive when scrolling **down** (towards the user), which we
+    // map to "zoom out" by inverting the sign.
+    attach(
+        &canvas_target,
+        "wheel",
+        {
+            let shared = shared.clone();
+            let canvas = canvas.clone();
+            let inner = inner.clone();
+            Closure::wrap(Box::new(move |e: web_sys::Event| {
+                if let Ok(w) = e.dyn_into::<web_sys::WheelEvent>() {
+                    w.prevent_default(); // stop the page from scrolling
+                    let cursor = cursor_from_event(w.as_ref(), &canvas);
+                    shared.cursor_px.set(cursor);
+                    let canvas_size = inner.borrow().renderer.size();
+                    // 0.005 per pixel-delta gives a 1 zoom step per
+                    // ~200 px of trackpad pan — comfortable.
+                    let zoom_delta = -w.delta_y() * 0.005;
+                    inner
+                        .borrow_mut()
+                        .renderer
+                        .camera
+                        .zoom_at(zoom_delta, cursor, canvas_size);
+                }
+            }) as Box<dyn FnMut(web_sys::Event)>)
+        },
+        &mut listeners,
+    )?;
 
     Ok(AegisInstance {
         _inner: inner,
         _raf: raf,
         _resize_observer: resize_observer,
         _resize_cb: resize_cb,
+        _listeners: listeners,
     })
 }

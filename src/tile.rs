@@ -115,8 +115,10 @@ pub fn fetch_tile_async(url: &str, on_done: impl 'static + FnOnce(Result<Decoded
     });
 }
 
+/// Async tile fetch via the browser's `fetch` API. Used by the
+/// renderer's per-tile dispatcher (spawn_local).
 #[cfg(target_arch = "wasm32")]
-async fn fetch_tile_web(url: &str) -> Result<DecodedTile, String> {
+pub async fn fetch_tile_web(url: &str) -> Result<DecodedTile, String> {
     use wasm_bindgen::JsCast;
     use wasm_bindgen_futures::JsFuture;
 
