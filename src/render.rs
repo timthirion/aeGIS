@@ -46,15 +46,33 @@ pub fn make_instance() -> wgpu::Instance {
     })
 }
 
+/// Per-tile uniform. Carries the tile's world-Mercator extent plus
+/// the full camera state — the tile shader tessellates the quad into
+/// a grid and runs the same flat ↔ sphere projection as the vector
+/// pass per vertex, so tiles wrap onto the globe at low zoom instead
+/// of just fading out.
+///
+/// Layout — five `vec4` rows (80 bytes):
+/// ```text
+/// row 0: world_rect.xyxy (xmin, ymin, xmax, ymax in normalised Mercator)
+/// row 1: world_center.xy | pixels_per_world | globeness
+/// row 2: canvas_half.xy  | center_lonlat_rad.xy
+/// row 3: globe_scale     | _pad.xyz
+/// row 4: _pad2.xyzw                  (kept so the struct is a multiple
+///                                     of vec4 even after future growth)
+/// ```
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default, Pod, Zeroable)]
 struct TileUniforms {
-    /// Tile quad rect in NDC: (x_min, y_min, x_max, y_max).
-    rect: [f32; 4],
-    /// Phase 9 globe-view fade — `(1 - globeness)` is the alpha
-    /// multiplier applied to the sampled tile texel. Padded out to
-    /// 16-byte alignment so WGSL's uniform-struct layout matches.
+    /// (x_min, y_min, x_max, y_max) of the tile in normalised
+    /// Mercator world coords.
+    world_rect: [f32; 4],
+    world_center: [f32; 2],
+    pixels_per_world: f32,
     globeness: f32,
+    canvas_half: [f32; 2],
+    center_lonlat_rad: [f32; 2],
+    globe_scale: f32,
     _pad: [f32; 3],
 }
 
@@ -501,35 +519,63 @@ impl Renderer {
     /// overlaps the viewport gets drawn, regardless of its zoom level.
     /// Sorted coarse-first so that finer tiles overdraw their parents
     /// — during a zoom-in we see the stretched-up parents as a
-    /// fallback while children load, then they pop into focus. The
-    /// alternative (draw only `round(zoom)` tiles) leaves the screen
-    /// blank during transitions.
+    /// fallback while children load, then they pop into focus.
+    ///
+    /// **Globe rendering:** at low zoom (globeness > 0) the
+    /// `tile_visible` flat-projection filter rejects tiles wrapping
+    /// onto the globe from the camera's far side, so we accept every
+    /// loaded tile and let the shader's per-fragment backface discard
+    /// handle hemispherical culling.
     pub fn render(&self) {
         let canvas = self.size();
+        let globeness = self.camera.globeness();
+        let on_globe = globeness > 0.0;
 
-        // Every loaded tile whose NDC rect intersects [-1, +1]².
-        // Borrow the binding alongside the id so the render pass's
-        // hot loop doesn't re-hash.
+        // Every loaded tile worth drawing this frame. The shader
+        // projects per-vertex through both flat-Mercator and
+        // ellipsoidal-globe pipelines and blends by globeness — so
+        // the same draw call works for either projection.
         let mut draws: Vec<(&TileId, [f32; 4], &TileBinding)> = self
             .tiles
             .iter()
             .filter_map(|(id, binding)| {
-                if !self.camera.tile_visible(*id, canvas) {
+                let visible = on_globe || self.camera.tile_visible(*id, canvas);
+                if !visible {
                     return None;
                 }
-                Some((id, self.camera.tile_ndc_rect(*id, canvas), binding))
+                Some((id, id.world_rect(), binding))
             })
             .collect();
         // Coarse-first: finer tiles overdraw the stretched-up parents.
         draws.sort_by_key(|(id, _, _)| id.z);
 
-        // Write each visible tile's NDC rect + per-frame globeness
-        // into its per-tile uniform before the render pass starts.
-        let globeness = self.camera.globeness();
-        for (_, rect, binding) in &draws {
+        // Per-tile uniform: tile's world rect + a snapshot of the
+        // current camera state. Camera fields are duplicated per tile
+        // (~64 bytes × N tiles), which is wasteful but keeps the bind-
+        // group shape simple — a future cleanup would split camera
+        // into a shared group 0 binding.
+        let (wcx, wcy) =
+            crs::lonlat_to_world(self.camera.center_lonlat.0, self.camera.center_lonlat.1);
+        let camera_snapshot = (
+            [wcx as f32, wcy as f32],
+            self.camera.pixels_per_world() as f32,
+            globeness,
+            [
+                self.config.width as f32 / 2.0,
+                self.config.height as f32 / 2.0,
+            ],
+            self.camera.center_lonlat_rad(),
+            0.9_f32, // globe_scale — must match vector pass's value
+        );
+        for (_, world_rect, binding) in &draws {
             let u = TileUniforms {
-                rect: *rect,
-                globeness,
+                world_rect: *world_rect,
+                world_center: camera_snapshot.0,
+                pixels_per_world: camera_snapshot.1,
+                globeness: camera_snapshot.2,
+                canvas_half: camera_snapshot.3,
+                center_lonlat_rad: camera_snapshot.4,
+                globe_scale: camera_snapshot.5,
                 _pad: [0.0; 3],
             };
             self.queue
@@ -616,9 +662,14 @@ impl Renderer {
 
             if !draws.is_empty() {
                 pass.set_pipeline(&self.tile_pipeline);
+                // 8×8 grid of quads × 6 verts/quad — matches `GRID`
+                // + `QUAD_VERTS` in tile.wgsl. The grid is what lets
+                // each tile curve onto the globe at low zoom rather
+                // than rendering as a flat NDC quad.
+                const TILE_GRID_VERTS: u32 = 8 * 8 * 6;
                 for (_, _, binding) in &draws {
                     pass.set_bind_group(0, &binding.bind_group, &[]);
-                    pass.draw(0..6, 0..1);
+                    pass.draw(0..TILE_GRID_VERTS, 0..1);
                 }
             } else {
                 // Cold cache (nothing loaded yet) — show the M0

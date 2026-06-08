@@ -32,6 +32,20 @@ impl TileId {
         TileId { z, x, y }
     }
 
+    /// The tile's extent in normalised Mercator world coords as
+    /// `(x_min, y_min, x_max, y_max)`. The tessellated globe-tile
+    /// shader uses this to interpolate per-vertex world positions
+    /// across the tile.
+    pub fn world_rect(&self) -> [f32; 4] {
+        let n = (1u32 << self.z) as f32;
+        [
+            self.x as f32 / n,
+            self.y as f32 / n,
+            (self.x + 1) as f32 / n,
+            (self.y + 1) as f32 / n,
+        ]
+    }
+
     /// URL for a 256×256 PNG raster tile from OpenStreetMap's standard
     /// tile CDN. **Development / low-volume use only** per the
     /// [OSM tile-usage policy](https://operations.osmfoundation.org/policies/tiles/);
