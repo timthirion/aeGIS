@@ -325,16 +325,42 @@ impl Renderer {
     }
 
     /// Ensure every currently-visible tile is either loaded or has a
-    /// fetch in flight. Cheap to call every frame.
+    /// fetch in flight, **plus** the parent tiles at one zoom level
+    /// coarser. Parents are 1/4 the count of current-zoom tiles (each
+    /// covers 4 children), so the prefetch cost is small — and it
+    /// makes zoom-out instant: by the time you scroll to z-1, those
+    /// tiles are already on the GPU.
     pub fn ensure_visible_tiles(&mut self) {
-        let visible = self.camera.visible_tiles(self.size());
-        for id in visible {
-            if self.tiles.contains_key(&id) || self.requested.contains(&id) {
-                continue;
-            }
-            self.requested.insert(id);
-            self.dispatch_tile_fetch(id);
+        let canvas = self.size();
+        let visible = self.camera.visible_tiles(canvas);
+        for id in &visible {
+            self.request_if_new(*id);
         }
+        // Prefetch parents. HashSet dedupes — each parent at
+        // (z-1, x/2, y/2) covers up to four visible children.
+        if let Some(first) = visible.first() {
+            if first.z > 0 {
+                let parents: HashSet<TileId> = visible
+                    .iter()
+                    .map(|t| TileId {
+                        z: t.z - 1,
+                        x: t.x / 2,
+                        y: t.y / 2,
+                    })
+                    .collect();
+                for id in parents {
+                    self.request_if_new(id);
+                }
+            }
+        }
+    }
+
+    fn request_if_new(&mut self, id: TileId) {
+        if self.tiles.contains_key(&id) || self.requested.contains(&id) {
+            return;
+        }
+        self.requested.insert(id);
+        self.dispatch_tile_fetch(id);
     }
 
     /// Native: spawn a thread per tile request that performs the
@@ -363,24 +389,37 @@ impl Renderer {
         });
     }
 
-    /// Draw one frame. Reads the camera's current state to pick + place
-    /// visible tiles; tiles not yet loaded are skipped this frame and
-    /// will appear in a subsequent frame once their fetch completes.
+    /// Draw one frame.
+    ///
+    /// **Multi-zoom rendering:** every loaded tile whose screen rect
+    /// overlaps the viewport gets drawn, regardless of its zoom level.
+    /// Sorted coarse-first so that finer tiles overdraw their parents
+    /// — during a zoom-in we see the stretched-up parents as a
+    /// fallback while children load, then they pop into focus. The
+    /// alternative (draw only `round(zoom)` tiles) leaves the screen
+    /// blank during transitions.
     pub fn render(&self) {
         let canvas = self.size();
-        let visible = self.camera.visible_tiles(canvas);
 
-        // Pre-compute (tile, ndc_rect) pairs for every visible loaded
-        // tile, then upload each rect into its own per-tile uniform
-        // buffer. Doing the uploads in a single sweep before the render
-        // pass keeps the pass's hot loop free of queue writes.
-        let draws: Vec<(&TileId, [f32; 4])> = visible
+        // Every loaded tile whose NDC rect intersects [-1, +1]².
+        // Borrow the binding alongside the id so the render pass's
+        // hot loop doesn't re-hash.
+        let mut draws: Vec<(&TileId, [f32; 4], &TileBinding)> = self
+            .tiles
             .iter()
-            .filter(|id| self.tiles.contains_key(id))
-            .map(|id| (id, self.camera.tile_ndc_rect(*id, canvas)))
+            .filter_map(|(id, binding)| {
+                if !self.camera.tile_visible(*id, canvas) {
+                    return None;
+                }
+                Some((id, self.camera.tile_ndc_rect(*id, canvas), binding))
+            })
             .collect();
-        for (id, rect) in &draws {
-            let binding = &self.tiles[*id];
+        // Coarse-first: finer tiles overdraw the stretched-up parents.
+        draws.sort_by_key(|(id, _, _)| id.z);
+
+        // Write each visible tile's NDC rect into its per-tile uniform
+        // buffer before the render pass starts.
+        for (_, rect, binding) in &draws {
             let u = TileUniforms { rect: *rect };
             self.queue
                 .write_buffer(&binding.uniform_buf, 0, bytemuck::bytes_of(&u));
@@ -435,8 +474,7 @@ impl Renderer {
 
             if !draws.is_empty() {
                 pass.set_pipeline(&self.tile_pipeline);
-                for (id, _) in &draws {
-                    let binding = &self.tiles[*id];
+                for (_, _, binding) in &draws {
                     pass.set_bind_group(0, &binding.bind_group, &[]);
                     pass.draw(0..6, 0..1);
                 }

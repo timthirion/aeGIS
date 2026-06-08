@@ -138,6 +138,17 @@ impl Camera {
         tiles
     }
 
+    /// True if the given tile's screen-NDC rect intersects the
+    /// viewport. The renderer uses this for multi-zoom rendering:
+    /// every loaded tile (at any zoom) whose rect overlaps `[-1, 1]²`
+    /// gets drawn this frame, providing a coarser-or-finer fallback
+    /// during pan + zoom transitions while the "right" tiles load.
+    pub fn tile_visible(&self, tile: TileId, canvas: (u32, u32)) -> bool {
+        let r = self.tile_ndc_rect(tile, canvas);
+        // Standard AABB overlap with the unit square [-1, +1] × [-1, +1].
+        r[2] > -1.0 && r[0] < 1.0 && r[3] > -1.0 && r[1] < 1.0
+    }
+
     /// Screen-NDC rectangle `(x_min, y_min, x_max, y_max)` occupied by
     /// the given tile at the **current** (possibly fractional) zoom.
     /// NDC convention: `x` and `y` both `[-1, +1]` with `+y` up.
@@ -278,6 +289,54 @@ mod tests {
             "unexpected visible-tile count at z=10 / 800x600: {}",
             tiles.len()
         );
+    }
+
+    #[test]
+    fn tile_visible_matches_visible_tiles_at_native_zoom() {
+        // At the camera's exact zoom level, `tile_visible` should
+        // agree with `visible_tiles` for every tile in the world.
+        let c = Camera::new(CHICAGO_LONLAT.0, CHICAGO_LONLAT.1, 10.0);
+        let canvas = (800, 600);
+        let visible: std::collections::HashSet<_> = c.visible_tiles(canvas).into_iter().collect();
+        for x in 256..272 {
+            for y in 376..386 {
+                let id = TileId { z: 10, x, y };
+                assert_eq!(
+                    c.tile_visible(id, canvas),
+                    visible.contains(&id),
+                    "z=10 tile ({x}, {y}): visible_tiles vs tile_visible disagree"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn tile_visible_includes_parent_zoom_during_zoom_in() {
+        // At zoom 10.7 (between integer levels), the renderer picks
+        // z=11 tiles via visible_tiles — but a z=10 tile covering the
+        // same area still tests as visible. That's the multi-zoom
+        // fallback the renderer relies on while z=11 tiles fetch.
+        let c = Camera::new(CHICAGO_LONLAT.0, CHICAGO_LONLAT.1, 10.7);
+        let canvas = (800, 600);
+        let chicago_z10 = TileId {
+            z: 10,
+            x: 262,
+            y: 380,
+        };
+        assert!(c.tile_visible(chicago_z10, canvas));
+    }
+
+    #[test]
+    fn tile_visible_rejects_offscreen_tiles() {
+        // A tile on the other side of the world should not be visible.
+        let c = Camera::new(CHICAGO_LONLAT.0, CHICAGO_LONLAT.1, 10.0);
+        let canvas = (800, 600);
+        let antipodes = TileId {
+            z: 10,
+            x: 774,
+            y: 380,
+        }; // ~180° from Chicago
+        assert!(!c.tile_visible(antipodes, canvas));
     }
 
     #[test]
