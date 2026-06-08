@@ -43,12 +43,13 @@ jobs:
         # The deploy artifact is `deploy/`, which holds:
         #   - the top-level entry page (index.html)
         #   - the wasm bundle (pkg/aegis.js, aegis_bg.wasm, ...)
-        # Data fixtures (Natural Earth extracts, etc.) get copied in
-        # once plan 0001 M3 introduces them.
+        #   - data/ for the Natural Earth countries GeoJSON overlay
+        #     (and future fixtures). Same paths the web entry fetches.
         run: |
           mkdir -p deploy
           cp index.html deploy/
           cp -r pkg deploy/pkg
+          cp -r data deploy/data
           ls -la deploy
 
       - name: Upload Pages artifact

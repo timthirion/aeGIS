@@ -10,6 +10,7 @@ pub mod camera;
 pub mod crs;
 pub mod render;
 pub mod tile;
+pub mod vector;
 pub mod version;
 
 #[cfg(target_arch = "wasm32")]
@@ -52,6 +53,24 @@ pub fn run() {
     ));
     // The renderer's `ensure_visible_tiles` fires the initial fetches
     // automatically on the first frame — no manual prefetch needed.
+
+    // Load the bundled Natural Earth countries overlay (best-effort —
+    // run from any working directory the file might not be present).
+    let geojson_path = "data/natural-earth/countries.geojson";
+    match std::fs::read_to_string(geojson_path) {
+        Ok(source) => match vector::load_geojson_lines(&source) {
+            Ok(layer) => {
+                log::info!(
+                    "loaded {} ({} segments)",
+                    geojson_path,
+                    layer.segment_count()
+                );
+                renderer.set_vector_layer(&layer);
+            }
+            Err(e) => log::warn!("parse {geojson_path}: {e}"),
+        },
+        Err(e) => log::warn!("read {geojson_path}: {e} — running without vector overlay"),
+    }
 
     let mut cursor_px: (f64, f64) = (0.0, 0.0);
     let mut dragging = false;

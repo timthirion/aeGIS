@@ -28,10 +28,13 @@ use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
 
 use crate::camera::Camera;
+use crate::crs;
 use crate::tile::{self, DecodedTile, TileId, CHICAGO_LONLAT};
+use crate::vector::VectorLayer;
 
 const CLEAR_SHADER: &str = include_str!("shaders/clear.wgsl");
 const TILE_SHADER: &str = include_str!("shaders/tile.wgsl");
+const VECTOR_SHADER: &str = include_str!("shaders/vector.wgsl");
 
 const TILE_UNIFORM_SIZE: u64 = std::mem::size_of::<TileUniforms>() as u64;
 
@@ -48,6 +51,27 @@ pub fn make_instance() -> wgpu::Instance {
 struct TileUniforms {
     /// Tile quad rect in NDC: (x_min, y_min, x_max, y_max).
     rect: [f32; 4],
+}
+
+/// Per-frame camera uniform consumed by `vector.wgsl`. Matches the
+/// `Camera` struct in WGSL byte-for-byte; bytemuck-friendly layout
+/// pads scalars to vec2 alignment so `repr(C)` does the right thing.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, Pod, Zeroable)]
+struct VectorCameraUniform {
+    world_center: [f32; 2],
+    pixels_per_world: f32,
+    _pad0: f32,
+    canvas_half: [f32; 2],
+    _pad1: [f32; 2],
+    color: [f32; 4],
+}
+
+/// A vector-layer that's been uploaded as a GPU vertex buffer, ready
+/// to render as a LineList.
+struct VectorBinding {
+    vertex_buf: wgpu::Buffer,
+    vertex_count: u32,
 }
 
 /// A raster tile that's been uploaded to the GPU.
@@ -74,6 +98,11 @@ pub struct Renderer {
     tile_pipeline: wgpu::RenderPipeline,
     tile_bgl: wgpu::BindGroupLayout,
     tile_sampler: wgpu::Sampler,
+
+    vector_pipeline: wgpu::RenderPipeline,
+    vector_camera_buf: wgpu::Buffer,
+    vector_bind_group: wgpu::BindGroup,
+    vector: Option<VectorBinding>,
 
     /// Tiles that have been decoded + uploaded to the GPU.
     tiles: HashMap<TileId, TileBinding>,
@@ -189,6 +218,37 @@ impl Renderer {
             ..Default::default()
         });
 
+        // Vector pipeline + per-frame camera uniform. Shared bind
+        // group (single uniform buffer) — `set_vector_layer` swaps the
+        // vertex buffer, but the camera binding stays put.
+        let vector_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("aegis-vector-bgl"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+        let vector_camera_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("aegis-vector-camera"),
+            contents: bytemuck::bytes_of(&VectorCameraUniform::default()),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        let vector_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("aegis-vector-bg"),
+            layout: &vector_bgl,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: vector_camera_buf.as_entire_binding(),
+            }],
+        });
+        let vector_pipeline = build_vector_pipeline(&device, format, &vector_bgl);
+
         let (completed_tx, completed_rx) = mpsc::channel();
 
         Renderer {
@@ -200,12 +260,40 @@ impl Renderer {
             tile_pipeline,
             tile_bgl,
             tile_sampler,
+            vector_pipeline,
+            vector_camera_buf,
+            vector_bind_group,
+            vector: None,
             tiles: HashMap::new(),
             requested: HashSet::new(),
             completed_tx,
             completed_rx,
             camera: Camera::new(CHICAGO_LONLAT.0, CHICAGO_LONLAT.1, 10.0),
         }
+    }
+
+    /// Upload a vector overlay's vertex buffer (LineList layout: each
+    /// pair of vertices = one segment). Idempotent — repeated calls
+    /// replace the existing binding. Drops the previous vertex buffer
+    /// via wgpu's normal Resource lifecycle.
+    pub fn set_vector_layer(&mut self, layer: &VectorLayer) {
+        let bytes = bytemuck::cast_slice::<[f32; 2], u8>(&layer.vertices);
+        let vertex_buf = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("aegis-vector-vbo"),
+                contents: bytes,
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+        log::info!(
+            "set_vector_layer: uploaded {} segments ({} bytes)",
+            layer.segment_count(),
+            bytes.len()
+        );
+        self.vector = Some(VectorBinding {
+            vertex_buf,
+            vertex_count: layer.vertices.len() as u32,
+        });
     }
 
     /// Surface dimensions in physical pixels.
@@ -425,6 +513,34 @@ impl Renderer {
                 .write_buffer(&binding.uniform_buf, 0, bytemuck::bytes_of(&u));
         }
 
+        // Write the per-frame camera uniform for the vector pass.
+        // Cheap (one ~48-byte upload) and unconditional — the vector
+        // pass only draws if a layer has been set, but the uniform is
+        // ready either way.
+        let (wcx, wcy) =
+            crs::lonlat_to_world(self.camera.center_lonlat.0, self.camera.center_lonlat.1);
+        let ppw = self.camera.pixels_per_world() as f32;
+        let vector_camera = VectorCameraUniform {
+            world_center: [wcx as f32, wcy as f32],
+            pixels_per_world: ppw,
+            _pad0: 0.0,
+            canvas_half: [
+                self.config.width as f32 / 2.0,
+                self.config.height as f32 / 2.0,
+            ],
+            _pad1: [0.0; 2],
+            // Country-outline overlay colour: a coral-orange that
+            // reads against OSM's brown/beige basemap. Alpha kept
+            // moderate so the basemap shows through faintly under
+            // the lines.
+            color: [0.95, 0.42, 0.22, 0.85],
+        };
+        self.queue.write_buffer(
+            &self.vector_camera_buf,
+            0,
+            bytemuck::bytes_of(&vector_camera),
+        );
+
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(t)
             | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
@@ -483,6 +599,14 @@ impl Renderer {
                 // gradient as a "loading" state.
                 pass.set_pipeline(&self.clear_pipeline);
                 pass.draw(0..3, 0..1);
+            }
+
+            // Vector overlay on top of the basemap.
+            if let Some(vector) = &self.vector {
+                pass.set_pipeline(&self.vector_pipeline);
+                pass.set_bind_group(0, &self.vector_bind_group, &[]);
+                pass.set_vertex_buffer(0, vector.vertex_buf.slice(..));
+                pass.draw(0..vector.vertex_count, 0..1);
             }
         }
         self.queue.submit(std::iter::once(encoder.finish()));
@@ -573,6 +697,65 @@ fn build_tile_pipeline(
         }),
         primitive: wgpu::PrimitiveState {
             topology: wgpu::PrimitiveTopology::TriangleList,
+            strip_index_format: None,
+            front_face: wgpu::FrontFace::Ccw,
+            cull_mode: None,
+            polygon_mode: wgpu::PolygonMode::Fill,
+            unclipped_depth: false,
+            conservative: false,
+        },
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
+fn build_vector_pipeline(
+    device: &wgpu::Device,
+    format: wgpu::TextureFormat,
+    bgl: &wgpu::BindGroupLayout,
+) -> wgpu::RenderPipeline {
+    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("aegis-vector-shader"),
+        source: wgpu::ShaderSource::Wgsl(VECTOR_SHADER.into()),
+    });
+    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("aegis-vector-layout"),
+        bind_group_layouts: &[Some(bgl)],
+        immediate_size: 0,
+    });
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("aegis-vector-pipeline"),
+        layout: Some(&layout),
+        vertex: wgpu::VertexState {
+            module: &module,
+            entry_point: Some("vs_main"),
+            buffers: &[wgpu::VertexBufferLayout {
+                array_stride: std::mem::size_of::<[f32; 2]>() as wgpu::BufferAddress,
+                step_mode: wgpu::VertexStepMode::Vertex,
+                attributes: &[wgpu::VertexAttribute {
+                    format: wgpu::VertexFormat::Float32x2,
+                    offset: 0,
+                    shader_location: 0,
+                }],
+            }],
+            compilation_options: Default::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &module,
+            entry_point: Some("fs_main"),
+            targets: &[Some(wgpu::ColorTargetState {
+                format,
+                // Straight alpha blend so the line colour's alpha
+                // controls visibility over the basemap.
+                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            compilation_options: Default::default(),
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::LineList,
             strip_index_format: None,
             front_face: wgpu::FrontFace::Ccw,
             cull_mode: None,

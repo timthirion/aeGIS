@@ -31,3 +31,8 @@ fn clear_shader_validates() {
 fn tile_shader_validates() {
     validate_wgsl(include_str!("../src/shaders/tile.wgsl"), "tile.wgsl");
 }
+
+#[test]
+fn vector_shader_validates() {
+    validate_wgsl(include_str!("../src/shaders/vector.wgsl"), "vector.wgsl");
+}

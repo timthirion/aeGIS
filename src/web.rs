@@ -33,6 +33,28 @@ fn web_window() -> web_sys::Window {
     web_sys::window().expect("no global window")
 }
 
+/// Fetch a text resource (used for the GeoJSON overlay). Browser sets
+/// `User-Agent`; we don't need to.
+async fn fetch_text(url: &str) -> Result<String, String> {
+    use wasm_bindgen_futures::JsFuture;
+    let resp_value = JsFuture::from(web_window().fetch_with_str(url))
+        .await
+        .map_err(|e| format!("fetch: {e:?}"))?;
+    let resp: web_sys::Response = resp_value
+        .dyn_into()
+        .map_err(|e| format!("Response cast: {e:?}"))?;
+    if !resp.ok() {
+        return Err(format!("HTTP {} for {url}", resp.status()));
+    }
+    let text_promise = resp.text().map_err(|e| format!("text(): {e:?}"))?;
+    let text_value = JsFuture::from(text_promise)
+        .await
+        .map_err(|e| format!("text await: {e:?}"))?;
+    text_value
+        .as_string()
+        .ok_or_else(|| "text was not a string".to_string())
+}
+
 fn request_animation_frame(cb: &Closure<dyn FnMut()>) {
     web_window()
         .request_animation_frame(cb.as_ref().unchecked_ref())
@@ -167,6 +189,32 @@ pub async fn start(host_id: String) -> Result<AegisInstance, JsValue> {
         canvas: canvas.clone(),
         shared: shared.clone(),
     }));
+
+    // Fetch the Natural Earth countries overlay async. The fetch
+    // runs concurrently with the first few frames of tile loading;
+    // when it lands, the overlay appears on top of whatever tiles
+    // are already up.
+    {
+        let inner_for_vector = inner.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            match fetch_text("./data/natural-earth/countries.geojson").await {
+                Ok(source) => match crate::vector::load_geojson_lines(&source) {
+                    Ok(layer) => {
+                        log::info!(
+                            "loaded countries.geojson ({} segments)",
+                            layer.segment_count()
+                        );
+                        inner_for_vector
+                            .borrow_mut()
+                            .renderer
+                            .set_vector_layer(&layer);
+                    }
+                    Err(e) => log::warn!("parse countries.geojson: {e}"),
+                },
+                Err(e) => log::warn!("fetch countries.geojson: {e}"),
+            }
+        });
+    }
 
     // rAF loop — self-rescheduling closure.
     let raf: Rc<RefCell<Option<Closure<dyn FnMut()>>>> = Rc::new(RefCell::new(None));

@@ -2,8 +2,9 @@
 
 - **Status:** active
 - **Last updated:** 2026-06-08
-- **Last touched on:** M1/M2 interactive — drag-to-pan, wheel-to-zoom-
-  around-cursor, multi-tile rendering, mpsc-driven async tile cache
+- **Last touched on:** M3 vector overlay — Natural Earth countries
+  drawn as alpha-blended line list over the basemap, projecting through
+  a per-frame camera uniform that's the swap point for the globe view
 
 ## Goal
 
@@ -281,26 +282,56 @@ fetcher not blocking the render loop.
 
 ### M3 — GeoJSON overlay (vector layer)
 
-- [ ] `core::layer::vector::VectorLayer` — owns a `Vec<geo::Geometry>`
-      plus a `Style` (fill + stroke RGBA, stroke width).
-- [ ] `core::io::geojson` — `geozero`-backed loader: `from_geojson_str(s)
-      -> Result<VectorLayer, IoError>`. Round-trip test: load a fixture,
-      serialise back out, parse again, assert geometry + property
-      equality.
-- [ ] `lyon`-based tessellation: polygons → triangle mesh; lines →
-      stroked triangle mesh. Cached on the layer; re-tessellated only
-      when the layer's style.stroke_width changes (zoom-independent for
-      M3; Phase 7 styling fixes this).
-- [ ] `shaders/vector.wgsl` — flat-shaded textured-or-untextured
-      triangle pass, projected through the same Web Mercator matrix as
-      M2's tile pass.
-- [ ] Fixture: a small Natural Earth `countries` extract (public domain),
-      shipped under `data/natural-earth/` with `ATTRIBUTION`.
+- [x] `core::vector::VectorLayer` — pre-projected `Vec<[f32; 2]>` in
+      normalised Mercator world coords, laid out for a wgpu `LineList`.
+      Pure data + a single owned vertex buffer; the `Style` / per-
+      layer attribute work is deferred to Phase 7 (styling system) so
+      M3 stays focused on getting pixels on screen.
+- [x] `core::vector::load_geojson_lines` — `geojson`-backed loader
+      walking `LineString` / `MultiLineString` / `Polygon` /
+      `MultiPolygon` / `GeometryCollection`. Each `(lon, lat)` projects
+      through Spherical Mercator at load time, so the GPU just sees
+      world coords. Tests pin: empty FC, N-point linestring → N-1
+      segments, polygon ring auto-closure (with + without explicit
+      last-coord-duplicate), point-types skipped, equator/prime →
+      world centre (0.5, 0.5).
+- [ ] ~~`lyon`-based tessellation~~ — deferred. LineList + 1-px lines
+      give a clean country-outline look for M3; lyon-stroked thick
+      lines / polygon fills land when Phase 7 introduces the styling
+      system that actually controls stroke weight + fill colour.
+- [x] `shaders/vector.wgsl` — per-vertex projection through a
+      `VectorCameraUniform { world_center, pixels_per_world,
+      canvas_half, color }`. **This is the projection point that
+      swaps when the globe view lands** — same vertex data, new
+      shader math interpolating between flat Mercator NDC and
+      ellipsoidal-globe NDC by a `globeness` uniform.
+- [x] Fixture: Natural Earth 110m countries
+      (`data/natural-earth/countries.geojson`, 712 KB, public domain),
+      with `ATTRIBUTION.md` covering provenance + refresh command.
+- [x] Renderer wiring: separate `vector_pipeline` (LineList topology,
+      `BlendState::ALPHA_BLENDING`), one shared bind-group with the
+      per-frame `VectorCameraUniform`. Drawn last so the overlay
+      sits on top of the basemap tiles.
+- [x] Loading: native reads `data/natural-earth/countries.geojson`
+      from the working directory at startup (best-effort — logs a
+      warning if missing rather than panicking). Web fetches it via
+      `web_sys::fetch` once the canvas is attached; arrival is
+      asynchronous so the basemap loads first.
 
-**Done when:** a Natural Earth country polygon overlay renders correctly
-on top of the M2 basemap in both targets; the GeoJSON round-trip test
-passes; clicking on a polygon (M4) reads back the correct feature
-attributes.
+**Done when:** country borders render in coral-orange over the basemap
+in both targets; pre-flight green; the wasm bundle stays under 500 KB.
+  _Build-verified 2026-06-08: native + wasm clean, 31 lib tests + 3
+  shader tests passing, wasm bundle 408 KB after wasm-opt.
+  **Visual confirmation pending** — embedder should reload the live
+  URL and zoom out to see the country outlines materialise as the
+  basemap zoom range supports the 110m feature scale._
+
+**What M3 deliberately doesn't ship** (per the scope-trim above):
+- Filled polygons (just outlines for now)
+- Hover / click feature interrogation (M4 work — needs the embedder
+  API surface to expose it)
+- Multiple layers, per-layer styling, vector-tile sources (Phase 4 / 7)
+- Tessellation via `lyon` (deferred until styling needs thick strokes)
 
 ### M4 — Embeddable widget skeleton + verification harness
 
