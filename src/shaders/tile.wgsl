@@ -28,8 +28,9 @@ struct Uniforms {
     /// Camera centre as (lon_rad, lat_rad) — for sphere rotation.
     center_lonlat_rad: vec2<f32>,
     /// Sphere radius in NDC (tunable margin around the globe).
+    /// See `vector.wgsl` for the matching `_pad: vec3<f32>` warning —
+    /// WGSL pads the struct end to 64 bytes automatically.
     globe_scale: f32,
-    _pad: vec3<f32>,
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;

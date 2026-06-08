@@ -211,7 +211,13 @@ impl Renderer {
             entries: &[
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX,
+                    // Visible to BOTH stages — the vertex shader reads
+                    // world_rect + camera state; the fragment shader
+                    // reads `globeness` for the backface discard guard.
+                    // Was VERTEX-only before tessellation; the driver
+                    // rejects the pipeline if the fragment binding
+                    // visibility doesn't match what the shader reads.
+                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false,

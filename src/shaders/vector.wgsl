@@ -26,8 +26,13 @@ struct Camera {
     /// SRC_ALPHA blending).
     color: vec4<f32>,
     /// Sphere radius in NDC (tunable margin around the globe).
+    /// WGSL pads the struct end to a multiple of 16 (the largest
+    /// member's alignment) automatically — matches the Rust
+    /// `VectorCameraUniform`'s 64-byte size. **Do not add a trailing
+    /// `_pad: vec3<f32>` field** — vec3 alignment would push the
+    /// struct size to 80 bytes and the browser would reject the
+    /// 64-byte uniform buffer as "too small".
     globe_scale: f32,
-    _pad: vec3<f32>,
 };
 
 @group(0) @binding(0) var<uniform> camera: Camera;
