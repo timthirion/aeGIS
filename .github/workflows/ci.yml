@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+# Cancel in-flight runs for the same branch/PR when a newer commit lands.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  rust:
+    name: Rust (fmt + clippy + test + wasm32 check)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo registry + build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: rust-quality
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Tests
+        run: cargo test --all-targets
+
+      - name: wasm32 check
+        # `cargo check` (not build) because we don't ship a wasm
+        # artifact from CI — we just need to know it still compiles.
+        run: cargo check --target wasm32-unknown-unknown --lib
+
+      - name: No oversized files in HEAD
+        # Catches a regression where someone re-commits a chunky
+        # binary (a stray Sentinel scene, a high-res reference
+        # render, etc.). 5 MB ceiling — anything legitimately above
+        # that should be gitignored or fetched on demand by a
+        # script under `scripts/`.
+        run: |
+          set -e
+          ceiling=$((5 * 1024 * 1024))
+          oversized=$(git ls-tree -r -l HEAD | awk -v c=$ceiling '$4 > c {print $4, $5}')
+          if [ -n "$oversized" ]; then
+            echo "::error::Files above 5 MB checked in:"
+            echo "$oversized"
+            exit 1
+          fi
