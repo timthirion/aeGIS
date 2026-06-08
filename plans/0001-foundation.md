@@ -2,9 +2,10 @@
 
 - **Status:** active
 - **Last updated:** 2026-06-08
-- **Last touched on:** M3 vector overlay — Natural Earth countries
-  drawn as alpha-blended line list over the basemap, projecting through
-  a per-frame camera uniform that's the swap point for the globe view
+- **Last touched on:** Phase 9 v1 (globe view) shipped opportunistically
+  in the same session — tiles + vectors interpolate from flat Mercator
+  to a 3D globe via `Camera::globeness()`; see ROADMAP Phase 9 entry
+  for what landed and what's deferred
 
 ## Goal
 

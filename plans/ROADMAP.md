@@ -33,10 +33,22 @@ Design bias:
 
 ## Where we are today
 
-Empty Rust repository scaffolded with project conventions
-(`AGENTS.md`), the planning discipline (`plans/`), the agent +
-skill scaffolding (`.claude/`), and an initial foundation plan
-([`0001-foundation.md`](0001-foundation.md)). No code shipped yet.
+Live at [**timthirion.github.io/aeGIS**](https://timthirion.github.io/aeGIS/).
+
+As of 2026-06-08, the foundation phase (plan
+[`0001-foundation.md`](0001-foundation.md)) has shipped through
+M3 — interactive Web Mercator slippy map with multi-zoom tile
+rendering, parent-tile prefetch, and a Natural Earth GeoJSON
+country-outline overlay. **Phase 9 v1 (globe view) also shipped**
+in the same session: tiles + vectors interpolate from flat
+Mercator to a 3D globe by zoom via a single `globeness` uniform
+in the shaders.
+
+What's left to round out the foundation: M4 (embeddable widget API
++ attribution overlay + reference-image harness), Phase 4 (PMTiles
+self-hosted basemap), Phase 5+ (raster + spatial index + styling),
+and Phase 10 (live satellite-orbit overlay riding on top of the
+globe view).
 
 ## Plan + milestone conventions
 
@@ -138,27 +150,50 @@ callback)`, `attributionsFor(layer)`. The closing milestone of the
 v1 trajectory — the surface a blog post or third-party app
 actually consumes.
 
-### Phase 9 — Globe view: flat → spherical zoom-out
+### Phase 9 — Globe view: flat → spherical zoom-out  ✅ v1 shipped
 
-The Google-Earth / MapLibre-globe affordance. Implement both a flat
-Web Mercator vertex projection and an ellipsoidal (WGS84) globe
-projection in WGSL, and **interpolate** between them based on the
-current zoom level — continuous, single codepath, no separate "globe
-mode." At zoom ≲ 5 the user sees a recognisable Earth; at zoom ≳ 7
-they see flat Mercator; in between, the projection smoothly tweens.
+The Google-Earth / MapLibre-globe affordance. Both a flat Web
+Mercator vertex projection and a spherical (unit-sphere) globe
+projection live in WGSL, **interpolated** between by a single
+`globeness ∈ [0, 1]` uniform driven by zoom — continuous, single
+codepath, no separate "globe mode." At zoom ≤ 2 the user sees a
+rotating Earth; at zoom ≥ 5 they see flat Mercator; in between, the
+projection smoothly smoothsteps.
+
+**v1 shipped 2026-06-08:**
+- `Camera::globeness()` smoothstep'd from zoom (1.0 ≤ z ≤ 2.0,
+  0.0 ≥ z ≥ 5.0).
+- Vector overlay (`vector.wgsl`) does per-vertex flat ↔ sphere mix,
+  with per-fragment backface discard for the back of the sphere.
+- Tiles (`tile.wgsl`) tessellated into an 8×8 grid per tile so the
+  basemap **wraps** the globe (instead of fading out as a v0 hack).
+  Same per-vertex projection mix as the vector pass.
+- Globe-friendly pan rate: at globeness > 0, pan switches from the
+  flat-Mercator `1/pixels_per_world` rate to a globe-aware
+  `visible_arc / canvas_width` rate so dragging the sphere feels
+  right (~128° rotation per full canvas drag).
+- Default starting view is now zoom 1.5 (well inside globeness ≈ 1)
+  so the headline feature is the first thing the user sees.
+
+**v1 known limitations** (each a future plan):
+- `visible_tiles` uses flat-projection math, which at zoom < ~5
+  naturally selects all world tiles, but at intermediate transition
+  zooms (3–5) only picks a wedge around the camera centre. A
+  sphere-aware selector based on great-circle distance would fix
+  the "globe with empty gores" look in the transition band.
+- Antimeridian-wrap still unsupported — pan past ±180° clamps
+  instead of wrapping.
+- The sphere is currently a unit sphere; an ellipsoidal WGS84 fit
+  (~0.3 % flattening) is a precision upgrade for high-accuracy work.
 
 Reference: MapLibre GL JS's globe-view implementation
-(`globe-projection` PR + blog post). The trick is parameterising the
-projection by a single `globeness ∈ [0, 1]` uniform driven by zoom.
+(`globe-projection` PR + blog post). The trick is the single
+`globeness` parameter driven by zoom.
 
-Tile selection has to grow up too — at globe zoom, the visible
-half-sphere implies a different set of tiles than a flat rectangular
-viewport. Frustum culling against the ellipsoid + horizon-clipping
-become real.
-
-Publishable artifact: zoom continuously from a Mercator street-level
-view all the way out to a rotating globe, with the basemap tile
-fetch keeping up the whole way.
+Publishable artifact (shipped): zoom continuously between flat
+Mercator and a 3D globe with country outlines + tessellated OSM
+basemap tiles tracking the whole way. Live at
+[**timthirion.github.io/aeGIS**](https://timthirion.github.io/aeGIS/).
 
 ### Phase 10 — Orbital overlay: live satellite positions
 

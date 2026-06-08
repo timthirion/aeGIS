@@ -34,25 +34,37 @@ aeGIS is built on free + open foundations:
 
 ## Status
 
-Early. The repo carries the project conventions
-([`AGENTS.md`](AGENTS.md)), the planning discipline
-([`plans/`](plans/)), the agent + skill scaffolding
-([`.claude/`](.claude/)), and a foundation plan
-([`plans/0001-foundation.md`](plans/0001-foundation.md)) whose first
-milestone (`M0` — pixels on screen, native + web) ships a fullscreen-
-triangle gradient via `wgpu`. Live at
-[**timthirion.github.io/aeGIS**](https://timthirion.github.io/aeGIS/).
+Live at [**timthirion.github.io/aeGIS**](https://timthirion.github.io/aeGIS/).
+
+The foundation phase (plan
+[`0001-foundation.md`](plans/0001-foundation.md)) has shipped
+through M3:
+
+- Interactive Web Mercator slippy map (drag-to-pan,
+  wheel-zoom-around-cursor)
+- Multi-zoom tile rendering with parent-tile prefetch for smooth
+  zoom transitions
+- Async tile cache (channel-driven; native `std::thread`, web
+  `spawn_local`)
+- Country-outline overlay from the bundled Natural Earth 1:110m
+  dataset
+
+Plus **Phase 9 v1 (globe view)** — zooming out smoothly transitions
+the flat Mercator map into a rotating 3D globe (single `globeness`
+uniform interpolating between the two projections in WGSL). Country
+outlines + OSM imagery both wrap the sphere; backface discard hides
+the far side. Zoom back in and you're on a normal slippy map.
 
 See [`plans/ROADMAP.md`](plans/ROADMAP.md) for direction.
 
 ## Direction
 
-The plan is to grow aeGIS from a slippy raster map → vector overlays →
-multi-CRS reprojection → vector tiles → raster (Cloud-Optimized GeoTIFF)
-→ spatial index + queries → a declarative styling system → an
-embeddable widget API → a Google-Earth-style globe view with a smooth
-flat-to-spherical zoom-out → live satellite-orbit overlays driven by
-the Celestrak TLE catalog.
+The plan is to grow aeGIS from a slippy raster map → vector overlays
+(done) → multi-CRS reprojection → vector tiles → raster (Cloud-
+Optimized GeoTIFF) → spatial index + queries → a declarative styling
+system → an embeddable widget API → a Google-Earth-style globe view
+with a smooth flat-to-spherical zoom-out (v1 done) → live satellite-
+orbit overlays driven by the Celestrak TLE catalog.
 
 Each phase becomes a `plans/NNNN-*.md` file with concrete milestones,
 tests, and a reference fixture so anyone (human or agent) can pick up
