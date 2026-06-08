@@ -34,6 +34,17 @@ pub const TILE_PIXELS: f64 = 256.0;
 pub const MIN_ZOOM: f64 = 0.0;
 pub const MAX_ZOOM: f64 = 19.0;
 
+/// Zoom at which the flat → spherical projection transition begins
+/// (zoom ≥ this is rendered fully flat). Above this, the slippy-map
+/// is the Mercator view we've always shipped.
+pub const GLOBE_FLAT_ZOOM: f64 = 5.0;
+
+/// Zoom at which the transition completes (zoom ≤ this is rendered
+/// as a full 3D globe). Between this and [`GLOBE_FLAT_ZOOM`], the
+/// vertex shader interpolates between the two projections via a
+/// smoothstep curve.
+pub const GLOBE_FULL_ZOOM: f64 = 2.0;
+
 /// Web-Mercator viewport camera.
 #[derive(Debug, Clone, Copy)]
 pub struct Camera {
@@ -57,6 +68,32 @@ impl Camera {
     /// drops straight out of `TILE_PIXELS * 2^zoom`.
     pub fn pixels_per_world(&self) -> f64 {
         TILE_PIXELS * 2.0_f64.powf(self.zoom)
+    }
+
+    /// The "globeness" parameter for the flat-to-sphere transition:
+    /// **0.0** = render as flat Web Mercator (the slippy-map view);
+    /// **1.0** = render as a 3D globe.
+    ///
+    /// Driven by zoom via a smoothstep: fully flat at
+    /// `zoom ≥ GLOBE_FLAT_ZOOM`, fully globe at
+    /// `zoom ≤ GLOBE_FULL_ZOOM`, smooth in between. The vertex
+    /// shader interpolates the vertex position between the two
+    /// projections by this value.
+    pub fn globeness(&self) -> f32 {
+        let t =
+            ((GLOBE_FLAT_ZOOM - self.zoom) / (GLOBE_FLAT_ZOOM - GLOBE_FULL_ZOOM)).clamp(0.0, 1.0);
+        // Smoothstep: 3t² - 2t³.
+        (t * t * (3.0 - 2.0 * t)) as f32
+    }
+
+    /// Camera centre as `(lon_rad, lat_rad)` — what the sphere
+    /// vertex shader needs to rotate the globe so the camera centre
+    /// is at the "front" (positive Z after rotation).
+    pub fn center_lonlat_rad(&self) -> [f32; 2] {
+        [
+            self.center_lonlat.0.to_radians() as f32,
+            self.center_lonlat.1.to_radians() as f32,
+        ]
     }
 
     /// Pan by a screen-pixel delta. The convention matches a mouse
@@ -186,6 +223,65 @@ mod tests {
     fn close(a: f64, b: f64, tol: f64) -> bool {
         (a - b).abs() < tol
     }
+
+    // -----------------------------------------------------------------
+    // globeness — flat ↔ sphere transition curve
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn globeness_zero_at_high_zoom() {
+        let c = Camera::new(0.0, 0.0, 10.0);
+        assert_eq!(c.globeness(), 0.0);
+        let c = Camera::new(0.0, 0.0, GLOBE_FLAT_ZOOM);
+        assert_eq!(c.globeness(), 0.0);
+    }
+
+    #[test]
+    fn globeness_one_at_low_zoom() {
+        let c = Camera::new(0.0, 0.0, GLOBE_FULL_ZOOM);
+        assert_eq!(c.globeness(), 1.0);
+        let c = Camera::new(0.0, 0.0, 0.0);
+        assert_eq!(c.globeness(), 1.0);
+    }
+
+    #[test]
+    fn globeness_smooth_in_transition_band() {
+        let mid_zoom = (GLOBE_FLAT_ZOOM + GLOBE_FULL_ZOOM) / 2.0;
+        let c = Camera::new(0.0, 0.0, mid_zoom);
+        // At the midpoint of the band, smoothstep gives 0.5 exactly.
+        assert!((c.globeness() - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn globeness_monotonic_in_transition_band() {
+        // Sweep across the transition and confirm globeness is
+        // monotonically non-increasing in zoom (higher zoom = less
+        // globey).
+        let mut last = 1.0_f32;
+        let steps = 64;
+        for i in 0..=steps {
+            let t = i as f64 / steps as f64;
+            let zoom = GLOBE_FULL_ZOOM + t * (GLOBE_FLAT_ZOOM - GLOBE_FULL_ZOOM);
+            let g = Camera::new(0.0, 0.0, zoom).globeness();
+            assert!(
+                g <= last + 1e-6,
+                "globeness({zoom}) = {g} exceeded prior {last}"
+            );
+            last = g;
+        }
+    }
+
+    #[test]
+    fn center_lonlat_rad_converts_to_radians() {
+        let c = Camera::new(180.0, 90.0, 0.0);
+        let [lon, lat] = c.center_lonlat_rad();
+        assert!((lon - std::f32::consts::PI).abs() < 1e-6);
+        assert!((lat - std::f32::consts::FRAC_PI_2).abs() < 1e-6);
+    }
+
+    // -----------------------------------------------------------------
+    // Pre-existing zoom / pan / tile-visibility coverage
+    // -----------------------------------------------------------------
 
     #[test]
     fn pixels_per_world_doubles_per_zoom() {

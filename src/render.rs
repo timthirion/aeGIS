@@ -51,20 +51,34 @@ pub fn make_instance() -> wgpu::Instance {
 struct TileUniforms {
     /// Tile quad rect in NDC: (x_min, y_min, x_max, y_max).
     rect: [f32; 4],
+    /// Phase 9 globe-view fade — `(1 - globeness)` is the alpha
+    /// multiplier applied to the sampled tile texel. Padded out to
+    /// 16-byte alignment so WGSL's uniform-struct layout matches.
+    globeness: f32,
+    _pad: [f32; 3],
 }
 
 /// Per-frame camera uniform consumed by `vector.wgsl`. Matches the
-/// `Camera` struct in WGSL byte-for-byte; bytemuck-friendly layout
-/// pads scalars to vec2 alignment so `repr(C)` does the right thing.
+/// WGSL `Camera` struct byte-for-byte (4 × `vec4` = 64 bytes).
+///
+/// Layout — each `vec4` row is 16 bytes:
+/// ```text
+/// row 0: world_center.xy | pixels_per_world | globeness
+/// row 1: canvas_half.xy  | center_lonlat_rad.xy
+/// row 2: color.rgba
+/// row 3: globe_scale     | _pad.xyz
+/// ```
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default, Pod, Zeroable)]
 struct VectorCameraUniform {
     world_center: [f32; 2],
     pixels_per_world: f32,
-    _pad0: f32,
+    globeness: f32,
     canvas_half: [f32; 2],
-    _pad1: [f32; 2],
+    center_lonlat_rad: [f32; 2],
     color: [f32; 4],
+    globe_scale: f32,
+    _pad: [f32; 3],
 }
 
 /// A vector-layer that's been uploaded as a GPU vertex buffer, ready
@@ -505,35 +519,43 @@ impl Renderer {
         // Coarse-first: finer tiles overdraw the stretched-up parents.
         draws.sort_by_key(|(id, _, _)| id.z);
 
-        // Write each visible tile's NDC rect into its per-tile uniform
-        // buffer before the render pass starts.
+        // Write each visible tile's NDC rect + per-frame globeness
+        // into its per-tile uniform before the render pass starts.
+        let globeness = self.camera.globeness();
         for (_, rect, binding) in &draws {
-            let u = TileUniforms { rect: *rect };
+            let u = TileUniforms {
+                rect: *rect,
+                globeness,
+                _pad: [0.0; 3],
+            };
             self.queue
                 .write_buffer(&binding.uniform_buf, 0, bytemuck::bytes_of(&u));
         }
 
         // Write the per-frame camera uniform for the vector pass.
-        // Cheap (one ~48-byte upload) and unconditional — the vector
-        // pass only draws if a layer has been set, but the uniform is
-        // ready either way.
+        // Single 64-byte upload; cheap. The vector pass only draws
+        // if a layer has been set, but the uniform is ready either
+        // way so subsequent set_vector_layer doesn't need a refresh.
         let (wcx, wcy) =
             crs::lonlat_to_world(self.camera.center_lonlat.0, self.camera.center_lonlat.1);
-        let ppw = self.camera.pixels_per_world() as f32;
         let vector_camera = VectorCameraUniform {
             world_center: [wcx as f32, wcy as f32],
-            pixels_per_world: ppw,
-            _pad0: 0.0,
+            pixels_per_world: self.camera.pixels_per_world() as f32,
+            globeness: self.camera.globeness(),
             canvas_half: [
                 self.config.width as f32 / 2.0,
                 self.config.height as f32 / 2.0,
             ],
-            _pad1: [0.0; 2],
+            center_lonlat_rad: self.camera.center_lonlat_rad(),
             // Country-outline overlay colour: a coral-orange that
             // reads against OSM's brown/beige basemap. Alpha kept
             // moderate so the basemap shows through faintly under
             // the lines.
             color: [0.95, 0.42, 0.22, 0.85],
+            // 0.9 leaves a 10% margin around the globe at globeness=1
+            // so the sphere isn't flush with the canvas edges.
+            globe_scale: 0.9,
+            _pad: [0.0; 3],
         };
         self.queue.write_buffer(
             &self.vector_camera_buf,
@@ -690,7 +712,11 @@ fn build_tile_pipeline(
             entry_point: Some("fs_main"),
             targets: &[Some(wgpu::ColorTargetState {
                 format,
-                blend: None,
+                // Phase 9: alpha-blend so tiles can fade out by
+                // `(1 - globeness)` during the flat → globe
+                // transition. Standard SRC_ALPHA over (straight
+                // alpha, not premultiplied).
+                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
                 write_mask: wgpu::ColorWrites::ALL,
             })],
             compilation_options: Default::default(),
