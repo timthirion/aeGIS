@@ -6,7 +6,9 @@
 //!
 //! See `AGENTS.md` and `plans/ROADMAP.md` for the project's direction.
 
+pub mod crs;
 pub mod render;
+pub mod tile;
 pub mod version;
 
 #[cfg(target_arch = "wasm32")]
