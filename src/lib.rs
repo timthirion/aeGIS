@@ -6,6 +6,7 @@
 //!
 //! See `AGENTS.md` and `plans/ROADMAP.md` for the project's direction.
 
+pub mod camera;
 pub mod crs;
 pub mod render;
 pub mod tile;
