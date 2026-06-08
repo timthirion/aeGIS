@@ -54,23 +54,26 @@ fn world_to_lonlat_rad(world: vec2<f32>) -> vec2<f32> {
     return vec2<f32>(lon_rad, lat_rad);
 }
 
+// See `vector.wgsl` for the convention notes — prime meridian at +Z,
+// rotation = Y(-cam_lon) then X(+cam_lat). Keep this in sync.
 fn lonlat_to_sphere(lonlat: vec2<f32>) -> vec3<f32> {
     let lon = lonlat.x;
     let lat = lonlat.y;
-    return vec3<f32>(cos(lat) * cos(lon), sin(lat), cos(lat) * sin(lon));
+    return vec3<f32>(cos(lat) * sin(lon), sin(lat), cos(lat) * cos(lon));
 }
 
 fn rotate_to_camera(p: vec3<f32>, cam: vec2<f32>) -> vec3<f32> {
-    // Same rotation as vector.wgsl — bring `cam` to (0, 0, 1).
+    // Y by -cam_lon.
     let cl = cos(cam.x);
     let sl = sin(cam.x);
-    let x1 = cl * p.x + sl * p.z;
-    let z1 = -sl * p.x + cl * p.z;
+    let x1 = cl * p.x - sl * p.z;
+    let z1 = sl * p.x + cl * p.z;
     let y1 = p.y;
+    // X by +cam_lat.
     let cla = cos(cam.y);
     let sla = sin(cam.y);
-    let y2 = cla * y1 + sla * z1;
-    let z2 = -sla * y1 + cla * z1;
+    let y2 = cla * y1 - sla * z1;
+    let z2 = sla * y1 + cla * z1;
     return vec3<f32>(x1, y2, z2);
 }
 

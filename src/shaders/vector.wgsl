@@ -60,28 +60,40 @@ fn world_to_lonlat_rad(world: vec2<f32>) -> vec2<f32> {
     return vec2<f32>(lon_rad, lat_rad);
 }
 
-/// `(lon, lat)` on a unit sphere → XYZ.
+/// `(lon, lat)` on a unit sphere → XYZ with **prime meridian at +Z**
+/// (so a camera at lonlat=(0, 0) looking down -Z sees the prime
+/// meridian dead-centre). Longitudes east of the prime meridian land
+/// in +X (= right on screen); latitudes north land in +Y (= up).
+///
+/// Future-me warning: the alternative convention with prime meridian
+/// at +X (`x = cos(lat)·cos(lon)`) put the camera-centre world point
+/// at the far-right edge of the canvas and rendered the sphere
+/// mirrored ("continents reversed", drag direction inverted). Don't
+/// go back.
 fn lonlat_to_sphere(lonlat: vec2<f32>) -> vec3<f32> {
     let lon = lonlat.x;
     let lat = lonlat.y;
-    return vec3<f32>(cos(lat) * cos(lon), sin(lat), cos(lat) * sin(lon));
+    return vec3<f32>(cos(lat) * sin(lon), sin(lat), cos(lat) * cos(lon));
 }
 
-/// Rotate a sphere point so the camera's `center_lonlat` ends up at +Z.
-/// Two-axis rotation: first by -cam_lon around Y, then by -cam_lat
-/// around X.
+/// Rotate a sphere point so the camera's `(lon, lat)` ends up at
+/// `(0, 0, 1)` — the front of the sphere as seen by an orthographic
+/// camera looking down -Z. Right-handed rotation matrices: Y by
+/// `-cam_lon` first, then X by `+cam_lat`.
 fn rotate_to_camera(p: vec3<f32>, cam: vec2<f32>) -> vec3<f32> {
+    // Step 1: Y by -cam_lon. Aligns the camera meridian with the YZ
+    // plane (points east of camera land in +X, west in -X).
     let cl = cos(cam.x);
     let sl = sin(cam.x);
-    // Yaw: rotate -cam_lon around Y (active rotation of the point).
-    let x1 = cl * p.x + sl * p.z;
-    let z1 = -sl * p.x + cl * p.z;
+    let x1 = cl * p.x - sl * p.z;
+    let z1 = sl * p.x + cl * p.z;
     let y1 = p.y;
-    // Pitch: rotate -cam_lat around X.
+    // Step 2: X by +cam_lat. Brings the camera latitude onto the
+    // equator of the new frame (north of camera lands in +Y).
     let cla = cos(cam.y);
     let sla = sin(cam.y);
-    let y2 = cla * y1 + sla * z1;
-    let z2 = -sla * y1 + cla * z1;
+    let y2 = cla * y1 - sla * z1;
+    let z2 = sla * y1 + cla * z1;
     return vec3<f32>(x1, y2, z2);
 }
 
