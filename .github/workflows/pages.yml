@@ -1,0 +1,69 @@
+name: Pages deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Only one deploy may be in flight at a time. A newer push to main
+# cancels any in-progress deploy.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+jobs:
+  build:
+    name: Build wasm bundle
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (wasm32 target)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo registry + build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: pages-build
+
+      - name: Install wasm-pack
+        run: cargo install wasm-pack --locked
+
+      - name: Build wasm pkg
+        run: wasm-pack build --target web --release --out-dir pkg
+
+      - name: Assemble deploy directory
+        # The deploy artifact is `deploy/`, which holds:
+        #   - the top-level entry page (index.html)
+        #   - the wasm bundle (pkg/aegis.js, aegis_bg.wasm, ...)
+        # Data fixtures (Natural Earth extracts, etc.) get copied in
+        # once plan 0001 M3 introduces them.
+        run: |
+          mkdir -p deploy
+          cp index.html deploy/
+          cp -r pkg deploy/pkg
+          ls -la deploy
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: deploy
+
+  deploy:
+    name: Deploy to GitHub Pages
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@v4
