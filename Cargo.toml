@@ -46,6 +46,7 @@ web-sys = { version = "0.3", features = [
   "HtmlCanvasElement",
   "HtmlElement",
   "MouseEvent",
+  "PointerEvent",
   "Window",
   "WheelEvent",
   "ResizeObserver",

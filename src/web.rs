@@ -211,7 +211,11 @@ pub async fn start(host_id: String) -> Result<AegisInstance, JsValue> {
         )
     }
 
-    // pointerdown — start drag.
+    // pointerdown — start drag. Capture the pointer so subsequent
+    // `pointermove` events keep landing on the canvas even after the
+    // cursor leaves it. Without this, the user drags out past the
+    // canvas edge and the camera stops following — the classic
+    // "pan stops at the edge" bug.
     attach(
         &canvas_target,
         "pointerdown",
@@ -219,9 +223,10 @@ pub async fn start(host_id: String) -> Result<AegisInstance, JsValue> {
             let shared = shared.clone();
             let canvas = canvas.clone();
             Closure::wrap(Box::new(move |e: web_sys::Event| {
-                if let Ok(m) = e.dyn_into::<web_sys::MouseEvent>() {
-                    shared.cursor_px.set(cursor_from_event(&m, &canvas));
+                if let Ok(p) = e.dyn_into::<web_sys::PointerEvent>() {
+                    shared.cursor_px.set(cursor_from_event(p.as_ref(), &canvas));
                     shared.dragging.set(true);
+                    let _ = canvas.set_pointer_capture(p.pointer_id());
                 }
             }) as Box<dyn FnMut(web_sys::Event)>)
         },
@@ -273,9 +278,12 @@ pub async fn start(host_id: String) -> Result<AegisInstance, JsValue> {
         &mut listeners,
     )?;
 
-    // wheel — zoom around the cursor. Browsers' WheelEvent.deltaY is
-    // positive when scrolling **down** (towards the user), which we
-    // map to "zoom out" by inverting the sign.
+    // wheel — zoom around the cursor. Browsers' `WheelEvent.deltaY`
+    // is positive when scrolling down (toward the user) → we invert to
+    // map "scroll down" to "zoom out". Critical: `deltaY` is in units
+    // determined by `deltaMode` — PIXEL (0), LINE (1), or PAGE (2).
+    // Without normalising, a regular mouse wheel (deltaMode=LINE,
+    // deltaY=1 per click) produces an imperceptible 0.005 zoom step.
     attach(
         &canvas_target,
         "wheel",
@@ -285,13 +293,24 @@ pub async fn start(host_id: String) -> Result<AegisInstance, JsValue> {
             let inner = inner.clone();
             Closure::wrap(Box::new(move |e: web_sys::Event| {
                 if let Ok(w) = e.dyn_into::<web_sys::WheelEvent>() {
-                    w.prevent_default(); // stop the page from scrolling
+                    w.prevent_default();
                     let cursor = cursor_from_event(w.as_ref(), &canvas);
                     shared.cursor_px.set(cursor);
+                    // Normalise everything to pixels first, then apply
+                    // a single tuning constant. The line / page
+                    // multipliers are the conventional defaults
+                    // browsers themselves use when reporting deltas
+                    // to applications that don't ask for the raw
+                    // mode (~16 px per line, ~400 px per page).
+                    let dy_px = match w.delta_mode() {
+                        web_sys::WheelEvent::DOM_DELTA_LINE => w.delta_y() * 16.0,
+                        web_sys::WheelEvent::DOM_DELTA_PAGE => w.delta_y() * 400.0,
+                        _ => w.delta_y(),
+                    };
+                    // 0.005 zoom per pixel → ~1 zoom per 200 px of
+                    // trackpad pan, ~0.5 zoom per mouse-wheel click.
+                    let zoom_delta = -dy_px * 0.005;
                     let canvas_size = inner.borrow().renderer.size();
-                    // 0.005 per pixel-delta gives a 1 zoom step per
-                    // ~200 px of trackpad pan — comfortable.
-                    let zoom_delta = -w.delta_y() * 0.005;
                     inner
                         .borrow_mut()
                         .renderer

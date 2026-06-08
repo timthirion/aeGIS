@@ -51,7 +51,12 @@
       display: block;
       width: 100%;
       height: 100%;
+      cursor: grab;
+      /* Stop the browser from intercepting touch gestures for page
+         scroll / pinch-zoom — pointer events handle them. */
+      touch-action: none;
     }
+    #aegis-host canvas:active { cursor: grabbing; }
     footer {
       border-top: 1px solid #1d232b;
       font-size: 12px;
@@ -77,11 +82,20 @@
   <script type="module">
     import init, { start, version } from "./pkg/aegis.js";
 
+    // The AegisInstance handle owns every Rust-side Closure (the rAF
+    // tick, the ResizeObserver callback, every pointer + wheel
+    // listener). Letting it go out of scope = JS garbage-collects it
+    // = every Closure gets dropped = the next ResizeObserver / pointer
+    // / wheel event explodes with "closure invoked recursively or
+    // after being dropped". Hold it in a module-scoped binding so it
+    // lives as long as the page does.
+    let aegis;
+
     async function main() {
       await init();
       document.getElementById("version-tag").textContent = `v${version()}`;
       try {
-        await start("aegis-host");
+        aegis = await start("aegis-host");
       } catch (e) {
         console.error("aegis start failed", e);
         const host = document.getElementById("aegis-host");
