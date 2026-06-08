@@ -1,8 +1,9 @@
 # Foundation: from empty repo to embeddable slippy map (native + web)
 
-- **Status:** proposed
+- **Status:** active
 - **Last updated:** 2026-06-08
-- **Last touched on:** initial scaffolding pass
+- **Last touched on:** M0 landed — wgpu surface + clear pass in both targets;
+  Pages deploy live at timthirion.github.io/aegis
 
 ## Goal
 
@@ -100,23 +101,53 @@ gets wired in Phase 3 (a separate plan).
 
 ## Milestones
 
-### M0 — Pixels native + web
+### M0 — Pixels native + web ✅ DONE
 
-- [ ] Cargo project: single package as both native bin and wasm `cdylib`
+- [x] Cargo project: single package as both native bin and wasm `cdylib`
       + `rlib`. (Kept as one crate for M0; split into a workspace when
       the renderer grows.)
-- [ ] `wgpu` init (adapter / device / queue / surface) — builds and
-      links natively.
-- [ ] Fullscreen-triangle pass drawing a recognisable gradient
+- [x] `wgpu` init (adapter / device / queue / surface) — builds and
+      links natively. Implementation in `src/render.rs`; native driver
+      in `src/lib.rs::run` (winit 0.29 event loop, `Arc<Window>` for
+      the `Surface<'static>` lifetime), web driver in `src/web.rs`.
+- [x] Fullscreen-triangle pass drawing a recognisable gradient
       (`src/shaders/clear.wgsl`).
-- [ ] `wasm-pack build --target web` succeeds; `index.html` attaches to
-      a `#aegis-canvas` element and runs the same render.
-- [ ] WGSL covered by a `naga` validation test in `tests/shaders.rs`
+- [x] `wasm-pack build --target web` succeeds (104 KB wasm after
+      `wasm-opt`); `index.html` attaches to a `#aegis-host` element
+      via `start(host_id)` and runs the same render. A
+      `ResizeObserver` re-syncs the backing-store size on layout
+      changes; an `rAF` loop drives `Renderer::render()` per frame.
+- [x] WGSL covered by a `naga` validation test in `tests/shaders.rs`
       (no GPU needed; runs in plain `cargo test`).
 
 **Done when:** the gradient shows in both a desktop window and a browser
 tab; `cargo test` + `cargo clippy --all-targets -- -D warnings` +
 `cargo check --target wasm32-unknown-unknown --lib` all green.
+  _Build-verified 2026-06-08: native `cargo run` builds + spawns the
+  window cleanly; `wasm-pack build --target web` clean; CI green;
+  Pages deploy live at https://timthirion.github.io/aegis/.
+  **Visual confirmation pending** — I can't drive a real browser /
+  desktop window from this environment; the bindings + bundle build
+  correctly but the embedder should open both targets once to confirm
+  the gradient renders as expected._
+
+**winit / wgpu version pin:** the renderer is on `winit 0.29` +
+`pollster 0.3` (matches quasi's validated set). winit 0.30's
+`ApplicationHandler` rework is the future but introduces complexity
+on the wasm path for no incremental M0 benefit; bump deliberately
+in a separate plan if/when needed.
+
+**wgpu 29 gotchas worth pinning:**
+- `Surface::get_current_texture()` returns `wgpu::CurrentSurfaceTexture`
+  (enum: Success / Suboptimal / Outdated / Lost / Timeout / Occluded /
+  Validation) — not `Result`. Reconfigure on Outdated/Lost.
+- `RenderPassDescriptor` + `RenderPipelineDescriptor` carry
+  `multiview_mask`, not `multiview`.
+- `PipelineLayoutDescriptor` takes `immediate_size`, not
+  `push_constant_ranges`.
+- `Instance::new` takes the descriptor **by value**; the descriptor
+  uses `::new_without_display_handle()` as its base for cross-target
+  compatibility.
 
 ### M1 — Camera + viewport + Web Mercator math
 
