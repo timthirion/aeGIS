@@ -282,7 +282,11 @@ impl Renderer {
             requested: HashSet::new(),
             completed_tx,
             completed_rx,
-            camera: Camera::new(CHICAGO_LONLAT.0, CHICAGO_LONLAT.1, 10.0),
+            // Default view: a partly-globey zoom centred between
+            // the Americas so the headline globe view is the first
+            // thing the user sees. They can scroll in to land at
+            // Chicago / any flat-Mercator view.
+            camera: Camera::new(CHICAGO_LONLAT.0, 30.0, 1.5),
         }
     }
 

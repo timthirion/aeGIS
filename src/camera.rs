@@ -97,14 +97,36 @@ impl Camera {
     }
 
     /// Pan by a screen-pixel delta. The convention matches a mouse
-    /// drag: `+dx` moves the user's view to the right, which means the
-    /// world under the cursor moves to the right → the camera centre
-    /// moves to the **left**. Same for y.
-    pub fn pan(&mut self, dx_px: f64, dy_px: f64) {
-        let ppw = self.pixels_per_world();
+    /// drag: `+dx` moves the user's view to the right, which means
+    /// the world under the cursor moves to the right → the camera
+    /// centre moves to the **left**. Same for y.
+    ///
+    /// At low zoom (globeness > 0) the pan rate is blended toward a
+    /// **globe-aware** rate where dragging a full canvas width
+    /// rotates the sphere by the visible-arc angle (~`2·asin(0.9)`
+    /// = ~128° with the default `globe_scale`). Without this blend,
+    /// pan uses `1/pixels_per_world` as the world-units-per-pixel
+    /// scale, which is calibrated for the flat-Mercator view and
+    /// makes the globe spin out of control at zoom 0 (~140° per
+    /// 100 px of drag). The blend interpolates between the two
+    /// rates by `globeness` so the feel stays continuous across the
+    /// transition.
+    pub fn pan(&mut self, dx_px: f64, dy_px: f64, canvas_px: (u32, u32)) {
+        // Flat: 1 px = 1/ppw world units.
+        let flat_units_per_px = 1.0 / self.pixels_per_world();
+        // Globe: the sphere fills `globe_scale` of NDC's half-width
+        // (== `GLOBE_SCALE` in render.rs). The visible arc per
+        // canvas width is `2 * asin(globe_scale)` radians. A drag of
+        // one canvas width should rotate the sphere by that arc.
+        const GLOBE_SCALE: f64 = 0.9;
+        let visible_arc_world = (GLOBE_SCALE.asin() * 2.0) / (2.0 * std::f64::consts::PI);
+        let globe_units_per_px = visible_arc_world / canvas_px.0.max(1) as f64;
+        let g = self.globeness() as f64;
+        let units_per_px = flat_units_per_px * (1.0 - g) + globe_units_per_px * g;
+
         let (wx, wy) = crs::lonlat_to_world(self.center_lonlat.0, self.center_lonlat.1);
-        let new_wx = (wx - dx_px / ppw).rem_euclid(1.0);
-        let new_wy = (wy - dy_px / ppw).clamp(0.0, 1.0);
+        let new_wx = (wx - dx_px * units_per_px).rem_euclid(1.0);
+        let new_wy = (wy - dy_px * units_per_px).clamp(0.0, 1.0);
         self.center_lonlat = crs::world_to_lonlat(new_wx, new_wy);
     }
 
@@ -295,15 +317,21 @@ mod tests {
     }
 
     #[test]
-    fn pan_inverse_of_screen_motion() {
-        // Drag the cursor 100 pixels right and 50 pixels down. The
-        // world point that was under the cursor should now be 100 right
-        // and 50 down in screen space — i.e. the centre moved
-        // 100 left / 50 up in world space.
-        let mut c = Camera::new(0.0, 0.0, 1.0);
+    fn flat_pan_inverse_of_screen_motion() {
+        // **Flat-regime invariant.** Drag the cursor 100 pixels right
+        // and 50 pixels down at fully-flat zoom. The world point that
+        // was under the cursor should now be 100 right and 50 down in
+        // screen space — i.e. the centre moved 100 left / 50 up in
+        // world space.
+        //
+        // At low zoom (globeness > 0) pan switches to a globe-aware
+        // rate (different units-per-pixel) where this exact-inverse
+        // invariant doesn't hold; see `globe_pan_rate_matches_visible_arc`.
+        let mut c = Camera::new(0.0, 0.0, 10.0); // flat
+        assert_eq!(c.globeness(), 0.0);
         let canvas = (512, 512);
         let world_before_center = c.screen_to_world((256.0, 256.0), canvas);
-        c.pan(100.0, 50.0);
+        c.pan(100.0, 50.0, canvas);
         let world_after_center_was_offset =
             c.screen_to_world((256.0 + 100.0, 256.0 + 50.0), canvas);
         assert!(
@@ -317,6 +345,33 @@ mod tests {
             "pan y: {} vs {}",
             world_before_center.1,
             world_after_center_was_offset.1
+        );
+    }
+
+    #[test]
+    fn globe_pan_rate_matches_visible_arc() {
+        // **Globe-regime invariant.** At full globeness, dragging a
+        // full canvas width should rotate the sphere by the visible
+        // arc angle (~`2·asin(0.9)` ≈ 128° with the default
+        // globe_scale). Catches drift in the pan-rate constants the
+        // shader's globe projection depends on.
+        let mut c = Camera::new(0.0, 0.0, 0.0); // fully globe
+        assert_eq!(c.globeness(), 1.0);
+        let canvas = (1000, 1000);
+        let lon_before = c.center_lonlat.0;
+        c.pan(canvas.0 as f64, 0.0, canvas);
+        let lon_after = c.center_lonlat.0;
+        // Pan is "drag right → centre moves left", so the change is
+        // negative; take abs.
+        let dlon = (lon_after - lon_before).abs();
+        // Expected: 2 · asin(0.9) radians, in degrees.
+        let expected_deg = (0.9_f64.asin() * 2.0).to_degrees();
+        assert!(
+            (dlon - expected_deg).abs() < 0.5,
+            "globe pan: dragged {} px → {}° rotation, expected ~{}°",
+            canvas.0,
+            dlon,
+            expected_deg,
         );
     }
 

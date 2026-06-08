@@ -296,7 +296,9 @@ pub async fn start(host_id: String) -> Result<AegisInstance, JsValue> {
                         let prev = shared.cursor_px.get();
                         let dx = new_cursor.0 - prev.0;
                         let dy = new_cursor.1 - prev.1;
-                        inner.borrow_mut().renderer.camera.pan(dx, dy);
+                        let mut inner_mut = inner.borrow_mut();
+                        let canvas_size = inner_mut.renderer.size();
+                        inner_mut.renderer.camera.pan(dx, dy, canvas_size);
                     }
                     shared.cursor_px.set(new_cursor);
                 }

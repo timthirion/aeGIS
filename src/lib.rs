@@ -105,7 +105,8 @@ pub fn run() {
                         if dragging {
                             let dx = new_cursor.0 - cursor_px.0;
                             let dy = new_cursor.1 - cursor_px.1;
-                            renderer.camera.pan(dx, dy);
+                            let canvas = renderer.size();
+                            renderer.camera.pan(dx, dy, canvas);
                         }
                         cursor_px = new_cursor;
                     }
