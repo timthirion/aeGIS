@@ -1,38 +1,28 @@
-// Vector overlay pass with flat ↔ sphere projection.
+// Vector overlay on a 3D sphere. Each vertex projects from
+// (lon, lat) → unit-sphere XYZ → clip space via a per-frame view +
+// perspective projection matrix.
 //
-// Each vertex computes BOTH the flat-Mercator NDC and the spherical-
-// projection NDC, then mixes between them by `camera.globeness`. At
-// `globeness = 0` the result is identical to the original slippy-map
-// projection; at `globeness = 1` the geometry sits on a 3D globe.
-// In between, smoothstep.
+// **One scene, one projection.** The "flat slippy map" view at high
+// zoom emerges naturally from the perspective camera sitting close
+// to the sphere surface (`altitude ≈ 0.02` at zoom 10); the globe
+// view emerges from the camera being far enough out to see the whole
+// sphere (`altitude ≈ 2.0` capped at low zoom). The transition is
+// just camera position interpolating with zoom — no per-vertex blend.
 //
-// Backface handling: vertices on the far side of the sphere
-// (positive rotated-Z means the camera is "behind" them) are discarded
-// in the fragment shader, with a soft globeness gate so the discard
-// only kicks in once we're substantially globe-shaped.
+// Backface culling: each vertex's sphere position has its dot product
+// with the camera position passed to the fragment shader; a fragment
+// is on the far hemisphere iff that dot is less than 1 (because for a
+// unit sphere, the visible-hemisphere boundary is exactly where the
+// sphere is tangent to the line-of-sight from the camera, i.e. where
+// `vertex · camera_pos = vertex · vertex = 1`).
 
 struct Camera {
-    /// Camera centre in normalised Mercator (flat-path use).
-    world_center: vec2<f32>,
-    /// `TILE_PIXELS * 2^zoom` — display pixels per Mercator unit.
-    pixels_per_world: f32,
-    /// 0.0 = flat Mercator; 1.0 = full 3D globe; smoothstep in between.
-    globeness: f32,
-    /// `(canvas_width / 2, canvas_height / 2)` in physical pixels.
-    canvas_half: vec2<f32>,
-    /// Camera centre as (lon_rad, lat_rad) for the sphere rotation.
-    center_lonlat_rad: vec2<f32>,
-    /// Line colour (straight alpha; the pipeline does standard
-    /// SRC_ALPHA blending).
+    view_proj: mat4x4<f32>,
+    // 3D position of the camera in sphere-coords (length > 1).
+    position: vec3<f32>,
+    _pad0: f32,
+    // Line colour for this overlay.
     color: vec4<f32>,
-    /// Sphere radius in NDC (tunable margin around the globe).
-    /// WGSL pads the struct end to a multiple of 16 (the largest
-    /// member's alignment) automatically — matches the Rust
-    /// `VectorCameraUniform`'s 64-byte size. **Do not add a trailing
-    /// `_pad: vec3<f32>` field** — vec3 alignment would push the
-    /// struct size to 80 bytes and the browser would reject the
-    /// 64-byte uniform buffer as "too small".
-    globe_scale: f32,
 };
 
 @group(0) @binding(0) var<uniform> camera: Camera;
@@ -43,11 +33,7 @@ struct VsIn {
 
 struct VsOut {
     @builtin(position) clip: vec4<f32>,
-    /// Rotated sphere Z — positive = front of sphere (visible),
-    /// negative = back. Sent to the fragment shader for backface
-    /// discard. Interpolates linearly across each line segment, so
-    /// segments that cross the horizon get per-fragment culling.
-    @location(0) sphere_depth: f32,
+    @location(0) visibility: f32,
 };
 
 const PI: f32 = 3.14159265358979323846;
@@ -60,77 +46,28 @@ fn world_to_lonlat_rad(world: vec2<f32>) -> vec2<f32> {
     return vec2<f32>(lon_rad, lat_rad);
 }
 
-/// `(lon, lat)` on a unit sphere → XYZ with **prime meridian at +Z**
-/// (so a camera at lonlat=(0, 0) looking down -Z sees the prime
-/// meridian dead-centre). Longitudes east of the prime meridian land
-/// in +X (= right on screen); latitudes north land in +Y (= up).
-///
-/// Future-me warning: the alternative convention with prime meridian
-/// at +X (`x = cos(lat)·cos(lon)`) put the camera-centre world point
-/// at the far-right edge of the canvas and rendered the sphere
-/// mirrored ("continents reversed", drag direction inverted). Don't
-/// go back.
+/// `(lon, lat)` on a unit sphere → XYZ with prime meridian at +Z.
 fn lonlat_to_sphere(lonlat: vec2<f32>) -> vec3<f32> {
     let lon = lonlat.x;
     let lat = lonlat.y;
     return vec3<f32>(cos(lat) * sin(lon), sin(lat), cos(lat) * cos(lon));
 }
 
-/// Rotate a sphere point so the camera's `(lon, lat)` ends up at
-/// `(0, 0, 1)` — the front of the sphere as seen by an orthographic
-/// camera looking down -Z. Right-handed rotation matrices: Y by
-/// `-cam_lon` first, then X by `+cam_lat`.
-fn rotate_to_camera(p: vec3<f32>, cam: vec2<f32>) -> vec3<f32> {
-    // Step 1: Y by -cam_lon. Aligns the camera meridian with the YZ
-    // plane (points east of camera land in +X, west in -X).
-    let cl = cos(cam.x);
-    let sl = sin(cam.x);
-    let x1 = cl * p.x - sl * p.z;
-    let z1 = sl * p.x + cl * p.z;
-    let y1 = p.y;
-    // Step 2: X by +cam_lat. Brings the camera latitude onto the
-    // equator of the new frame (north of camera lands in +Y).
-    let cla = cos(cam.y);
-    let sla = sin(cam.y);
-    let y2 = cla * y1 - sla * z1;
-    let z2 = sla * y1 + cla * z1;
-    return vec3<f32>(x1, y2, z2);
-}
-
 @vertex
 fn vs_main(in: VsIn) -> VsOut {
-    // ---- Flat-Mercator path (unchanged) ----
-    let offset_px = (in.world - camera.world_center) * camera.pixels_per_world;
-    let flat_ndc = vec2<f32>(
-        offset_px.x / camera.canvas_half.x,
-        -offset_px.y / camera.canvas_half.y,
-    );
-
-    // ---- Globe path ----
     let lonlat = world_to_lonlat_rad(in.world);
     let sphere = lonlat_to_sphere(lonlat);
-    let rotated = rotate_to_camera(sphere, camera.center_lonlat_rad);
-    // Aspect correction so the sphere stays round on non-square canvases.
-    let aspect = camera.canvas_half.x / camera.canvas_half.y;
-    let globe_ndc = vec2<f32>(
-        rotated.x * camera.globe_scale / aspect,
-        rotated.y * camera.globe_scale,
-    );
-
-    let ndc = mix(flat_ndc, globe_ndc, camera.globeness);
-
     var out: VsOut;
-    out.clip = vec4<f32>(ndc, 0.0, 1.0);
-    out.sphere_depth = rotated.z;
+    out.clip = camera.view_proj * vec4<f32>(sphere, 1.0);
+    // > 0 = front of sphere, < 0 = back. Linear interpolation across
+    // segments handles the horizon-crossing case per-fragment.
+    out.visibility = dot(sphere, camera.position) - 1.0;
     return out;
 }
 
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
-    // Discard back-of-sphere fragments once we're substantially
-    // globe-shaped. The 0.5 threshold lets the flat-and-mostly-flat
-    // views ignore depth entirely.
-    if (camera.globeness > 0.5 && in.sphere_depth < 0.0) {
+    if (in.visibility < 0.0) {
         discard;
     }
     return camera.color;

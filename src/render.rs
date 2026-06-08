@@ -28,7 +28,6 @@ use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
 
 use crate::camera::Camera;
-use crate::crs;
 use crate::tile::{self, DecodedTile, TileId, CHICAGO_LONLAT};
 use crate::vector::VectorLayer;
 
@@ -46,57 +45,32 @@ pub fn make_instance() -> wgpu::Instance {
     })
 }
 
-/// Per-tile uniform. Carries the tile's world-Mercator extent plus
-/// the full camera state — the tile shader tessellates the quad into
-/// a grid and runs the same flat ↔ sphere projection as the vector
-/// pass per vertex, so tiles wrap onto the globe at low zoom instead
-/// of just fading out.
-///
-/// Layout — five `vec4` rows (80 bytes):
-/// ```text
-/// row 0: world_rect.xyxy (xmin, ymin, xmax, ymax in normalised Mercator)
-/// row 1: world_center.xy | pixels_per_world | globeness
-/// row 2: canvas_half.xy  | center_lonlat_rad.xy
-/// row 3: globe_scale     | _pad.xyz
-/// row 4: _pad2.xyzw                  (kept so the struct is a multiple
-///                                     of vec4 even after future growth)
-/// ```
+/// Per-tile uniform consumed by `tile.wgsl`. Matches the WGSL
+/// `Uniforms` struct byte-for-byte (6 × `vec4` = 96 bytes):
+/// - rows 0–3: view-projection matrix (column-major)
+/// - row 4: camera position (xyz) + 1 pad
+/// - row 5: tile's world rect (xmin, ymin, xmax, ymax)
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default, Pod, Zeroable)]
 struct TileUniforms {
-    /// (x_min, y_min, x_max, y_max) of the tile in normalised
-    /// Mercator world coords.
+    view_proj: [f32; 16],
+    camera_pos: [f32; 3],
+    _pad0: f32,
     world_rect: [f32; 4],
-    world_center: [f32; 2],
-    pixels_per_world: f32,
-    globeness: f32,
-    canvas_half: [f32; 2],
-    center_lonlat_rad: [f32; 2],
-    globe_scale: f32,
-    _pad: [f32; 3],
 }
 
 /// Per-frame camera uniform consumed by `vector.wgsl`. Matches the
-/// WGSL `Camera` struct byte-for-byte (4 × `vec4` = 64 bytes).
-///
-/// Layout — each `vec4` row is 16 bytes:
-/// ```text
-/// row 0: world_center.xy | pixels_per_world | globeness
-/// row 1: canvas_half.xy  | center_lonlat_rad.xy
-/// row 2: color.rgba
-/// row 3: globe_scale     | _pad.xyz
-/// ```
+/// WGSL `Camera` struct byte-for-byte (5 × `vec4` = 80 bytes):
+/// - rows 0–3: view-projection matrix (column-major)
+/// - row 4: camera position (xyz) + 1 pad
+/// - row 5: color (rgba)
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default, Pod, Zeroable)]
 struct VectorCameraUniform {
-    world_center: [f32; 2],
-    pixels_per_world: f32,
-    globeness: f32,
-    canvas_half: [f32; 2],
-    center_lonlat_rad: [f32; 2],
+    view_proj: [f32; 16],
+    position: [f32; 3],
+    _pad0: f32,
     color: [f32; 4],
-    globe_scale: f32,
-    _pad: [f32; 3],
 }
 
 /// A vector-layer that's been uploaded as a GPU vertex buffer, ready
@@ -521,97 +495,49 @@ impl Renderer {
 
     /// Draw one frame.
     ///
-    /// **Multi-zoom rendering:** every loaded tile whose screen rect
-    /// overlaps the viewport gets drawn, regardless of its zoom level.
-    /// Sorted coarse-first so that finer tiles overdraw their parents
-    /// — during a zoom-in we see the stretched-up parents as a
-    /// fallback while children load, then they pop into focus.
-    ///
-    /// **Globe rendering:** at low zoom (globeness > 0) the
-    /// `tile_visible` flat-projection filter rejects tiles wrapping
-    /// onto the globe from the camera's far side, so we accept every
-    /// loaded tile and let the shader's per-fragment backface discard
-    /// handle hemispherical culling.
+    /// Single-projection 3D scene: every vertex (tile + vector)
+    /// projects its sphere position through the camera's
+    /// view-projection matrix. The flat-slippy-map look at high zoom
+    /// emerges from the camera being close to the sphere surface
+    /// (~2% above at z=10); the full globe view at low zoom emerges
+    /// from the camera being far enough out to see the whole sphere.
     pub fn render(&self) {
         let canvas = self.size();
-        let globeness = self.camera.globeness();
-        let on_globe = globeness > 0.0;
+        let view_proj = self.camera.view_projection_matrix(canvas);
+        let camera_pos = self.camera.camera_3d_position(canvas);
 
-        // Every loaded tile worth drawing this frame. The shader
-        // projects per-vertex through both flat-Mercator and
-        // ellipsoidal-globe pipelines and blends by globeness — so
-        // the same draw call works for either projection.
+        // All loaded tiles get rendered — the shader's per-fragment
+        // backface discard handles hemispherical culling, and the
+        // tile-fetch path keeps the working set bounded to what
+        // visible_tiles + parent prefetch ask for.
         let mut draws: Vec<(&TileId, [f32; 4], &TileBinding)> = self
             .tiles
             .iter()
-            .filter_map(|(id, binding)| {
-                let visible = on_globe || self.camera.tile_visible(*id, canvas);
-                if !visible {
-                    return None;
-                }
-                Some((id, id.world_rect(), binding))
-            })
+            .map(|(id, binding)| (id, id.world_rect(), binding))
             .collect();
-        // Coarse-first: finer tiles overdraw the stretched-up parents.
+        // Coarse-first: finer tiles overdraw their parents.
         draws.sort_by_key(|(id, _, _)| id.z);
 
-        // Per-tile uniform: tile's world rect + a snapshot of the
-        // current camera state. Camera fields are duplicated per tile
-        // (~64 bytes × N tiles), which is wasteful but keeps the bind-
-        // group shape simple — a future cleanup would split camera
-        // into a shared group 0 binding.
-        let (wcx, wcy) =
-            crs::lonlat_to_world(self.camera.center_lonlat.0, self.camera.center_lonlat.1);
-        let camera_snapshot = (
-            [wcx as f32, wcy as f32],
-            self.camera.pixels_per_world() as f32,
-            globeness,
-            [
-                self.config.width as f32 / 2.0,
-                self.config.height as f32 / 2.0,
-            ],
-            self.camera.center_lonlat_rad(),
-            0.9_f32, // globe_scale — must match vector pass's value
-        );
         for (_, world_rect, binding) in &draws {
             let u = TileUniforms {
+                view_proj,
+                camera_pos,
+                _pad0: 0.0,
                 world_rect: *world_rect,
-                world_center: camera_snapshot.0,
-                pixels_per_world: camera_snapshot.1,
-                globeness: camera_snapshot.2,
-                canvas_half: camera_snapshot.3,
-                center_lonlat_rad: camera_snapshot.4,
-                globe_scale: camera_snapshot.5,
-                _pad: [0.0; 3],
             };
             self.queue
                 .write_buffer(&binding.uniform_buf, 0, bytemuck::bytes_of(&u));
         }
 
-        // Write the per-frame camera uniform for the vector pass.
-        // Single 64-byte upload; cheap. The vector pass only draws
-        // if a layer has been set, but the uniform is ready either
-        // way so subsequent set_vector_layer doesn't need a refresh.
-        let (wcx, wcy) =
-            crs::lonlat_to_world(self.camera.center_lonlat.0, self.camera.center_lonlat.1);
+        // Per-frame vector-camera uniform. Single 80-byte upload.
         let vector_camera = VectorCameraUniform {
-            world_center: [wcx as f32, wcy as f32],
-            pixels_per_world: self.camera.pixels_per_world() as f32,
-            globeness: self.camera.globeness(),
-            canvas_half: [
-                self.config.width as f32 / 2.0,
-                self.config.height as f32 / 2.0,
-            ],
-            center_lonlat_rad: self.camera.center_lonlat_rad(),
-            // Country-outline overlay colour: a coral-orange that
-            // reads against OSM's brown/beige basemap. Alpha kept
-            // moderate so the basemap shows through faintly under
-            // the lines.
+            view_proj,
+            position: camera_pos,
+            _pad0: 0.0,
+            // Country-outline overlay colour: coral-orange that reads
+            // against OSM's brown/beige basemap. Alpha kept moderate
+            // so the basemap shows faintly under the lines.
             color: [0.95, 0.42, 0.22, 0.85],
-            // 0.9 leaves a 10% margin around the globe at globeness=1
-            // so the sphere isn't flush with the canvas edges.
-            globe_scale: 0.9,
-            _pad: [0.0; 3],
         };
         self.queue.write_buffer(
             &self.vector_camera_buf,

@@ -96,6 +96,63 @@ impl Camera {
         ]
     }
 
+    /// 3D position of the perspective camera in the same coordinate
+    /// system as `lonlat_to_sphere` returns. Camera sits on the line
+    /// from sphere centre outward through the camera's `(lon, lat)`,
+    /// at a distance `D = 1 + altitude(zoom, canvas)`.
+    pub fn camera_3d_position(&self, canvas: (u32, u32)) -> [f32; 3] {
+        let lon = self.center_lonlat.0.to_radians();
+        let lat = self.center_lonlat.1.to_radians();
+        let c = [
+            (lat.cos() * lon.sin()) as f32,
+            lat.sin() as f32,
+            (lat.cos() * lon.cos()) as f32,
+        ];
+        let d = 1.0 + self.altitude(canvas) as f32;
+        [c[0] * d, c[1] * d, c[2] * d]
+    }
+
+    /// Camera altitude above the sphere surface in 3D units (sphere
+    /// radius = 1). Computed to match the flat-Mercator slippy-map
+    /// scale at high zoom, capped at the low end so the sphere stays
+    /// visible at zoom 0 rather than shrinking to a dot.
+    ///
+    /// At high zoom (z ≥ ~4), altitude follows
+    /// `H · π / (256 · 2^z · tan(fov/2))` so 1 world unit on the
+    /// sphere subtends the same screen pixels as the slippy map
+    /// would. At low zoom, altitude clamps to `ALTITUDE_CEIL` so the
+    /// globe stays ~60% of the canvas.
+    pub fn altitude(&self, canvas: (u32, u32)) -> f64 {
+        const FOV_Y_RAD: f64 = std::f64::consts::FRAC_PI_3; // 60°
+        const ALTITUDE_CEIL: f64 = 2.0; // D ≤ 3 → globe subtends ~38°
+        let slippy = canvas.1 as f64 * std::f64::consts::PI
+            / (256.0 * 2.0_f64.powf(self.zoom) * (FOV_Y_RAD * 0.5).tan());
+        slippy.min(ALTITUDE_CEIL)
+    }
+
+    /// Combined view × perspective-projection 4x4 matrix in
+    /// **column-major** order (the convention `wgpu` / WGSL's
+    /// `mat4x4<f32>` reads).
+    pub fn view_projection_matrix(&self, canvas: (u32, u32)) -> [f32; 16] {
+        let cam_pos = self.camera_3d_position(canvas);
+        let aspect = canvas.0 as f32 / canvas.1.max(1) as f32;
+        // Standard look-at: eye → origin. "Up" handling near the
+        // poles: when the camera is nearly along the +Y axis (overhead
+        // view), the canonical +Y up would be parallel to the look
+        // direction. Pick an up vector that always has a usable
+        // tangent component.
+        let up = if self.center_lonlat.1.abs() > 89.0 {
+            // Looking nearly straight down (or up) — use +Z as up so
+            // the look direction (+Y or -Y) crosses it cleanly.
+            [0.0, 0.0, 1.0]
+        } else {
+            [0.0, 1.0, 0.0]
+        };
+        let view = look_at(cam_pos, [0.0, 0.0, 0.0], up);
+        let proj = perspective(60.0_f32.to_radians(), aspect, 0.01, 100.0);
+        mat4_mul(proj, view)
+    }
+
     /// Pan by a screen-pixel delta. The convention matches a mouse
     /// drag: `+dx` moves the user's view to the right, which means
     /// the world under the cursor moves to the right → the camera
@@ -234,6 +291,86 @@ impl Camera {
         let y_min = to_ndc_y(to_px_y(tile_world_max.1));
         let y_max = to_ndc_y(to_px_y(tile_world_min.1));
         [x_min, y_min, x_max, y_max]
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Small 4x4 matrix helpers — inlined to avoid pulling in a math crate.
+// Column-major throughout (the WGSL `mat4x4<f32>` convention).
+// ---------------------------------------------------------------------------
+
+/// Right-handed perspective projection matrix. Maps `+y up`, looking
+/// down `-z`, with `near` and `far` as positive distances.
+fn perspective(fov_y_rad: f32, aspect: f32, near: f32, far: f32) -> [f32; 16] {
+    let f = 1.0 / (fov_y_rad / 2.0).tan();
+    let nf = 1.0 / (near - far);
+    let mut m = [0.0_f32; 16];
+    m[0] = f / aspect;
+    m[5] = f;
+    m[10] = (far + near) * nf;
+    m[11] = -1.0;
+    m[14] = 2.0 * far * near * nf;
+    m
+}
+
+/// Right-handed look-at view matrix.
+fn look_at(eye: [f32; 3], target: [f32; 3], up: [f32; 3]) -> [f32; 16] {
+    let f = normalize([target[0] - eye[0], target[1] - eye[1], target[2] - eye[2]]);
+    let s = normalize(cross(f, up));
+    let u = cross(s, f);
+    let mut m = [0.0_f32; 16];
+    m[0] = s[0];
+    m[1] = u[0];
+    m[2] = -f[0];
+    m[3] = 0.0;
+    m[4] = s[1];
+    m[5] = u[1];
+    m[6] = -f[1];
+    m[7] = 0.0;
+    m[8] = s[2];
+    m[9] = u[2];
+    m[10] = -f[2];
+    m[11] = 0.0;
+    m[12] = -dot(s, eye);
+    m[13] = -dot(u, eye);
+    m[14] = dot(f, eye);
+    m[15] = 1.0;
+    m
+}
+
+/// Column-major 4x4 multiply: `m = a * b`.
+fn mat4_mul(a: [f32; 16], b: [f32; 16]) -> [f32; 16] {
+    let mut m = [0.0_f32; 16];
+    for col in 0..4 {
+        for row in 0..4 {
+            let mut sum = 0.0;
+            for k in 0..4 {
+                sum += a[k * 4 + row] * b[col * 4 + k];
+            }
+            m[col * 4 + row] = sum;
+        }
+    }
+    m
+}
+
+fn cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
+}
+
+fn dot(a: [f32; 3], b: [f32; 3]) -> f32 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+
+fn normalize(v: [f32; 3]) -> [f32; 3] {
+    let len = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+    if len > 0.0 {
+        [v[0] / len, v[1] / len, v[2] / len]
+    } else {
+        v
     }
 }
 
