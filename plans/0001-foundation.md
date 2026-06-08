@@ -2,8 +2,8 @@
 
 - **Status:** active
 - **Last updated:** 2026-06-08
-- **Last touched on:** M0 landed — wgpu surface + clear pass in both targets;
-  Pages deploy live at timthirion.github.io/aeGIS
+- **Last touched on:** M1.5 "first tile" — Chicago at z=10 fetched from
+  OSM + rendered via the textured-quad pass in both targets
 
 ## Goal
 
@@ -151,15 +151,20 @@ in a separate plan if/when needed.
 
 ### M1 — Camera + viewport + Web Mercator math
 
-- [ ] `core::crs::mercator` — forward + inverse Spherical Mercator (the
-      EPSG:3857 convention). Tests pin a round-trip grid over [-85°, 85°]
-      latitude × [-180°, 180°] longitude to within `1e-9` tolerance.
-- [ ] `core::tile` — XYZ tile math: `lonlat_to_tile(z, lon, lat) ->
-      (x, y)`, `tile_to_lonlat_nw(z, x, y) -> (lon, lat)` (the
-      north-west corner convention), `visible_tiles(camera, viewport)
-      -> Vec<TileId>`. Tests cover the canonical fixtures (z=0 has
-      one tile, z=1 has four, the tile containing 0°,0° at z=1 is
-      `(1, 1)`, …).
+- [x] `core::crs` — forward + inverse Spherical Mercator (`lonlat_to_world`
+      / `world_to_lonlat`) + tile-coordinate math
+      (`lonlat_to_tile_fractional` / `tile_to_lonlat_nw`). Tests pin a
+      round-trip grid over [-180°, 180°] × [-85°, 85°] to within
+      `1e-9` (37×171 = 6 327 points). Latitude clamps at
+      `±85.05112877980659°` so the projection never returns ±∞.
+- [x] `core::tile` — `TileId { z, x, y }` with `Copy + Eq + Hash`
+      (LRU-key-ready). `TileId::from_lonlat` clamps to `[0, 2^z)`.
+      Canonical fixtures pinned: z=0 has one tile, z=1's four
+      quadrants around (0°, 0°) each fall into their expected tile,
+      Chicago at z=10 = `(10, 262, 380)` and the corresponding OSM
+      URL is `tile.openstreetmap.org/10/262/380.png`.
+- [ ] `visible_tiles(camera, viewport) -> Vec<TileId>` — depends on
+      the camera (next sub-item).
 - [ ] `core::camera` — pan + zoom + wheel state; produces a
       `Mat4` for the WGSL projection uniform.
 - [ ] Input glue: native `winit` mouse drag → camera pan; web canvas
@@ -170,18 +175,73 @@ in a separate plan if/when needed.
 **Done when:** pan and zoom interactively in both targets show the
 correct visible-tile grid as wireframe overlays at every zoom level.
 
+### M1.5 — First tile (the "we have a map" stop) ✅ DONE
+
+A scoped subset of M1+M2 the user explicitly asked for as a visible
+checkpoint: fetch **one** raster tile centred on Chicago, render it
+as a fullscreen quad with aspect-correct letterboxing. No camera, no
+viewport math — just "the OSM tile of Chicago appears in the canvas."
+
+- [x] `tile::fetch_tile_blocking` (native, `ehttp`) +
+      `tile::fetch_tile_async` (web, `web_sys::fetch` +
+      `wasm_bindgen_futures::spawn_local`) — see notes below on why
+      ehttp's web path was dropped.
+- [x] `tile::decode_png` — pure-Rust PNG decode via `image` crate's
+      `png` feature (works on both targets).
+- [x] `Renderer::set_tile(width, height, rgba)` — uploads the bytes
+      as an `Rgba8UnormSrgb` texture, builds a fresh bind group,
+      replaces the current tile. Idempotent; safe to call repeatedly.
+- [x] `shaders/tile.wgsl` — textured fullscreen-triangle pass with
+      an aspect-correction uniform so the 256×256 tile stays square
+      regardless of canvas aspect (pillarbox / letterbox).
+- [x] Surface format switched to **sRGB** so PNG-sourced sRGB bytes
+      render with correct gamma end-to-end (GPU's auto sRGB→linear
+      on texture read + linear→sRGB on surface write cancel out).
+- [x] OSM tile source: `https://tile.openstreetmap.org/{z}/{x}/{y}.png`
+      with a `User-Agent: aegis/0.0.1 (https://github.com/timthirion/aeGIS)`
+      header (required by OSM's tile usage policy). Verified the
+      response HTTP 200 + `Content-Type: image/png` via `curl` with
+      the same header.
+- [x] Naga validation for `tile.wgsl` in `tests/shaders.rs`.
+
+**Done when:** the live Pages URL shows the Chicago metro at zoom 10,
+letterboxed inside the viewport; `cargo run` shows the same tile in
+a native window.
+  _Build-verified 2026-06-08: native + wasm both clean, tests green,
+  shader validation green. **Visual confirmation pending** — embedder
+  should reload the live URL once the deploy lands and `cargo run`
+  locally to confirm._
+
+**Why ehttp on native but `web_sys` directly on web:** ehttp 0.5's
+`fetch` requires a `Send + 'static` callback, which doesn't compose
+with our `Rc<RefCell<Inner>>` web-state shape. On wasm we have a
+single-threaded JS runtime, so `Send` is API-imposed bondage with no
+upside. `web_sys::fetch_with_str` + `JsFuture` + `spawn_local` gives
+the same fetch behaviour with no `Send` requirement, in ~20 lines.
+
+**wgpu 29 deltas worth pinning in plan history:**
+- `wgpu::SamplerDescriptor::mipmap_filter` is `MipmapFilterMode`
+  (not `FilterMode` — drift from older wgpu majors).
+- `PipelineLayoutDescriptor::bind_group_layouts` is `&[Option<&BGL>]`
+  (the Option wrapper supports unbound group slots).
+
 ### M2 — Raster slippy map: tile fetch + render + attribution
 
-- [ ] `core::tile::source` — `RasterTileSource` trait with one
-      implementation: a permissive open-data OSM-derived tile server.
-      Document the chosen endpoint + its attribution + its usage policy
-      in the plan's Open Questions resolution.
-- [ ] Channel-driven async tile fetcher (`reqwest` native /
-      `wasm-bindgen` fetch web). In-memory LRU cache keyed by
-      `(source, z, x, y)`.
-- [ ] PNG/WebP decode → `wgpu::Texture` upload. Tiles are 256×256.
-- [ ] `shaders/tile.wgsl` — textured-quad pass; one draw per visible
-      tile; sub-pixel-correct positioning at any zoom.
+- [x] `tile::TileId::osm_url` + `OSM_USER_AGENT` constant. OSM endpoint
+      chosen as the M2 source for dev/low-volume traffic only; the
+      Protomaps PMTiles path lands in plan 0004 (Phase 4).
+- [x] Single-tile blocking fetch (native) + async fetch (web) —
+      shipped in M1.5. The channel-driven multi-tile version comes
+      next.
+- [x] PNG decode → `wgpu::Texture` upload — shipped in M1.5 for one
+      tile.
+- [x] `shaders/tile.wgsl` textured-quad pass — shipped in M1.5 for
+      one tile. The "one draw per visible tile" generalisation comes
+      with the camera (M1 next).
+- [ ] `core::tile::source` — `RasterTileSource` trait abstracting
+      the URL builder; OSM is one impl, Protomaps another (Phase 4).
+- [ ] Channel-driven multi-tile async fetcher with in-memory LRU
+      cache keyed by `(source, z, x, y)`.
 - [ ] Attribution overlay: an HTML `<div>` (web) or `winit` window
       title bar entry (native) carrying the required attribution
       string. `attributionsFor(layer)` API placeholder.
@@ -243,13 +303,17 @@ least one tracked fixture rendering at zero diff.
 
 ## Open questions
 
-- **Tile source for M2:** OSM's CDN (`tile.openstreetmap.org`) explicitly
-  disallows heavy production traffic. Acceptable for development; the
-  default for `RasterTileSource` should probably be a Protomaps-rendered
-  raster mirror or a free MapTiler key the user supplies via env. Resolve
-  before M2 ships and document the chosen endpoint here.
-- **Web HTTP client:** `reqwest` builds on wasm via the `wasm-bindgen`
-  fetch backend, but `ehttp` is lighter. Decide in M2.
+- **Tile source for M2:** ✅ Resolved 2026-06-08. M1.5 uses OSM's CDN
+  (`tile.openstreetmap.org`) with the project-identifying `User-Agent:
+  aegis/0.0.1 (https://github.com/timthirion/aeGIS)`. Acceptable for
+  the dev/demo traffic from a single Pages URL; production-scale
+  traffic moves to self-hosted Protomaps PMTiles in plan 0004
+  (Phase 4) before we even risk crossing OSM's threshold.
+- **Web HTTP client:** ✅ Resolved 2026-06-08. Native uses `ehttp`
+  (which wraps `ureq`); web uses `web_sys::fetch` + `JsFuture` +
+  `spawn_local` directly because ehttp's web path requires a
+  `Send + 'static` callback that doesn't compose with the
+  `Rc<RefCell<Inner>>` web-state shape (M1.5 notes).
 - **Tile cache eviction:** simple LRU sized in tile-count for M2; revisit
   when raster tiles get supplemented by vector tiles (Phase 4) and
   cache pressure grows.

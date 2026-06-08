@@ -26,3 +26,8 @@ fn validate_wgsl(source: &str, label: &str) {
 fn clear_shader_validates() {
     validate_wgsl(include_str!("../src/shaders/clear.wgsl"), "clear.wgsl");
 }
+
+#[test]
+fn tile_shader_validates() {
+    validate_wgsl(include_str!("../src/shaders/tile.wgsl"), "tile.wgsl");
+}

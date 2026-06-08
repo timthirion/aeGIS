@@ -50,6 +50,19 @@ pub fn run() {
         size.height.max(1),
     ));
 
+    // Plan 0001 "first tile" — block on a single OSM tile centred on
+    // Chicago at zoom 10. Future milestones replace this with the
+    // viewport-driven tile selector (M2) + camera-driven projection
+    // (M1).
+    let (lon, lat) = tile::CHICAGO_LONLAT;
+    let tile_id = tile::TileId::from_lonlat(10, lon, lat);
+    let url = tile_id.osm_url();
+    log::info!("fetching startup tile: {url}");
+    match tile::fetch_tile_blocking(&url) {
+        Ok(decoded) => renderer.set_tile(decoded.width, decoded.height, &decoded.rgba),
+        Err(e) => log::warn!("startup tile fetch failed ({e}); showing fallback gradient"),
+    }
+
     event_loop
         .run(move |event, elwt| {
             if let Event::WindowEvent { window_id, event } = event {

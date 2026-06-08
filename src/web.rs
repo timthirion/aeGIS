@@ -15,6 +15,7 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 
 use crate::render::{make_instance, Renderer};
+use crate::tile;
 
 #[wasm_bindgen(start)]
 pub fn on_module_load() {
@@ -149,6 +150,27 @@ pub async fn start(host_id: String) -> Result<AegisInstance, JsValue> {
     };
     let resize_observer = web_sys::ResizeObserver::new(resize_cb.as_ref().unchecked_ref())?;
     resize_observer.observe(&host);
+
+    // Plan 0001 "first tile" — kick off a single OSM tile fetch
+    // centred on Chicago at zoom 10. The fetch is fire-and-forget;
+    // the callback runs on the JS event loop when bytes arrive, then
+    // borrows `inner` (the rAF tick can't be borrowing concurrently
+    // because JS callbacks run sequentially on the main thread).
+    let (lon, lat) = tile::CHICAGO_LONLAT;
+    let tile_id = tile::TileId::from_lonlat(10, lon, lat);
+    let url = tile_id.osm_url();
+    log::info!("fetching startup tile: {url}");
+    let inner_for_fetch = inner.clone();
+    tile::fetch_tile_async(&url, move |result| match result {
+        Ok(decoded) => {
+            inner_for_fetch.borrow_mut().renderer.set_tile(
+                decoded.width,
+                decoded.height,
+                &decoded.rgba,
+            );
+        }
+        Err(e) => log::warn!("startup tile fetch failed ({e}); showing fallback gradient"),
+    });
 
     Ok(AegisInstance {
         _inner: inner,
