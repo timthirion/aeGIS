@@ -601,13 +601,26 @@ impl Renderer {
         let view_proj = self.camera.view_projection_matrix(canvas);
         let camera_pos = self.camera.camera_3d_position(canvas);
 
-        // All loaded tiles get rendered — the shader's per-fragment
-        // backface discard handles hemispherical culling, and the
-        // tile-fetch path keeps the working set bounded to what
-        // visible_tiles + parent prefetch ask for.
+        // Tile draws: every loaded tile at or below the current
+        // rounded camera zoom. Filtering out deeper-than-current
+        // tiles is the fix for "zoom in, then zoom out, and tile
+        // text stays tiny": when the user zoomed in we loaded deep
+        // tiles whose native text size is sized for that zoom; on
+        // zoom-out those tiles are still in `self.tiles` and used
+        // to draw on top of the parents, painting small screen
+        // slivers with text that's now far too small. Skipping
+        // them here keeps the on-screen text scaled to the current
+        // zoom (parent tiles fill in until the new "right" zoom
+        // loads).
+        //
+        // We don't evict from `self.tiles`; the deeper bindings
+        // stay cached on the GPU so re-zooming-in finds them
+        // already uploaded.
+        let current_z = self.camera.zoom.round().clamp(0.0, crate::camera::MAX_ZOOM) as u8;
         let mut draws: Vec<(&TileId, [f32; 4], &TileBinding)> = self
             .tiles
             .iter()
+            .filter(|(id, _)| id.z <= current_z)
             .map(|(id, binding)| (id, id.world_rect(), binding))
             .collect();
         // Coarse-first: finer tiles overdraw their parents.
