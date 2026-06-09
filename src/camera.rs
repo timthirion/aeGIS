@@ -264,6 +264,17 @@ impl Camera {
     pub fn visible_tiles_capped(&self, canvas: (u32, u32), max_z: u8) -> Vec<TileId> {
         let max_z_f = (max_z as f64).min(MAX_ZOOM);
         let z = self.zoom.round().clamp(MIN_ZOOM, max_z_f) as u8;
+
+        // On the globe (and during the flat ↔ globe transition), the
+        // flat-Mercator viewport rect under-represents what the camera
+        // actually sees. At zoom 3 the camera is looking at a sphere
+        // and a third of the world is in view, but flat math would
+        // return a 4-tile-wide strip near the centre. Switch to a
+        // sphere-cap test whenever any curvature is being rendered.
+        if self.globeness() > 0.0 {
+            return self.visible_tiles_globe(canvas, z);
+        }
+
         let n = 1u32 << z;
         let n_f = n as f64;
         let max_i = (n - 1) as i64;
@@ -290,6 +301,51 @@ impl Camera {
                     x: tx as u32,
                     y: ty as u32,
                 });
+            }
+        }
+        tiles
+    }
+
+    /// Tiles at zoom `z` whose centre falls inside the camera's
+    /// front-facing spherical cap. Used by [`Self::visible_tiles_capped`]
+    /// at low zoom where the slippy-map rectangle is the wrong shape.
+    ///
+    /// Cap geometry: with the sphere at unit radius and the camera at
+    /// distance `D = 1 + altitude`, a surface point P is visible iff
+    /// `P · C ≥ 1/D` (both as unit vectors from the sphere centre).
+    /// A small margin past the limb keeps tiles whose centre sits just
+    /// behind the horizon but whose camera-facing edge is still on
+    /// screen — important at low zoom where each tile spans tens of
+    /// degrees of longitude.
+    fn visible_tiles_globe(&self, canvas: (u32, u32), z: u8) -> Vec<TileId> {
+        let n = 1u32 << z;
+        let lon_c = self.center_lonlat.0.to_radians();
+        let lat_c = self.center_lonlat.1.to_radians();
+        let cam_dir = [
+            lat_c.cos() * lon_c.sin(),
+            lat_c.sin(),
+            lat_c.cos() * lon_c.cos(),
+        ];
+        let d = 1.0 + self.altitude(canvas);
+        let limb_cos = (1.0 / d) - 0.05;
+
+        let mut tiles = Vec::new();
+        for ty in 0..n {
+            for tx in 0..n {
+                let wx = (tx as f64 + 0.5) / n as f64;
+                let wy = (ty as f64 + 0.5) / n as f64;
+                let (lon, lat) = crs::world_to_lonlat(wx, wy);
+                let lon_r = lon.to_radians();
+                let lat_r = lat.to_radians();
+                let p = [
+                    lat_r.cos() * lon_r.sin(),
+                    lat_r.sin(),
+                    lat_r.cos() * lon_r.cos(),
+                ];
+                let dot = p[0] * cam_dir[0] + p[1] * cam_dir[1] + p[2] * cam_dir[2];
+                if dot > limb_cos {
+                    tiles.push(TileId { z, x: tx, y: ty });
+                }
             }
         }
         tiles
@@ -693,6 +749,31 @@ mod tests {
             (4..=16).contains(&tiles.len()),
             "unexpected visible-tile count at z=10 / 800x600: {}",
             tiles.len()
+        );
+    }
+
+    #[test]
+    fn visible_tiles_on_globe_covers_hemisphere() {
+        // At zoom 3 the renderer is mostly globe (globeness ~0.74)
+        // and the camera can see roughly a third of the sphere. Flat-
+        // viewport math would return a 4-tile-wide strip near the
+        // camera centre (~12 tiles); the sphere-cap path should
+        // return many more — and must include tiles well outside
+        // the flat rect, e.g. 90° east of Chicago.
+        let c = Camera::new(CHICAGO_LONLAT.0, CHICAGO_LONLAT.1, 3.0);
+        let tiles = c.visible_tiles((800, 600));
+        assert!(
+            tiles.len() > 20,
+            "globe-view z=3 should reveal more than a flat strip: got {} tiles",
+            tiles.len()
+        );
+        // Chicago is roughly (z=3, x=2, y=2); 90° east puts us around
+        // x=4 at the same row — well outside the flat-Mercator rect
+        // centred on Chicago but solidly on the visible hemisphere.
+        let far_east_same_row = TileId { z: 3, x: 4, y: 2 };
+        assert!(
+            tiles.contains(&far_east_same_row),
+            "globe-view z=3 should include a tile 90° east of camera: {tiles:?}"
         );
     }
 
