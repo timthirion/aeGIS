@@ -1,17 +1,24 @@
 # Blue Marble Earth imagery
 
-`earth_1024x512.png` is a 1024×512 equirectangular reduction of NASA's
-**Blue Marble: Land Surface, Shallow Water, and Shaded Topography**
-(`land_shallow_topo_2048`), an open dataset by NASA / Goddard Space
-Flight Center / Reto Stöckli.
+`earth_2048x1024.jpg` is the canonical NASA **Blue Marble: Land
+Surface, Shallow Water, and Shaded Topography** (`land_shallow_topo_2048`)
+imagery, unmodified, an open dataset by NASA / Goddard Space Flight
+Center / Reto Stöckli.
 
 ## Provenance
 
 - Source URL: <https://eoimages.gsfc.nasa.gov/images/imagerecords/57000/57752/land_shallow_topo_2048.jpg>
 - NASA's catalog entry: <https://visibleearth.nasa.gov/images/57752/blue-marble-land-surface-shallow-water-and-shaded-topography>
-- Original size: 2048 × 1024 JPEG (≈ 240 KB)
-- Our bundled size: 1024 × 512 PNG (≈ 450 KB) — `sips` downscale then
-  format-convert.
+- Bundled size: 2048 × 1024 JPEG (≈ 240 KB) — same bytes NASA serves.
+
+We previously bundled a 1024×512 PNG (≈ 450 KB after format
+conversion). The larger native-resolution source is *smaller*
+because JPEG compresses photographs more efficiently than PNG, and
+gives 4× the pixel density on screen so the globe view stays sharp
+under closer cropping. WebGPU's downlevel WebGL2 limit caps
+`max_texture_dimension_2d` at 2048, so 2048×1024 is the largest
+equirectangular texture we can ship without dropping that
+compatibility floor.
 
 ## Licence and attribution
 

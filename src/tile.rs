@@ -106,6 +106,22 @@ pub fn decode_png(bytes: &[u8]) -> Result<DecodedTile, image::ImageError> {
     })
 }
 
+/// Decode raster bytes of any format the `image` crate's enabled
+/// features support (PNG + JPEG today). Used by the bundled Blue
+/// Marble Earth texture, which ships as JPEG to keep the wasm bundle
+/// small; tiles stay on the format-specific [`decode_png`] path for
+/// the explicit-format guarantee.
+pub fn decode_image(bytes: &[u8]) -> Result<DecodedTile, image::ImageError> {
+    let img = image::load_from_memory(bytes)?;
+    let rgba = img.to_rgba8();
+    let (width, height) = rgba.dimensions();
+    Ok(DecodedTile {
+        width,
+        height,
+        rgba: rgba.into_raw(),
+    })
+}
+
 /// Native-only synchronous tile fetch. Sends an HTTP GET with the
 /// project's `User-Agent`, decodes the PNG response into RGBA. Used by
 /// the native entry to load the startup tile before entering the

@@ -21,8 +21,11 @@ bytemuck = { version = "1.16", features = ["derive"] }
 thiserror = "2"
 log = "0.4"
 
-# PNG decode for raster tiles — pure-Rust; runs on both targets.
-image = { version = "0.25", default-features = false, features = ["png"] }
+# PNG decode for raster tiles + JPEG for the bundled Blue Marble
+# Earth texture (JPEG is 1/7th the size of an equivalent PNG and
+# satellite imagery has no flat-colour regions for JPEG to artifact).
+# Both decoders are pure-Rust.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 
 # GeoJSON parsing for the M3 vector overlay. Pure-Rust; works on
 # wasm32 with no extra config.

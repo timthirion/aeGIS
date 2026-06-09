@@ -38,9 +38,14 @@ const CAPS_SHADER: &str = include_str!("shaders/caps.wgsl");
 const EARTH_SHADER: &str = include_str!("shaders/earth.wgsl");
 
 /// Blue Marble equirectangular Earth imagery, embedded at compile time
-/// so it ships with the wasm and native binaries alike. 1024×512 PNG,
-/// ~450 KB. See `data/blue-marble/ATTRIBUTION.md`.
-const EARTH_PNG_BYTES: &[u8] = include_bytes!("../data/blue-marble/earth_1024x512.png");
+/// so it ships with the wasm and native binaries alike. 2048×1024 JPEG,
+/// ~240 KB — same bytes NASA Visible Earth serves as the canonical
+/// `land_shallow_topo_2048` source. See `data/blue-marble/ATTRIBUTION.md`.
+///
+/// JPEG rather than PNG keeps the wasm bundle small (the PNG equivalent
+/// of this image is 1.6 MB); satellite imagery has no flat-colour
+/// regions for JPEG to artifact visibly.
+const EARTH_JPG_BYTES: &[u8] = include_bytes!("../data/blue-marble/earth_2048x1024.jpg");
 
 /// Vertex count for the full Earth sphere — `LAT_BANDS × LON_SEGMENTS`
 /// quads × 6 verts/quad. Mirrors the constants in `earth.wgsl`.
@@ -1060,10 +1065,10 @@ fn build_earth_resources(
     wgpu::Texture,
     wgpu::Sampler,
 ) {
-    let decoded = tile::decode_png(EARTH_PNG_BYTES)
-        .expect("bundled Blue Marble PNG failed to decode — binary is corrupt");
+    let decoded = tile::decode_image(EARTH_JPG_BYTES)
+        .expect("bundled Blue Marble JPEG failed to decode — binary is corrupt");
     log::info!(
-        "earth texture: decoded {}×{} from bundled PNG",
+        "earth texture: decoded {}×{} from bundled JPEG",
         decoded.width,
         decoded.height
     );
