@@ -87,7 +87,7 @@ impl TileId {
                 y = self.y,
             ),
             TileProvider::Sentinel2Cloudless => format!(
-                "https://s2maps-tiles.eu/wmts/1.0.0/s2cloudless-2020_3857/default/g/\
+                "https://tiles.maps.eox.at/wmts/1.0.0/s2cloudless-2020_3857/default/g/\
                  {z}/{y}/{x}.jpg",
                 z = self.z,
                 x = self.x,
@@ -243,7 +243,7 @@ mod tests {
         let tile = TileId { z: 5, x: 9, y: 12 };
         assert_eq!(
             tile.tile_url(TileProvider::Sentinel2Cloudless),
-            "https://s2maps-tiles.eu/wmts/1.0.0/s2cloudless-2020_3857/default/g/\
+            "https://tiles.maps.eox.at/wmts/1.0.0/s2cloudless-2020_3857/default/g/\
              5/12/9.jpg"
         );
     }
