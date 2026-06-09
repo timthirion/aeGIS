@@ -642,23 +642,29 @@ impl Renderer {
 
         // Per-frame cap uniforms. Same view_proj + camera_pos as the
         // other passes; the per-cap `pole_sign` and `color` are baked
-        // into each buffer. Cap colours are expressed in 8-bit sRGB
-        // (the colour space paint pickers and hex codes speak) and
-        // converted to linear here — the sRGB surface re-encodes on
-        // output, so the shader needs linear values for the round-
-        // trip to land on the originally-chosen colour.
-        // North = soft pale blue-grey; south = soft warm white.
+        // into each buffer.
+        //
+        // No shading happens anywhere on the sphere (no lighting,
+        // no shadowing, no per-fragment darkening) — the colours
+        // round-trip through the sRGB pipeline exactly. The previous
+        // pass at these values (185,204,211 / 243,239,230) read as
+        // "too dark" because macOS's Digital Color Meter defaults to
+        // **Display in P3** on wide-gamut Macs, and that picker
+        // reports the *display-native* values, not sRGB. Interpreting
+        // those numbers as sRGB lands a few percent dimmer than the
+        // user actually picked. Bumped each channel toward white;
+        // iterate from here.
         let north_cap = CapUniform {
             view_proj,
             camera_pos,
             pole_sign: 1.0,
-            color: srgb8_to_linear_rgba(185, 204, 211, 255),
+            color: srgb8_to_linear_rgba(214, 228, 234, 255),
         };
         let south_cap = CapUniform {
             view_proj,
             camera_pos,
             pole_sign: -1.0,
-            color: srgb8_to_linear_rgba(243, 239, 230, 255),
+            color: srgb8_to_linear_rgba(252, 250, 246, 255),
         };
         self.queue
             .write_buffer(&self.north_cap_buf, 0, bytemuck::bytes_of(&north_cap));
