@@ -287,11 +287,20 @@ impl Camera {
         let top = (wcy - half_h_world).max(0.0);
         let bottom = (wcy + half_h_world).min(1.0);
 
+        // One-tile margin around the floored rect. Without it, tiles
+        // that are partially clipped by the viewport edge can fall
+        // outside the dispatched set — the rendered viewport is
+        // wider than the slippy-floor rect when the camera is at a
+        // fractional zoom (ppw uses self.zoom, tile addresses use
+        // round(self.zoom)), and at low-altitude perspective the
+        // canvas corners see slightly more world per pixel than the
+        // centre. The margin is cheap (~4 extra tiles) and covers
+        // both cases plus any DPR-rounding drift.
         let clamp = |v: f64| (v as i64).clamp(0, max_i);
-        let tile_min_x = clamp((left * n_f).floor());
-        let tile_max_x = clamp((right * n_f).floor());
-        let tile_min_y = clamp((top * n_f).floor());
-        let tile_max_y = clamp((bottom * n_f).floor());
+        let tile_min_x = clamp((left * n_f).floor() - 1.0);
+        let tile_max_x = clamp((right * n_f).floor() + 1.0);
+        let tile_min_y = clamp((top * n_f).floor() - 1.0);
+        let tile_max_y = clamp((bottom * n_f).floor() + 1.0);
 
         let mut tiles = Vec::new();
         for ty in tile_min_y..=tile_max_y {
@@ -744,9 +753,12 @@ mod tests {
             "Chicago tile not in visible set: {tiles:?}"
         );
         // 800×600 viewport at z=10 with 256-px tiles covers about
-        // 3-4 tiles wide × 3 tall — somewhere in [4, 16] inclusive.
+        // 3-4 tiles wide × 3 tall, plus a one-tile margin on every
+        // side (so edge-clipped tiles still get dispatched) — about
+        // 5-6 × 4-5 = 20-30, with [12, 42] as a generous outer
+        // bound that won't flap if the Chicago coords nudge.
         assert!(
-            (4..=16).contains(&tiles.len()),
+            (12..=42).contains(&tiles.len()),
             "unexpected visible-tile count at z=10 / 800x600: {}",
             tiles.len()
         );
@@ -778,20 +790,23 @@ mod tests {
     }
 
     #[test]
-    fn tile_visible_matches_visible_tiles_at_native_zoom() {
-        // At the camera's exact zoom level, `tile_visible` should
-        // agree with `visible_tiles` for every tile in the world.
+    fn tile_visible_is_subset_of_visible_tiles_at_native_zoom() {
+        // Every tile that `tile_visible` accepts (strict NDC-rect
+        // overlap with the viewport) must also be in `visible_tiles`
+        // (which dispatches with a one-tile edge margin). The reverse
+        // does NOT hold: the margin tiles aren't strictly visible.
         let c = Camera::new(CHICAGO_LONLAT.0, CHICAGO_LONLAT.1, 10.0);
         let canvas = (800, 600);
         let visible: std::collections::HashSet<_> = c.visible_tiles(canvas).into_iter().collect();
         for x in 256..272 {
             for y in 376..386 {
                 let id = TileId { z: 10, x, y };
-                assert_eq!(
-                    c.tile_visible(id, canvas),
-                    visible.contains(&id),
-                    "z=10 tile ({x}, {y}): visible_tiles vs tile_visible disagree"
-                );
+                if c.tile_visible(id, canvas) {
+                    assert!(
+                        visible.contains(&id),
+                        "z=10 tile ({x}, {y}): in viewport but not dispatched"
+                    );
+                }
             }
         }
     }
