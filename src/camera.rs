@@ -198,18 +198,38 @@ impl Camera {
         self.center_lonlat = crs::world_to_lonlat(new_wx, new_wy);
     }
 
-    /// Zoom by `delta` (positive = zoom in) while keeping the world
-    /// point under screen pixel `cursor_px` pinned to that pixel.
-    /// `canvas_size_px` is the current `(width, height)` in physical
-    /// pixels.
+    /// Zoom by `delta` (positive = zoom in). At flat-Mercator zoom
+    /// the world point under screen pixel `cursor_px` stays pinned
+    /// to that pixel (the natural shape for wheel-zoom-around-cursor).
+    /// At globe view the pinning fades out so a wheel tick is a pure
+    /// zoom around the camera centre. `canvas_size_px` is the current
+    /// `(width, height)` in physical pixels.
+    ///
+    /// **Why the fade.** `screen_to_world` uses flat-Mercator math.
+    /// At low zoom the canvas covers way more than one world width
+    /// of normalised Mercator (ppw = 256 at zoom 0, half-canvas at
+    /// 500 px → world half-width 1.95). The cursor at any
+    /// non-centre position maps to a "world coord" outside [0, 1],
+    /// which doesn't correspond to anything the user sees on the
+    /// 3D-projected sphere. Pinning that phantom point translates
+    /// to the camera rotating a non-trivial arc per wheel tick —
+    /// "the ball wants to roll above all else." Blending the shift
+    /// by `(1 - globeness)` collapses the rotation to zero at full
+    /// globe and re-introduces it smoothly across the transition
+    /// band as the slippy-map regime takes over.
     pub fn zoom_at(&mut self, delta: f64, cursor_px: (f64, f64), canvas_size_px: (u32, u32)) {
         let world_before = self.screen_to_world(cursor_px, canvas_size_px);
         self.zoom = (self.zoom + delta).clamp(MIN_ZOOM, MAX_ZOOM);
         let world_after = self.screen_to_world(cursor_px, canvas_size_px);
-        // Shift the centre so `world_after` == `world_before` post-zoom.
+        // Shift the centre so `world_after` == `world_before`, scaled
+        // by `(1 - globeness)` so the pinning fades out as the camera
+        // approaches the full globe view.
+        let pin = 1.0 - self.globeness() as f64;
+        let shift_x = (world_before.0 - world_after.0) * pin;
+        let shift_y = (world_before.1 - world_after.1) * pin;
         let (wcx, wcy) = crs::lonlat_to_world(self.center_lonlat.0, self.center_lonlat.1);
-        let new_wcx = (wcx + world_before.0 - world_after.0).rem_euclid(1.0);
-        let new_wcy = (wcy + world_before.1 - world_after.1).clamp(0.0, 1.0);
+        let new_wcx = (wcx + shift_x).rem_euclid(1.0);
+        let new_wcy = (wcy + shift_y).clamp(0.0, 1.0);
         self.center_lonlat = crs::world_to_lonlat(new_wcx, new_wcy);
     }
 
@@ -565,15 +585,18 @@ mod tests {
     }
 
     #[test]
-    fn zoom_at_pins_world_under_cursor() {
-        // The world point under a given screen pixel must be the same
-        // before and after zoom_at — that's the entire UX promise of
-        // wheel-zoom-around-cursor.
-        let mut c = Camera::new(CHICAGO_LONLAT.0, CHICAGO_LONLAT.1, 4.0);
+    fn zoom_at_pins_world_under_cursor_at_flat_zoom() {
+        // **Flat-regime invariant.** The world point under a given
+        // screen pixel must be the same before and after zoom_at —
+        // that's the UX promise of wheel-zoom-around-cursor in the
+        // slippy-map regime. At globe-transition zooms the pinning
+        // intentionally fades out; see the globe-view test below.
+        let mut c = Camera::new(CHICAGO_LONLAT.0, CHICAGO_LONLAT.1, 10.0);
+        assert_eq!(c.globeness(), 0.0);
         let canvas = (800, 600);
-        let cursor = (640.0, 200.0); // somewhere off-centre
+        let cursor = (640.0, 200.0); // off-centre
         let world_before = c.screen_to_world(cursor, canvas);
-        c.zoom_at(1.7, cursor, canvas);
+        c.zoom_at(0.5, cursor, canvas);
         let world_after = c.screen_to_world(cursor, canvas);
         assert!(
             close(world_before.0, world_after.0, 1e-9),
@@ -586,6 +609,38 @@ mod tests {
             "world y drift: {} → {}",
             world_before.1,
             world_after.1
+        );
+    }
+
+    #[test]
+    fn zoom_at_does_not_pan_at_full_globe() {
+        // **Globe-regime invariant.** At globeness=1 a wheel tick must
+        // be a pure zoom around the camera centre. The previous
+        // behaviour pinned the cursor world point computed from
+        // flat-Mercator math, which at globe-scale maps off-centre
+        // cursors to world coords well outside [0, 1] and produced
+        // a meaningful camera rotation per wheel tick — making
+        // initial zoom-in from the globe view hard to control.
+        let mut c = Camera::new(CHICAGO_LONLAT.0, CHICAGO_LONLAT.1, 0.0);
+        assert_eq!(c.globeness(), 1.0);
+        let centre_before = c.center_lonlat;
+        // A maximally-off-centre cursor at full globe — anywhere this
+        // mapping breaks down the worst.
+        c.zoom_at(0.5, (790.0, 10.0), (800, 600));
+        let centre_after = c.center_lonlat;
+        // Centre survives the forward+inverse Mercator round trip in
+        // zoom_at to within 1e-9; allow 1e-6 for inherited slop.
+        assert!(
+            close(centre_before.0, centre_after.0, 1e-6),
+            "lon shift at globe view: {} → {}",
+            centre_before.0,
+            centre_after.0
+        );
+        assert!(
+            close(centre_before.1, centre_after.1, 1e-6),
+            "lat shift at globe view: {} → {}",
+            centre_before.1,
+            centre_after.1
         );
     }
 
