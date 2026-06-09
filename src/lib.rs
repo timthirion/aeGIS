@@ -6,6 +6,7 @@
 //!
 //! See `AGENTS.md` and `plans/ROADMAP.md` for the project's direction.
 
+pub mod bm_tile;
 pub mod camera;
 pub mod crs;
 pub mod render;
@@ -127,7 +128,9 @@ pub fn run() {
                     }
                     WindowEvent::RedrawRequested => {
                         renderer.drain_completed_fetches();
+                        renderer.drain_bm_completed_fetches();
                         renderer.ensure_visible_tiles();
+                        renderer.ensure_visible_bm_tiles();
                         renderer.render();
                         window.request_redraw();
                     }

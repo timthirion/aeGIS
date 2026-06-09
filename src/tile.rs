@@ -123,20 +123,20 @@ pub fn decode_image(bytes: &[u8]) -> Result<DecodedTile, image::ImageError> {
 }
 
 /// Native-only synchronous tile fetch. Sends an HTTP GET with the
-/// project's `User-Agent`, decodes the PNG response into RGBA. Used by
-/// the native entry to load the startup tile before entering the
-/// event loop.
+/// project's `User-Agent` and autodetects the response format (PNG
+/// for Carto, JPEG for NASA GIBS — both basemap layers share this
+/// path).
 #[cfg(not(target_arch = "wasm32"))]
 pub fn fetch_tile_blocking(url: &str) -> Result<DecodedTile, String> {
     let request = ehttp::Request {
-        headers: ehttp::Headers::new(&[("User-Agent", TILE_USER_AGENT), ("Accept", "image/png")]),
+        headers: ehttp::Headers::new(&[("User-Agent", TILE_USER_AGENT), ("Accept", "image/*")]),
         ..ehttp::Request::get(url)
     };
     let response = ehttp::fetch_blocking(&request).map_err(|e| format!("fetch: {e}"))?;
     if !response.ok {
         return Err(format!("HTTP {} for {}", response.status, url));
     }
-    decode_png(&response.bytes).map_err(|e| format!("decode_png: {e}"))
+    decode_image(&response.bytes).map_err(|e| format!("decode: {e}"))
 }
 
 /// Web-only async tile fetch. Spawns a task on the browser's event
@@ -176,7 +176,7 @@ pub async fn fetch_tile_web(url: &str) -> Result<DecodedTile, String> {
     .await
     .map_err(|e| format!("array_buffer await: {e:?}"))?;
     let bytes = js_sys::Uint8Array::new(&buffer).to_vec();
-    decode_png(&bytes).map_err(|e| format!("decode_png: {e}"))
+    decode_image(&bytes).map_err(|e| format!("decode: {e}"))
 }
 
 #[cfg(test)]

@@ -96,7 +96,9 @@ impl Inner {
             self.renderer.resize(w, h);
         }
         self.renderer.drain_completed_fetches();
+        self.renderer.drain_bm_completed_fetches();
         self.renderer.ensure_visible_tiles();
+        self.renderer.ensure_visible_bm_tiles();
         self.renderer.render();
     }
 }
