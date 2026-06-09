@@ -8,6 +8,7 @@
 
 pub mod camera;
 pub mod crs;
+pub mod flyto;
 pub mod net;
 pub mod render;
 pub mod search;
@@ -76,6 +77,10 @@ pub fn run() {
 
     let mut cursor_px: (f64, f64) = (0.0, 0.0);
     let mut dragging = false;
+    // Monotonic clock for the fly-to animation. `Instant::now()` is
+    // the same source the renderer was already implicitly using via
+    // `std::thread::spawn` timestamps in the tile fetcher.
+    let startup = std::time::Instant::now();
 
     event_loop
         .run(move |event, elwt| {
@@ -124,7 +129,7 @@ pub fn run() {
                             let dx = new_cursor.0 - cursor_px.0;
                             let dy = new_cursor.1 - cursor_px.1;
                             let canvas = renderer.size();
-                            renderer.camera.pan(dx, dy, canvas);
+                            renderer.user_pan(dx, dy, canvas);
                         }
                         cursor_px = new_cursor;
                     }
@@ -139,13 +144,13 @@ pub fn run() {
                             // "needs to be more responsive" feel.
                             MouseScrollDelta::PixelDelta(p) => p.y * 0.01,
                         };
-                        renderer
-                            .camera
-                            .zoom_at(zoom_delta, cursor_px, renderer.size());
+                        renderer.user_zoom_at(zoom_delta, cursor_px, renderer.size());
                     }
                     WindowEvent::RedrawRequested => {
                         renderer.drain_completed_fetches();
                         renderer.drain_sat_completed_fetches();
+                        let now = startup.elapsed().as_secs_f64();
+                        renderer.tick_fly_to(now);
                         renderer.ensure_visible_tiles();
                         renderer.ensure_visible_sat_tiles();
                         renderer.render();

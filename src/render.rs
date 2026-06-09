@@ -290,7 +290,17 @@ pub struct Renderer {
 
     /// Camera state. Public for direct mutation by input handlers
     /// (`renderer.camera.pan(...)`, `renderer.camera.zoom_at(...)`).
+    /// Direct mutation also implicitly cancels any in-flight fly-to
+    /// via the `pan` / `zoom_at` wrappers below; raw `camera.pan`
+    /// from input handlers should go through [`Self::user_pan`] /
+    /// [`Self::user_zoom_at`] instead so the cancellation fires.
     pub camera: Camera,
+
+    /// In-flight fly-to animation, if any. [`Self::tick`] samples
+    /// from this every frame and applies the result to `camera`.
+    /// User input (pan / zoom / basemap toggle) clears it so the
+    /// animation never fights the user. Plan 0002 M3.
+    flyto: Option<crate::flyto::FlyTo>,
 }
 
 impl Renderer {
@@ -547,7 +557,23 @@ impl Renderer {
             // straight into satellite imagery that reads as a
             // recognisable place, not a hemisphere of green-and-blue.
             camera: Camera::new(CHICAGO_LONLAT.0, CHICAGO_LONLAT.1, 11.0),
+            flyto: None,
         }
+    }
+
+    /// User pan — pixel delta from a mouse drag. Cancels any
+    /// in-flight fly-to before applying the pan, so the animation
+    /// doesn't keep gliding under the user's input.
+    pub fn user_pan(&mut self, dx_px: f64, dy_px: f64, canvas_px: (u32, u32)) {
+        self.flyto = None;
+        self.camera.pan(dx_px, dy_px, canvas_px);
+    }
+
+    /// User zoom — wheel delta around a cursor position. Cancels
+    /// any in-flight fly-to before applying the zoom.
+    pub fn user_zoom_at(&mut self, delta: f64, cursor_px: (f64, f64), canvas_size_px: (u32, u32)) {
+        self.flyto = None;
+        self.camera.zoom_at(delta, cursor_px, canvas_size_px);
     }
 
     /// Upload a vector overlay's vertex buffer (LineList layout: each
@@ -963,6 +989,10 @@ impl Renderer {
         if self.basemap_mode == mode {
             return;
         }
+        // Basemap toggle is a user input — cancel any in-flight
+        // fly-to so the camera doesn't keep gliding under the new
+        // basemap.
+        self.flyto = None;
         self.basemap_mode = mode;
         if mode == BasemapMode::Satellite {
             self.dispatch_visible_sat_tiles();
@@ -970,6 +1000,93 @@ impl Renderer {
             self.sat_dwell_snapshot = Some(SatDwellSnapshot::from_camera(&self.camera, canvas));
             self.sat_dwell_frames = SAT_DWELL_FRAMES.saturating_add(1);
         }
+    }
+
+    // ---------------------------------------------------------------------
+    // Fly-to: smooth camera glide to a search-result location. Plan 0002 M3.
+    // ---------------------------------------------------------------------
+
+    /// Start a fly-to from the current camera state to
+    /// `(target_lonlat, target_zoom)`. `now` is monotonic time in
+    /// seconds — the caller supplies it from `Instant::now()` on
+    /// native and `performance.now()` on web. Replaces any
+    /// in-flight fly-to.
+    pub fn fly_to(&mut self, target_lonlat: (f64, f64), target_zoom: f64, now: f64) {
+        self.flyto = Some(crate::flyto::FlyTo::to_target(
+            &self.camera,
+            target_lonlat,
+            target_zoom,
+            now,
+        ));
+    }
+
+    /// Start a fly-to that fits `bbox` (as
+    /// `[lon_min, lat_min, lon_max, lat_max]`) into the canvas with
+    /// a 10% margin on every side. Targets the bbox centre.
+    pub fn fly_to_bbox(&mut self, bbox: [f64; 4], now: f64) {
+        let canvas = self.size();
+        let zoom = crate::flyto::zoom_to_fit_bbox(bbox, canvas);
+        let target = crate::flyto::bbox_center(bbox);
+        self.fly_to(target, zoom, now);
+    }
+
+    /// Cancel any in-flight fly-to without moving the camera.
+    /// Call from user-input handlers (pan, zoom, basemap toggle).
+    pub fn cancel_fly_to(&mut self) {
+        self.flyto = None;
+    }
+
+    /// True iff a fly-to is currently animating.
+    pub fn is_flying(&self) -> bool {
+        self.flyto.is_some()
+    }
+
+    /// Advance the fly-to animation by one frame. `now` is the
+    /// same monotonic-seconds value the caller passes to `fly_to`.
+    /// Clears the animation when complete. No-op when no fly-to
+    /// is active.
+    pub fn tick_fly_to(&mut self, now: f64) {
+        let Some(fly) = self.flyto else { return };
+        let (lonlat, zoom) = fly.sample(now);
+        self.camera.center_lonlat = lonlat;
+        self.camera.zoom = zoom.clamp(crate::camera::MIN_ZOOM, crate::camera::MAX_ZOOM);
+        if fly.is_done(now) {
+            self.flyto = None;
+        }
+    }
+
+    /// Headless "search and go" — parses `query` as either a
+    /// coordinate expression or a geocoder query, picks the first
+    /// result, and kicks off a fly-to to it. Native only;
+    /// blocking. On web the equivalent flow lives in
+    /// `src/web.rs`'s search-bar handler (M2).
+    ///
+    /// Returns the `SearchResult` that the camera is flying to,
+    /// or `None` for a coord-parseable input (no geocoder result).
+    /// `Err` if the query was unparseable AND the geocoder
+    /// returned no results.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn search_and_fly_to(
+        &mut self,
+        query: &str,
+        now: f64,
+    ) -> Result<Option<crate::search::SearchResult>, crate::search::GeocodeError> {
+        // Coord path first — offline and unambiguous when it matches.
+        if let Some((lon, lat)) = crate::search::parse_coord(query) {
+            self.fly_to((lon, lat), 12.0, now);
+            return Ok(None);
+        }
+        let mut client = crate::search::GeocoderClient::new();
+        let near = Some(self.camera.center_lonlat);
+        let results = crate::search::geocode_blocking(&mut client, query, near)?;
+        let Some(first) = results.into_iter().next() else {
+            return Err(crate::search::GeocodeError::Malformed);
+        };
+        match first.bbox {
+            Some(b) => self.fly_to_bbox(b, now),
+            None => self.fly_to(first.lonlat, first.kind.default_zoom(), now),
+        }
+        Ok(Some(first))
     }
 
     /// Native: spawn a thread per satellite-tile request.

@@ -97,6 +97,10 @@ impl Inner {
         }
         self.renderer.drain_completed_fetches();
         self.renderer.drain_sat_completed_fetches();
+        // Monotonic seconds since the page loaded. `performance.now()`
+        // returns ms — divide for the seconds the fly-to sampler wants.
+        let now = web_window().performance().map_or(0.0, |p| p.now() / 1000.0);
+        self.renderer.tick_fly_to(now);
         self.renderer.ensure_visible_tiles();
         self.renderer.ensure_visible_sat_tiles();
         self.renderer.render();
@@ -329,7 +333,7 @@ pub async fn start(host_id: String) -> Result<AegisInstance, JsValue> {
                         let dy = new_cursor.1 - prev.1;
                         let mut inner_mut = inner.borrow_mut();
                         let canvas_size = inner_mut.renderer.size();
-                        inner_mut.renderer.camera.pan(dx, dy, canvas_size);
+                        inner_mut.renderer.user_pan(dx, dy, canvas_size);
                     }
                     shared.cursor_px.set(new_cursor);
                 }
@@ -406,8 +410,7 @@ pub async fn start(host_id: String) -> Result<AegisInstance, JsValue> {
                     inner
                         .borrow_mut()
                         .renderer
-                        .camera
-                        .zoom_at(zoom_delta, cursor, canvas_size);
+                        .user_zoom_at(zoom_delta, cursor, canvas_size);
                 }
             }) as Box<dyn FnMut(web_sys::Event)>)
         },
