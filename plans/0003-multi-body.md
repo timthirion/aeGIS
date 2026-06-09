@@ -1,9 +1,10 @@
 # Multi-body globes: Mars, Moon, and the path to fictional worlds
 
-- **Status:** proposed
+- **Status:** done
 - **Last updated:** 2026-06-09
-- **Last touched on:** drafted alongside plan 0002 (search) during
-  the post-Phase-9 cleanup; nothing implemented yet
+- **Last touched on:** M0–M4 all shipped in one session
+  (`4cd506f`, `c56b5f0`, `af42944`, and the M4 close commit). Body
+  switcher (🌍 🔴 🌙 🧙) lives next to the "aeGIS" title.
 
 ## Goal
 
@@ -239,22 +240,22 @@ re-renders the attribution panel.
 
 ### M0 — Body abstraction + Earth refactor (MAP-body-abstraction)
 
-- [ ] `Body`, `Basemap`, `BodyId`, `BasemapId`, `TileProjection`,
+- [x] `Body`, `Basemap`, `BodyId`, `BasemapId`, `TileProjection`,
       `HomeView`, `CapColors`, `CrsConvention` types in a new
       `src/body.rs`.
-- [ ] Replace the `BasemapMode` enum with `(BodyId, BasemapId)`
+- [x] Replace the `BasemapMode` enum with `(BodyId, BasemapId)`
       pairs everywhere it's used (renderer state, web getter /
       setter, basemap-toggle wiring).
-- [ ] `TileProvider` becomes a record (`projection`,
+- [x] `TileProvider` becomes a record (`projection`,
       `url_template`, `max_z`); `tile_url` formats from the
       template.
-- [ ] Static `EARTH: Body` with the two existing basemaps; nothing
+- [x] Static `EARTH: Body` with the two existing basemaps; nothing
       else changes about Earth's behaviour. The live demo looks
       identical post-M0.
-- [ ] Test: `Body::all().iter().map(|b| b.basemaps.len()).sum() >=
+- [x] Test: `Body::all().iter().map(|b| b.basemaps.len()).sum() >=
       1` and every basemap's URL template has the expected
       `{z}/{x}/{y}` (or `{z}/{y}/{x}`) substitution points.
-- [ ] **Body-aware search refactor** (absorbed from plan 0002 per
+- [x] **Body-aware search refactor** (absorbed from plan 0002 per
       its Open questions resolution): `SearchTarget` and
       `SearchResult` in `src/search.rs` gain `body: BodyId`.
       `GeocoderClient::geocode` short-circuits with
@@ -266,62 +267,62 @@ re-renders the attribution panel.
 
 ### M1 — Equirectangular tile projection (MAP-eq-projection)
 
-- [ ] `Camera::visible_tiles_capped` dispatches on
+- [x] `Camera::visible_tiles_capped` dispatches on
       `body.basemaps[active].provider.projection`. New Equirectangular
       path computes tile addresses without Mercator stretch. Test
       that at z=2 with an Equirectangular Earth-equivalent body,
       the centre tile covers `(0°, 0°)`.
-- [ ] `tile.wgsl` gains a uniform `projection_kind: u32` and the
+- [x] `tile.wgsl` gains a uniform `projection_kind: u32` and the
       `world_to_lonlat_rad` function branches accordingly. Add a
       `caps_shader_validates`-style shader test.
-- [ ] `Body::Earth` keeps `WebMercator`; nothing else changes
+- [x] `Body::Earth` keeps `WebMercator`; nothing else changes
       visually. A dummy `Body::EarthEq` (test-only, not exposed)
       with the Equirectangular flag round-trips through the
       pipeline so the EQ path is exercised before Mars lands.
 
 ### M2 — Mars (MAP-mars)
 
-- [ ] Add `MARS: Body` to `body.rs`: Viking Color Mosaic +
+- [x] Add `MARS: Body` to `body.rs`: Viking Color Mosaic +
       MOLA Hillshade as two basemaps, Olympus Mons home view,
       bundled equirectangular fallback texture, dust-red cap
       colours, `show_political_overlays: false`.
-- [ ] `data/mars/mars_fallback_2048x1024.jpg` (downscaled Viking
+- [x] `data/mars/mars_fallback_2048x1024.jpg` (downscaled Viking
       mosaic export, ≤ 2 MB) committed to the repo with a small
       `data/mars/README.md` documenting source + license.
-- [ ] Body switcher UI in `index.html` + wiring in `src/web.rs`
+- [x] Body switcher UI in `index.html` + wiring in `src/web.rs`
       that flips between Earth and Mars. Per-body basemap toggle
       updates its labels (e.g. "Color" / "Terrain" instead of
       "Map" / "Satellite").
-- [ ] Attribution footer becomes a function of the current body
+- [x] Attribution footer becomes a function of the current body
       + basemap (template-driven from `Basemap::attribution_html`).
-- [ ] Reference render: a screenshot at
+- [x] Reference render: a screenshot at
       `tests/visual/mars-olympus-mons.png` so future regressions are
       reviewable.
 
 ### M3 — Moon (MAP-moon)
 
-- [ ] `MOON: Body` with LRO WAC global mosaic, Apollo 11 home
+- [x] `MOON: Body` with LRO WAC global mosaic, Apollo 11 home
       view, bundled equirectangular fallback, neutral-grey cap
       colours. Mostly a data add — M0–M2 should be doing all the
       structural work.
-- [ ] Reference render at `tests/visual/moon-tranquillitatis.png`.
-- [ ] Body switcher now shows three options.
+- [x] Reference render at `tests/visual/moon-tranquillitatis.png`.
+- [x] Body switcher now shows three options.
 
 ### M4 — Polish + a path for fictional worlds (MAP-multi-body-polish)
 
-- [ ] **Camera default per body:** body switch sets the camera to
+- [x] **Camera default per body:** body switch sets the camera to
       that body's `HomeView` (a smooth fly-to if plan 0002 has
       shipped; an instant snap otherwise).
-- [ ] **Per-body tile cache partition:** the existing `tiles` /
+- [x] **Per-body tile cache partition:** the existing `tiles` /
       `sat_tiles` HashMaps are keyed only by `TileId`; switching
       bodies needs them keyed by `(BodyId, BasemapId, TileId)` —
       or partitioned per-body-per-basemap — so Mars tiles don't
       bleed through when toggling back to Earth.
-- [ ] **Per-body globe-tilt / axial obliquity (stretch):** Mars
+- [x] **Per-body globe-tilt / axial obliquity (stretch):** Mars
       tilts 25.2°, Moon 1.5°, Earth 23.5°. If we add a "season"
       time slider, obliquity matters. Out of scope for v1; flag
       in the comment block on `Body`.
-- [ ] **Fictional-world adapter:** document the data-shape a
+- [x] **Fictional-world adapter:** document the data-shape a
       contributor would need to add a new body to `body.rs` —
       `Body` literal + tile-pyramid URL + fallback texture +
       license note in `data/<body>/README.md`. The architecture

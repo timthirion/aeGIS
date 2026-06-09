@@ -302,10 +302,56 @@ pub static MOON: Body = Body {
     show_political_overlays: false,
 };
 
-// Middle-earth slot lands in M4 (architectural support only; tile
-// imagery is licensing-blocked per the module-level docs).
+// --- Middle-earth (placeholder) -----------------------------------------
 
-static ALL_BODIES: &[&Body] = &[&EARTH, &MARS, &MOON];
+const MIDDLE_EARTH_FALLBACK_BYTES: &[u8] =
+    include_bytes!("../data/middle-earth/middle_earth_2048x1024.jpg");
+
+const MIDDLE_EARTH_BASEMAPS: &[Basemap] = &[
+    Basemap {
+        id: BasemapId("placeholder"),
+        display_name: "Placeholder",
+        projection: TileProjection::Equirectangular,
+        // No real tile pyramid — the URL template points at a
+        // local pseudo-source. Tile fetches will 404 and fall
+        // through to retry-then-fail; the fallback texture is the
+        // only thing the user actually sees.
+        url_template: "/middle-earth-placeholder/{z}/{y}/{x}.jpg",
+        max_z: 0,
+        attribution_html: "Procedural placeholder. Not derived from Tolkien's canonical maps; see <code>data/middle-earth/README.md</code>.",
+        cap_colors: CapColors {
+            // Match the fallback's polar-ice tone so caps blend
+            // cleanly into the unprojected texture.
+            north: [220, 220, 230, 255],
+            south: [200, 200, 210, 255],
+        },
+    },
+];
+
+pub static MIDDLE_EARTH: Body = Body {
+    id: BodyId::MiddleEarth,
+    display_name: "Middle-earth",
+    icon: "🧙",
+    // Approximating from the Arda map scaling — Middle-earth is
+    // ~5400 km wide. Treating that as the equatorial radius gives
+    // the camera reasonable scale relative to Earth / Mars / Moon.
+    // The number doesn't influence rendering (we always treat the
+    // body as a unit sphere); kept here so future precision work
+    // has something honest to hand.
+    equatorial_radius_m: 5_400_000.0 / std::f64::consts::PI,
+    basemaps: MIDDLE_EARTH_BASEMAPS,
+    home: HomeView {
+        // Roughly centred on the placeholder's east continent — no
+        // canonical Middle-earth coordinate is honoured here.
+        lon: 60.0,
+        lat: 30.0,
+        zoom: 2.0,
+    },
+    fallback_texture: MIDDLE_EARTH_FALLBACK_BYTES,
+    show_political_overlays: false,
+};
+
+static ALL_BODIES: &[&Body] = &[&EARTH, &MARS, &MOON, &MIDDLE_EARTH];
 
 /// All bodies the renderer can currently render. Used by the body-
 /// switcher UI to enumerate options.

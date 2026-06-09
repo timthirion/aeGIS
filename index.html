@@ -39,6 +39,43 @@
       color: #8d97a3;
       font-variant-numeric: tabular-nums;
     }
+    /* Body switcher — four emoji icon buttons in the header next
+       to the title. The active body's icon scales up slightly so
+       the selection state is unmistakable. */
+    #aegis-body-switcher {
+      display: inline-flex;
+      gap: 4px;
+      margin-left: auto;
+      padding: 2px;
+      border: 1px solid #1d232b;
+      border-radius: 999px;
+      background: rgba(20, 22, 26, 0.5);
+    }
+    #aegis-body-switcher button {
+      appearance: none;
+      border: none;
+      background: transparent;
+      width: 30px;
+      height: 26px;
+      border-radius: 999px;
+      cursor: pointer;
+      font-size: 16px;
+      line-height: 1;
+      padding: 0;
+      transition: background-color 120ms, transform 120ms;
+      /* Force colour-emoji rendering on platforms whose default
+         system font would otherwise replace these with monochrome
+         glyphs. */
+      font-family: "Apple Color Emoji", "Segoe UI Emoji",
+                   "Noto Color Emoji", emoji, sans-serif;
+    }
+    #aegis-body-switcher button:hover {
+      background: #2a3340;
+    }
+    #aegis-body-switcher button[aria-pressed="true"] {
+      background: #2a3340;
+      transform: scale(1.08);
+    }
     main {
       position: relative;
       overflow: hidden;
@@ -172,6 +209,12 @@
   <header>
     <h1>aeGIS</h1>
     <span class="tag" id="version-tag">loading…</span>
+    <div id="aegis-body-switcher" role="group" aria-label="Body">
+      <button type="button" data-body="earth" aria-pressed="true" title="Earth">🌍</button>
+      <button type="button" data-body="mars" aria-pressed="false" title="Mars">🔴</button>
+      <button type="button" data-body="moon" aria-pressed="false" title="Moon">🌙</button>
+      <button type="button" data-body="middle-earth" aria-pressed="false" title="Middle-earth (placeholder)">🧙</button>
+    </div>
   </header>
   <main>
     <div id="aegis-host"></div>
@@ -220,6 +263,7 @@
       try {
         aegis = await start("aegis-host");
         wireBasemapToggle(aegis);
+        wireBodySwitcher(aegis);
       } catch (e) {
         console.error("aegis start failed", e);
         const host = document.getElementById("aegis-host");
@@ -229,6 +273,35 @@
         host.style.font = "13px ui-monospace, SFMono-Regular, monospace";
         host.textContent = `aeGIS failed to start: ${e}`;
       }
+    }
+
+    function wireBodySwitcher(instance) {
+      const switcher = document.getElementById("aegis-body-switcher");
+      if (!switcher) return;
+      const buttons = Array.from(switcher.querySelectorAll("button"));
+      const syncPressed = (active) => {
+        buttons.forEach((b) =>
+          b.setAttribute("aria-pressed", b.dataset.body === active ? "true" : "false"),
+        );
+      };
+      // Sync initial state from the renderer.
+      syncPressed(instance.body());
+      switcher.addEventListener("click", (e) => {
+        const btn = e.target.closest("button[data-body]");
+        if (!btn) return;
+        const body = btn.dataset.body;
+        instance.setBody(body);
+        syncPressed(body);
+        // Body switch resets the basemap to the new body's default;
+        // re-sync the basemap toggle so its pressed state matches.
+        const basemapToggle = document.getElementById("basemap-toggle");
+        if (basemapToggle) {
+          const current = instance.basemap();
+          basemapToggle.querySelectorAll("button").forEach((b) =>
+            b.setAttribute("aria-pressed", b.dataset.mode === current ? "true" : "false"),
+          );
+        }
+      });
     }
 
     function wireBasemapToggle(instance) {

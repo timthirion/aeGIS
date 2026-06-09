@@ -230,8 +230,8 @@ class concept — DEM-draped terrain (Phase 11+) would extend it.
 - [`0003-multi-body.md`](0003-multi-body.md) — Multi-body globes:
   a `Body` abstraction, Equirectangular tile-grid support, and
   Mars + Moon basemaps from NASA Trek public-domain pyramids.
-  Architectural prep for fictional worlds (Middle-earth, etc.),
-  gated on tile-source licensing.
+  Middle-earth slot ships as a procedural placeholder; canonical
+  Tolkien-estate maps stay licensing-blocked. **Shipped 2026-06-09.**
 
 ## Done
 

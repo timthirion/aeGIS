@@ -15,8 +15,28 @@ use std::rc::Rc;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 
+use crate::body::BodyId;
 use crate::render::{make_instance, BasemapMode, Renderer};
 use crate::search::{geocode_async, parse_coord, GeocoderClient, ResultKind, SearchResult};
+
+fn body_id_from_slug(slug: &str) -> Option<BodyId> {
+    match slug {
+        "earth" => Some(BodyId::Earth),
+        "mars" => Some(BodyId::Mars),
+        "moon" => Some(BodyId::Moon),
+        "middle-earth" => Some(BodyId::MiddleEarth),
+        _ => None,
+    }
+}
+
+fn body_id_to_slug(id: BodyId) -> &'static str {
+    match id {
+        BodyId::Earth => "earth",
+        BodyId::Mars => "mars",
+        BodyId::Moon => "moon",
+        BodyId::MiddleEarth => "middle-earth",
+    }
+}
 
 #[wasm_bindgen(start)]
 pub fn on_module_load() {
@@ -174,6 +194,25 @@ impl AegisInstance {
         if let Some(m) = parsed {
             self.inner.borrow_mut().renderer.set_basemap_mode(m);
         }
+    }
+
+    /// Switch the active body. Pass `"earth"`, `"mars"`, `"moon"`,
+    /// or `"middle-earth"`. Unknown values are silently ignored.
+    /// The page chrome listens for the basemap-toggle update event
+    /// after this fires (see the host page script).
+    #[wasm_bindgen(js_name = setBody)]
+    pub fn set_body(&self, slug: &str) {
+        let Some(id) = body_id_from_slug(slug) else {
+            return;
+        };
+        self.inner.borrow_mut().renderer.set_body(id);
+    }
+
+    /// Returns the active body as `"earth"` / `"mars"` / `"moon"` /
+    /// `"middle-earth"`.
+    #[wasm_bindgen(js_name = body)]
+    pub fn body(&self) -> String {
+        body_id_to_slug(self.inner.borrow().renderer.active_body_id()).into()
     }
 
     /// Returns the current basemap as `"map"` or `"satellite"`.

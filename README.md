@@ -119,6 +119,21 @@ responsible for honouring the chosen provider's terms. The defaults:
   These tiles are *not* open-licensed — if you fork aeGIS and need
   unrestricted commercial-redistribution rights to the imagery
   itself, swap the provider before shipping.
+- **Mars Color** / **Mars Terrain** basemaps → NASA Mars Trek
+  Viking MDIM 2.1 mosaic and MGS MOLA shaded relief. Public domain
+  worldwide (U.S. Government work). Required credit:
+  `Imagery: NASA / Viking MDIM 2.1` or `Topography: NASA / MGS
+  MOLA Color Hillshade`.
+- **Moon Mosaic** basemap → NASA Moon Trek LRO LROC WAC global
+  mosaic. Public domain worldwide. Required credit:
+  `Imagery: NASA / LRO LROC WAC`.
+- **Middle-earth** is a placeholder: the architectural slot
+  exists, but no tile imagery is bundled because canonical
+  Tolkien-estate maps are not under any open licence. The fallback
+  texture is a procedurally-generated stand-in (Apache-2.0 with
+  the rest of the repo); see [`data/middle-earth/README.md`](data/middle-earth/README.md).
+  Drop in CC-licensed Middle-earth-style tiles via the `Basemap`
+  shape in `src/body.rs` to wire a real basemap.
 
 ### Geocoder (search box)
 
