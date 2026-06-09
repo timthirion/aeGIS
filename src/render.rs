@@ -28,10 +28,9 @@ use std::sync::mpsc;
 use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
 
+use crate::body::{self, Basemap, BasemapId, Body, BodyId};
 use crate::camera::Camera;
-use crate::tile::{
-    self, DecodedTile, TileId, TileProvider, CHICAGO_LONLAT, ESRI_WORLD_IMAGERY_MAX_Z,
-};
+use crate::tile::{self, DecodedTile, TileId};
 use crate::vector::VectorLayer;
 
 const TILE_SHADER: &str = include_str!("shaders/tile.wgsl");
@@ -141,6 +140,14 @@ struct EarthCameraUniform {
 /// switching turns the other off both at draw time and at fetch time
 /// (a Satellite session shouldn't burn Carto requests on a hidden
 /// pyramid, and vice versa).
+///
+/// Compatibility shim: this enum used to be the renderer's basemap-
+/// mode field. After plan 0003 M0 the renderer holds a
+/// `(BodyId, BasemapId)` pair instead. `BasemapMode` is kept as a
+/// public surface only for the wasm-bindgen entry points
+/// (`set_basemap("map" | "satellite")`) that pre-date multi-body.
+/// The web UI converts between the slug string and this enum at
+/// the boundary.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
 pub enum BasemapMode {
     /// Carto Voyager street basemap.
@@ -150,6 +157,25 @@ pub enum BasemapMode {
     /// the headline experience and lands the user straight into it.
     #[default]
     Satellite,
+}
+
+impl BasemapMode {
+    /// Convert to the body's `BasemapId` slug.
+    pub fn to_basemap_id(self) -> BasemapId {
+        match self {
+            BasemapMode::Map => BasemapId("map"),
+            BasemapMode::Satellite => BasemapId("satellite"),
+        }
+    }
+
+    /// Map a body's `BasemapId` back to the enum, defaulting to
+    /// Satellite for unknown slugs (Mars / Moon basemap slugs).
+    pub fn from_basemap_id(id: BasemapId) -> BasemapMode {
+        match id.0 {
+            "map" => BasemapMode::Map,
+            _ => BasemapMode::Satellite,
+        }
+    }
 }
 
 /// A vector-layer that's been uploaded as a GPU vertex buffer, ready
@@ -284,9 +310,14 @@ pub struct Renderer {
     sat_dwell_snapshot: Option<SatDwellSnapshot>,
     sat_dwell_frames: u32,
 
-    /// Which basemap to draw + fetch. Toggled by the UI overlay
-    /// (web) or the `B` key (native); see [`Self::set_basemap_mode`].
-    basemap_mode: BasemapMode,
+    /// Which body the renderer is currently showing. v1 always
+    /// `BodyId::Earth`; Mars/Moon arrive in plan 0003 M2/M3.
+    active_body: BodyId,
+    /// Which of the active body's basemaps is being drawn + fetched.
+    /// For Earth that's `BasemapId("map")` or `BasemapId("satellite")`.
+    /// Toggled by the UI overlay (web) or the `B` key (native);
+    /// see [`Self::set_basemap_mode`].
+    active_basemap: BasemapId,
 
     /// Camera state. Public for direct mutation by input handlers
     /// (`renderer.camera.pan(...)`, `renderer.camera.zoom_at(...)`).
@@ -551,14 +582,31 @@ impl Renderer {
             sat_completed_rx,
             sat_dwell_snapshot: None,
             sat_dwell_frames: 0,
-            basemap_mode: BasemapMode::default(),
-            // Default view: mid-zoom on Chicago in the flat Mercator
-            // regime (z=11 ≈ city + inner suburbs). Lands the user
-            // straight into satellite imagery that reads as a
-            // recognisable place, not a hemisphere of green-and-blue.
-            camera: Camera::new(CHICAGO_LONLAT.0, CHICAGO_LONLAT.1, 11.0),
+            // Default body + basemap: Earth, Satellite. Same as the
+            // pre-multi-body default the user already shipped. The
+            // starting camera lands on the body's HomeView — for
+            // Earth that's mid-zoom Chicago (z=11 ≈ city + inner
+            // suburbs); the same code path is what body-switching
+            // will reuse in M4.
+            active_body: BodyId::Earth,
+            active_basemap: BasemapMode::Satellite.to_basemap_id(),
+            camera: {
+                let h = body::EARTH.home;
+                Camera::new(h.lon, h.lat, h.zoom)
+            },
             flyto: None,
         }
+    }
+
+    /// The body currently being rendered.
+    fn active_body_ref(&self) -> &'static Body {
+        body::by_id(self.active_body)
+    }
+
+    /// The basemap currently being rendered. Always a member of
+    /// `self.active_body_ref().basemaps`.
+    fn active_basemap_ref(&self) -> &'static Basemap {
+        self.active_body_ref().basemap(self.active_basemap)
     }
 
     /// User pan — pixel delta from a mouse drag. Cancels any
@@ -724,7 +772,7 @@ impl Renderer {
     /// makes zoom-out instant: by the time you scroll to z-1, those
     /// tiles are already on the GPU.
     pub fn ensure_visible_tiles(&mut self) {
-        if self.basemap_mode != BasemapMode::Map {
+        if self.active_basemap != BasemapId("map") {
             // Carto pyramid is hidden; don't burn requests on tiles
             // we won't draw. The cache stays warm for cheap toggle-back.
             return;
@@ -768,7 +816,7 @@ impl Renderer {
     #[cfg(not(target_arch = "wasm32"))]
     fn dispatch_tile_fetch(&self, id: TileId) {
         let tx = self.completed_tx.clone();
-        let url = id.tile_url(TileProvider::Carto);
+        let url = body::format_tile_url(self.active_basemap_ref().url_template, id.z, id.x, id.y);
         std::thread::spawn(move || {
             let result = tile::fetch_tile_blocking(&url);
             let _ = tx.send((id, result));
@@ -781,7 +829,7 @@ impl Renderer {
     #[cfg(target_arch = "wasm32")]
     fn dispatch_tile_fetch(&self, id: TileId) {
         let tx = self.completed_tx.clone();
-        let url = id.tile_url(TileProvider::Carto);
+        let url = body::format_tile_url(self.active_basemap_ref().url_template, id.z, id.x, id.y);
         wasm_bindgen_futures::spawn_local(async move {
             let result = tile::fetch_tile_web(&url).await;
             let _ = tx.send((id, result));
@@ -917,7 +965,7 @@ impl Renderer {
     /// resets the counter so the streamed layer never gets in the way
     /// mid-gesture.
     pub fn ensure_visible_sat_tiles(&mut self) {
-        if self.basemap_mode != BasemapMode::Satellite {
+        if self.active_basemap != BasemapId("satellite") {
             return;
         }
         let canvas = self.size();
@@ -948,9 +996,8 @@ impl Renderer {
     /// immediate-fetch branch in [`Self::set_basemap_mode`].
     fn dispatch_visible_sat_tiles(&mut self) {
         let canvas = self.size();
-        let visible = self
-            .camera
-            .visible_tiles_capped(canvas, ESRI_WORLD_IMAGERY_MAX_Z);
+        let max_z = self.active_basemap_ref().max_z;
+        let visible = self.camera.visible_tiles_capped(canvas, max_z);
         let visible_count = visible.len();
         let mut dispatched = 0;
         for id in visible {
@@ -975,31 +1022,46 @@ impl Renderer {
         }
     }
 
-    /// The basemap currently being shown.
+    /// The basemap currently being shown. Compatibility surface for
+    /// the wasm-bindgen pre-multi-body API; new code should call
+    /// `active_basemap_id()` instead.
     pub fn basemap_mode(&self) -> BasemapMode {
-        self.basemap_mode
+        BasemapMode::from_basemap_id(self.active_basemap)
     }
 
-    /// Switch the basemap. Calling with the current mode is a no-op.
-    /// When switching **to** Satellite we skip the dwell wait and
-    /// dispatch the visible-tile fetch immediately — the user just
-    /// asked for satellite imagery, so a half-second delay would feel
-    /// like the toggle didn't work.
+    /// Switch the basemap on the active body. Calling with the
+    /// current basemap is a no-op. When switching **to** Satellite
+    /// we skip the dwell wait and dispatch the visible-tile fetch
+    /// immediately — the user just asked for satellite imagery, so
+    /// a half-second delay would feel like the toggle didn't work.
     pub fn set_basemap_mode(&mut self, mode: BasemapMode) {
-        if self.basemap_mode == mode {
+        let next = mode.to_basemap_id();
+        if self.active_basemap == next {
             return;
         }
         // Basemap toggle is a user input — cancel any in-flight
         // fly-to so the camera doesn't keep gliding under the new
         // basemap.
         self.flyto = None;
-        self.basemap_mode = mode;
-        if mode == BasemapMode::Satellite {
+        self.active_basemap = next;
+        if next == BasemapId("satellite") {
             self.dispatch_visible_sat_tiles();
             let canvas = self.size();
             self.sat_dwell_snapshot = Some(SatDwellSnapshot::from_camera(&self.camera, canvas));
             self.sat_dwell_frames = SAT_DWELL_FRAMES.saturating_add(1);
         }
+    }
+
+    /// The currently active basemap's slug — `"map"` / `"satellite"`
+    /// for Earth. Public for the web UI + URL-state serialisation.
+    pub fn active_basemap_id(&self) -> BasemapId {
+        self.active_basemap
+    }
+
+    /// The currently active body. Public for the web UI body
+    /// switcher.
+    pub fn active_body_id(&self) -> BodyId {
+        self.active_body
     }
 
     // ---------------------------------------------------------------------
@@ -1093,7 +1155,7 @@ impl Renderer {
     #[cfg(not(target_arch = "wasm32"))]
     fn dispatch_sat_tile_fetch(&self, id: TileId) {
         let tx = self.sat_completed_tx.clone();
-        let url = id.tile_url(TileProvider::EsriWorldImagery);
+        let url = body::format_tile_url(self.active_basemap_ref().url_template, id.z, id.x, id.y);
         std::thread::spawn(move || {
             let result = tile::fetch_tile_blocking(&url);
             let _ = tx.send((id, result));
@@ -1104,7 +1166,7 @@ impl Renderer {
     #[cfg(target_arch = "wasm32")]
     fn dispatch_sat_tile_fetch(&self, id: TileId) {
         let tx = self.sat_completed_tx.clone();
-        let url = id.tile_url(TileProvider::EsriWorldImagery);
+        let url = body::format_tile_url(self.active_basemap_ref().url_template, id.z, id.x, id.y);
         wasm_bindgen_futures::spawn_local(async move {
             let result = tile::fetch_tile_web(&url).await;
             let _ = tx.send((id, result));
@@ -1215,25 +1277,20 @@ impl Renderer {
         // other passes; the per-cap `pole_sign` and `color` are baked
         // into each buffer.
         //
-        // Cap colours are mode-specific. In Map mode the caps are
-        // the user's hand-picked stylised palette (Arctic blue +
-        // Antarctic cream). In Satellite mode the caps cover the
-        // degenerate-UV region of the Blue Marble equirectangular
-        // texture at the actual pole (every vertex at lat=±π/2
-        // collapses to one sphere point with varying UV → garbage
-        // sample), so they need to match the true imagery colour
-        // there: pale ice-blue for the Arctic Ocean and bright
-        // white for the Antarctic ice sheet.
-        let (north_cap_color, south_cap_color) = match self.basemap_mode {
-            BasemapMode::Map => (
-                srgb8_to_linear_rgba(170, 206, 212, 255),
-                srgb8_to_linear_rgba(246, 239, 229, 255),
-            ),
-            BasemapMode::Satellite => (
-                srgb8_to_linear_rgba(190, 215, 230, 255),
-                srgb8_to_linear_rgba(248, 250, 252, 255),
-            ),
-        };
+        // Cap colours come from the active basemap. Earth's Map
+        // basemap uses a stylised palette (Arctic blue + Antarctic
+        // cream); its Satellite basemap uses a realistic ice white
+        // because the Blue Marble equirectangular texture has
+        // degenerate UVs at the actual pole (every lat=±π/2 vertex
+        // collapses to one sphere point with varying lon-uv → the
+        // sampler interpolates over a degenerate triangle) and the
+        // cap covers that region. Mars / Moon basemaps pick their
+        // own colours via the same path.
+        let basemap = self.active_basemap_ref();
+        let [nr, ng, nb, na] = basemap.cap_colors.north;
+        let [sr, sg, sb, sa] = basemap.cap_colors.south;
+        let north_cap_color = srgb8_to_linear_rgba(nr, ng, nb, na);
+        let south_cap_color = srgb8_to_linear_rgba(sr, sg, sb, sa);
         let north_cap = CapUniform {
             view_proj,
             camera_pos,
@@ -1325,13 +1382,13 @@ impl Renderer {
             // (cold cache, panning ahead of fetches, polar latitudes
             // the GIBS pyramid would need to fill, the back hemisphere
             // — discarded).
-            if self.basemap_mode == BasemapMode::Satellite {
+            if self.active_basemap == BasemapId("satellite") {
                 pass.set_pipeline(&self.earth_pipeline);
                 pass.set_bind_group(0, &self.earth_bind_group, &[]);
                 pass.draw(0..EARTH_DRAW_VERTS, 0..1);
             }
 
-            if self.basemap_mode == BasemapMode::Map && !draws.is_empty() {
+            if self.active_basemap == BasemapId("map") && !draws.is_empty() {
                 pass.set_pipeline(&self.tile_pipeline);
                 // 32×32 grid of quads × 6 verts/quad — matches `GRID`
                 // + `QUAD_VERTS` in tile.wgsl. The grid is what lets
@@ -1351,7 +1408,7 @@ impl Renderer {
             // bundled Earth texture; tiles refine sharpness wherever
             // loaded. Same `tile_pipeline` as Carto since both are
             // Web Mercator.
-            if self.basemap_mode == BasemapMode::Satellite && !sat_draws.is_empty() {
+            if self.active_basemap == BasemapId("satellite") && !sat_draws.is_empty() {
                 pass.set_pipeline(&self.tile_pipeline);
                 const TILE_GRID_VERTS: u32 = 32 * 32 * 6;
                 for (_, _, binding) in &sat_draws {

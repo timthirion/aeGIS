@@ -18,29 +18,10 @@ pub struct TileId {
     pub y: u32,
 }
 
-/// Which provider's tile pyramid a `TileId` resolves to. Both
-/// providers use the same Web Mercator XYZ pyramid (so the geometry
-/// math is identical), only the URL and the practical max-zoom
-/// differ.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum TileProvider {
-    /// Carto Voyager OSM-derived street basemap. PNG, retina @2x.
-    Carto,
-    /// Esri ArcGIS World Imagery. JPEG, 256×256, served from Esri's
-    /// global CDN. Free to use with attribution per Esri's basemap
-    /// terms; downstream deployments must surface the credit
-    /// "Source: Esri, Maxar, Earthstar Geographics, and the GIS User
-    /// Community" in the visible UI. We picked this over EOX's
-    /// Sentinel-2 cloudless after measuring ~6–10× lower latency from
-    /// the CDN — the prior source was leaving the visible hemisphere
-    /// patchy for seconds at a time.
-    EsriWorldImagery,
-}
-
-/// Highest zoom the Esri World Imagery layer reliably publishes
-/// worldwide. A handful of urban areas extend to z=20–23, but z=19 is
-/// the conservative cap that's covered everywhere the user might pan.
-pub const ESRI_WORLD_IMAGERY_MAX_Z: u8 = 19;
+// TileProvider + ESRI_WORLD_IMAGERY_MAX_Z were removed in plan
+// 0003 M0; URL templates and max-zoom values now live per-basemap
+// in `crate::body::Basemap`. The renderer formats URLs via
+// `body::format_tile_url(template, z, x, y)`.
 
 impl TileId {
     /// The tile containing `(lon, lat)` at zoom `z`. Tile coordinates
@@ -70,39 +51,10 @@ impl TileId {
         ]
     }
 
-    /// URL for this tile from the given provider. Both providers
-    /// share the Web Mercator XYZ pyramid, so the `(z, x, y)` triple
-    /// is provider-independent — only the endpoint changes.
-    ///
-    /// **Carto Voyager** (Map mode): 512×512 PNG retina tile. CORS-
-    /// enabled, no API key, OSM-derived. The `@2x` form has 4× the
-    /// pixel density of the standard 256×256 tiles so labels stay
-    /// crisp on high-DPR displays. Attribution: © OpenStreetMap
-    /// contributors © CARTO.
-    ///
-    /// **Esri World Imagery** (Satellite mode): 256×256 JPEG from
-    /// Esri's `services.arcgisonline.com` tile endpoint. Aggregated
-    /// imagery (Maxar, Earthstar, etc.) served from a global CDN.
-    /// Free to use with attribution per Esri's basemap terms. Note
-    /// the path order is `{z}/{y}/{x}` — row before column — not the
-    /// XYZ slippy convention.
-    pub fn tile_url(&self, provider: TileProvider) -> String {
-        match provider {
-            TileProvider::Carto => format!(
-                "https://a.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}@2x.png",
-                z = self.z,
-                x = self.x,
-                y = self.y,
-            ),
-            TileProvider::EsriWorldImagery => format!(
-                "https://services.arcgisonline.com/ArcGIS/rest/services/World_Imagery/\
-                 MapServer/tile/{z}/{y}/{x}",
-                z = self.z,
-                x = self.x,
-                y = self.y,
-            ),
-        }
-    }
+    // Per-provider tile URL formation moved to `body::format_tile_url`
+    // in plan 0003 M0; URL templates live with the basemap data now
+    // so adding a body is "add a static," not "thread a new enum
+    // variant through six files." See `src/body.rs`.
 }
 
 /// `User-Agent` value for native HTTP. Re-export of `net::USER_AGENT`
@@ -213,21 +165,12 @@ mod tests {
                 y: 380
             }
         );
-        assert_eq!(
-            tile.tile_url(TileProvider::Carto),
-            "https://a.basemaps.cartocdn.com/rastertiles/voyager/10/262/380@2x.png"
-        );
     }
 
-    #[test]
-    fn esri_world_imagery_url_uses_zyx_order() {
-        let tile = TileId { z: 5, x: 9, y: 12 };
-        assert_eq!(
-            tile.tile_url(TileProvider::EsriWorldImagery),
-            "https://services.arcgisonline.com/ArcGIS/rest/services/World_Imagery/\
-             MapServer/tile/5/12/9"
-        );
-    }
+    // URL-formation tests moved into `body::tests` (the format_tile_url
+    // function lives there now). The two Earth basemaps continue to
+    // pin their templates as Carto `{z}/{x}/{y}@2x.png` and Esri
+    // `{z}/{y}/{x}` via the body::EARTH static.
 
     #[test]
     fn user_agent_identifies_project_and_version() {
