@@ -112,11 +112,14 @@ pub fn run() {
                     }
                     WindowEvent::MouseWheel { delta, .. } => {
                         let zoom_delta = match delta {
-                            // One scroll line ≈ half a zoom step.
+                            // Mouse wheel: half a zoom per click.
                             MouseScrollDelta::LineDelta(_, y) => y as f64 * 0.5,
-                            // Trackpad: tunable to taste — 0.005 / pixel
-                            // gives ~1 zoom per 200 px of vertical pan.
-                            MouseScrollDelta::PixelDelta(p) => p.y * 0.005,
+                            // Trackpad: 0.01 zoom/px → ~1 zoom per
+                            // 100 px of vertical pan. Roughly 2x the
+                            // earlier 0.005 to match the web target's
+                            // bumped step + the user-reported
+                            // "needs to be more responsive" feel.
+                            MouseScrollDelta::PixelDelta(p) => p.y * 0.01,
                         };
                         renderer
                             .camera

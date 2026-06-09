@@ -332,8 +332,21 @@ pub async fn start(host_id: String) -> Result<AegisInstance, JsValue> {
     // is positive when scrolling down (toward the user) → we invert to
     // map "scroll down" to "zoom out". Critical: `deltaY` is in units
     // determined by `deltaMode` — PIXEL (0), LINE (1), or PAGE (2).
-    // Without normalising, a regular mouse wheel (deltaMode=LINE,
-    // deltaY=1 per click) produces an imperceptible 0.005 zoom step.
+    //
+    // Mouse wheels deliver LINE-mode events at ~1 click per call —
+    // the previous code multiplied by `16 px/line × 0.005 zoom/px` =
+    // 0.08 zoom/click, way under the ~0.5 zoom/click a discrete
+    // wheel click should feel like. Branch per delta-mode so each
+    // input device gets a step calibrated to how it actually
+    // generates events: trackpad PIXEL deltas stay continuous, mouse
+    // LINE deltas get a real per-click step.
+    //
+    // Pan + zoom are independent listeners — the wheel fires
+    // alongside any in-flight pointermove drag, so the user can
+    // zoom while panning. The previous "doesn't zoom unless I stop
+    // panning" was the trackpad step being so small that the camera
+    // pan visually masked the zoom; the larger steps here make zoom
+    // visible even mid-drag.
     attach(
         &canvas_target,
         "wheel",
@@ -346,20 +359,18 @@ pub async fn start(host_id: String) -> Result<AegisInstance, JsValue> {
                     w.prevent_default();
                     let cursor = cursor_from_event(w.as_ref(), &canvas);
                     shared.cursor_px.set(cursor);
-                    // Normalise everything to pixels first, then apply
-                    // a single tuning constant. The line / page
-                    // multipliers are the conventional defaults
-                    // browsers themselves use when reporting deltas
-                    // to applications that don't ask for the raw
-                    // mode (~16 px per line, ~400 px per page).
-                    let dy_px = match w.delta_mode() {
-                        web_sys::WheelEvent::DOM_DELTA_LINE => w.delta_y() * 16.0,
-                        web_sys::WheelEvent::DOM_DELTA_PAGE => w.delta_y() * 400.0,
-                        _ => w.delta_y(),
+                    let zoom_delta = match w.delta_mode() {
+                        // Mouse wheel: 0.5 zoom per click, sign-
+                        // inverted so scroll-up zooms in.
+                        web_sys::WheelEvent::DOM_DELTA_LINE => -w.delta_y() * 0.5,
+                        // Page-scroll keys: a full zoom per page.
+                        web_sys::WheelEvent::DOM_DELTA_PAGE => -w.delta_y(),
+                        // Trackpad / smooth mouse: continuous pixel
+                        // deltas; 0.01 zoom/px → ~1 zoom per 100 px
+                        // of trackpad pan. Roughly 2x the previous
+                        // (0.005) so a casual swipe lands ~2 zooms.
+                        _ => -w.delta_y() * 0.01,
                     };
-                    // 0.005 zoom per pixel → ~1 zoom per 200 px of
-                    // trackpad pan, ~0.5 zoom per mouse-wheel click.
-                    let zoom_delta = -dy_px * 0.005;
                     let canvas_size = inner.borrow().renderer.size();
                     inner
                         .borrow_mut()
