@@ -143,11 +143,12 @@ struct EarthCameraUniform {
 /// pyramid, and vice versa).
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
 pub enum BasemapMode {
-    /// Carto Voyager street basemap (the historical default).
-    #[default]
+    /// Carto Voyager street basemap.
     Map,
-    /// NASA Blue Marble satellite imagery: bundled 4096×2048 base
-    /// plus dwell-streamed GIBS tiles.
+    /// Esri World Imagery, streamed lazily on camera dwell over a
+    /// bundled Blue Marble fallback. Default: the satellite view is
+    /// the headline experience and lands the user straight into it.
+    #[default]
     Satellite,
 }
 
@@ -541,11 +542,11 @@ impl Renderer {
             sat_dwell_snapshot: None,
             sat_dwell_frames: 0,
             basemap_mode: BasemapMode::default(),
-            // Default view: a partly-globey zoom centred between
-            // the Americas so the headline globe view is the first
-            // thing the user sees. They can scroll in to land at
-            // Chicago / any flat-Mercator view.
-            camera: Camera::new(CHICAGO_LONLAT.0, 30.0, 1.5),
+            // Default view: mid-zoom on Chicago in the flat Mercator
+            // regime (z=11 ≈ city + inner suburbs). Lands the user
+            // straight into satellite imagery that reads as a
+            // recognisable place, not a hemisphere of green-and-blue.
+            camera: Camera::new(CHICAGO_LONLAT.0, CHICAGO_LONLAT.1, 11.0),
         }
     }
 
