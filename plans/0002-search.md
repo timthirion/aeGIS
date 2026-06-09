@@ -1,10 +1,10 @@
 # Search: one box, coords + place queries
 
-- **Status:** active
+- **Status:** done
 - **Last updated:** 2026-06-09
-- **Last touched on:** revised after plan-skeptic attack on the
-  initial draft (see "Plan-skeptic attacks addressed" below);
-  about to start M0
+- **Last touched on:** M0–M3 all shipped in one session
+  (`ad3cbe7`, `c7f5b79`, `c28ad15`, `b2de48d`) after the plan-
+  skeptic-driven revision. See "Plan-skeptic attacks addressed".
 
 ## Goal
 
@@ -286,85 +286,85 @@ flush against the canvas edge.
 
 ### M0 — Coord parser (UI-coord-parser)
 
-- [ ] `parse_coord(&str) -> Option<(f64, f64)>` covering the three
+- [x] `parse_coord(&str) -> Option<(f64, f64)>` covering the three
       formats above. Unit tests for each format + each
       hemisphere + out-of-range rejection + the "first value
       out-of-range for lat → assume lon-first" rule.
-- [ ] Tests use a small property-style table of (input, expected
+- [x] Tests use a small property-style table of (input, expected
       lon, expected lat). Round-trip a few known cities (Chicago,
       Tokyo, Sydney, Reykjavík) through several formats and assert
       they all land in the same tile at z=10.
 
 ### M1 — Geocoder client (UI-geocoder-client)
 
-- [ ] New `src/net.rs`: `fetch_bytes_blocking(url)` (native, via
+- [x] New `src/net.rs`: `fetch_bytes_blocking(url)` (native, via
       `ehttp`) and `fetch_bytes_async(url, on_done)` (web, via
       `web_sys::fetch`). Returns `Result<Vec<u8>, NetError>` where
       `NetError` distinguishes transport vs HTTP-status vs
       decode-shape.
-- [ ] Refactor `tile::fetch_tile_blocking` / `fetch_tile_web` to
+- [x] Refactor `tile::fetch_tile_blocking` / `fetch_tile_web` to
       call `net::fetch_bytes_*` and then `decode_image`. Behaviour
       unchanged; the existing tile path is the regression test
       for this refactor.
-- [ ] `SearchResult`, `ResultKind`, `GeocodeError` types in
+- [x] `SearchResult`, `ResultKind`, `GeocodeError` types in
       `src/search.rs`. `ResultKind` enum: `City | Country | Region
       | Address | Poi | Unknown` with `default_zoom() -> f64` mapping.
-- [ ] `geocode(query, near) -> Result<Vec<SearchResult>,
+- [x] `geocode(query, near) -> Result<Vec<SearchResult>,
       GeocodeError>` against Photon via `net::fetch_bytes_*`,
       `serde_json::from_slice` into a typed Photon response struct,
       mapped to `SearchResult`.
-- [ ] Nominatim fallback: one-shot per-session switch on Photon
+- [x] Nominatim fallback: one-shot per-session switch on Photon
       5xx / transport error. The session-state lives in a
       `GeocoderClient` struct so tests can mock it.
-- [ ] Integration test (native, network-hitting, marked `#[ignore]`
+- [x] Integration test (native, network-hitting, marked `#[ignore]`
       so it doesn't run on CI by default): query "Chicago" and
       assert one result has `name == "Chicago"`, `kind ==
       ResultKind::City`, and `lonlat` within
       (−87.7 ± 0.5, 41.9 ± 0.5).
-- [ ] Native + web parity test: both targets compile and the same
+- [x] Native + web parity test: both targets compile and the same
       `GeocoderClient` API exists on both. Web parity comes for
       free from the wasm32 `cargo check`; native is the integration
       test above.
-- [ ] README documents Photon's "reasonable use" wording (it's
+- [x] README documents Photon's "reasonable use" wording (it's
       not an SLA), Nominatim's 1-req/sec public-instance cap, and
       the data-source policy memory entry. Same shape as the
       existing Esri-basemap-terms note.
 
 ### M2 — Search-bar UI (UI-search-bar)
 
-- [ ] `#aegis-search` element in `index.html` — input element
+- [x] `#aegis-search` element in `index.html` — input element
       only, no dropdown DOM. Styles use the same colour tokens as
       the existing chrome (footer `rgba(20, 22, 26, 0.85)`
       background, `#e6e8eb` text, `8px` border radius — copied
       from the current `#basemap-toggle` block). Pinned top-centre
       with `position: absolute; top: 16px; left: 50%; transform:
       translateX(-50%); width: min(480px, calc(100% - 32px))`.
-- [ ] `src/web.rs` creates the dropdown DOM via `web_sys` at
+- [x] `src/web.rs` creates the dropdown DOM via `web_sys` at
       startup (siblings of the input under `#aegis-search`), so
       Rust owns both the input listeners and the result list. No
       JS-side state.
-- [ ] **Debounce ownership: Rust-side.** On each `input` event,
+- [x] **Debounce ownership: Rust-side.** On each `input` event,
       clear any pending timeout via
       `web_sys::Window::clear_timeout_with_handle`, then schedule
       a new one (250 ms) via `set_timeout_with_callback_and_timeout_and_arguments_0`.
       The closure runs `parse_coord` first; on `None`, it fires
       `geocoder.geocode(...)` and renders the result list when the
       future completes.
-- [ ] Synthetic coordinate entry: when `parse_coord` returns
+- [x] Synthetic coordinate entry: when `parse_coord` returns
       `Some((lon, lat))`, the dropdown shows a single row
       labelled `"<lat>°<N|S>, <lon>°<E|W>"` with the subtitle
       `"coordinate — click or press Enter to fly"`. No network
       call.
-- [ ] Keyboard handling: `keydown` listener on the input.
+- [x] Keyboard handling: `keydown` listener on the input.
       `ArrowDown`/`ArrowUp` move highlight (wrap), `Enter` selects
       highlighted or first, `Escape` blurs and hides dropdown.
-- [ ] **Native target** (acknowledging the web-only UI split):
+- [x] **Native target** (acknowledging the web-only UI split):
       `Renderer::search_and_fly_to(&str)` lands as a headless
       API — parses the query (coord or place), runs the geocoder
       blocking on native, picks the first result, kicks off the
       M3 fly-to. Native users get parity via that one method
       call; no `winit` keyboard input wiring in v1.
-- [ ] Manual reference shot at `tests/visual/search-bar.png`
+- [x] Manual reference shot at `tests/visual/search-bar.png`
       (committed for design review only — **not** a regression
       test until a pixel-diff harness exists; the existing
       `tests/shaders.rs` is the model for what a real regression
@@ -372,27 +372,27 @@ flush against the canvas edge.
 
 ### M3 — Camera fly-to (UI-camera-fly-to)
 
-- [ ] `FlyTo` state in `Renderer`; per-frame `tick_camera()`
+- [x] `FlyTo` state in `Renderer`; per-frame `tick_camera()`
       interpolates and clears state when `t >= 1`.
-- [ ] **Slerp** for position (unit-sphere interpolation — not
+- [x] **Slerp** for position (unit-sphere interpolation — not
       lon/lat lerp) using the formula in the Design section.
       Smoothstep ease on `t` for both position and zoom.
-- [ ] Two-stage zoom: zoom-out then zoom-in, with the
+- [x] Two-stage zoom: zoom-out then zoom-in, with the
       intermediate zoom derived from the great-circle arc length
       (antipodal flies drop to ~zoom 1.5).
-- [ ] `duration` scales linearly with `Ω`: 0.4 s at `Ω = 0`,
+- [x] `duration` scales linearly with `Ω`: 0.4 s at `Ω = 0`,
       2.0 s at `Ω = π`. Both constants named in code so tuning
       is one-line.
-- [ ] Cancellation: any user input (pan, zoom, basemap toggle)
+- [x] Cancellation: any user input (pan, zoom, basemap toggle)
       clears `fly_to_state` to `None` immediately. Test the
       cancellation path in a unit test (set up a `FlyTo`, call
       `pan(1.0, 0.0, canvas)`, assert state is now `None`).
-- [ ] `Renderer::fly_to(target_lonlat, target_zoom)` and
+- [x] `Renderer::fly_to(target_lonlat, target_zoom)` and
       `Renderer::fly_to_bbox(bbox)` both wired into the
       search-result selection path. Result-kind picks one or the
       other (POI → `fly_to` with default zoom; everything with a
       bbox → `fly_to_bbox`).
-- [ ] Unit tests for slerp:
+- [x] Unit tests for slerp:
   - At `t=0`: camera position = start (within `1e-9`).
   - At `t=1`: camera position = target (within `1e-9`).
   - At `t=0.5`: interpolated 3D sphere point `p_mid` satisfies

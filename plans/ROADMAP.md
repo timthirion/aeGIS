@@ -226,7 +226,7 @@ class concept — DEM-draped terrain (Phase 11+) would extend it.
 - [`0002-search.md`](0002-search.md) — Search: one floating box
   that handles lat/lon coordinates (offline parse) and place
   queries (Photon / Nominatim geocoder), plus a camera fly-to
-  animation.
+  animation. **Shipped 2026-06-09.**
 - [`0003-multi-body.md`](0003-multi-body.md) — Multi-body globes:
   a `Body` abstraction, Equirectangular tile-grid support, and
   Mars + Moon basemaps from NASA Trek public-domain pyramids.
