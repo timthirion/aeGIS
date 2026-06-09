@@ -95,6 +95,70 @@
       background: #2a3340;
       color: #e6e8eb;
     }
+
+    /* Top-centre search bar. Same chrome palette as the basemap
+       toggle (panel background, border, blur). The input has no
+       native border so it reads as a continuation of the chrome
+       rather than a form field. The dropdown is created from Rust
+       and dropped in as a sibling of the input on first match. */
+    #aegis-search {
+      position: absolute;
+      top: 16px;
+      left: 50%;
+      transform: translateX(-50%);
+      width: min(480px, calc(100% - 32px));
+      z-index: 10;
+      background: rgba(11, 14, 18, 0.78);
+      border: 1px solid #1d232b;
+      border-radius: 8px;
+      backdrop-filter: blur(6px);
+      -webkit-backdrop-filter: blur(6px);
+      box-shadow: 0 2px 12px rgba(0, 0, 0, 0.35);
+      font: 14px/1.3 ui-sans-serif, system-ui, -apple-system, sans-serif;
+      user-select: none;
+      color: #e6e8eb;
+    }
+    #aegis-search input {
+      appearance: none;
+      width: 100%;
+      box-sizing: border-box;
+      border: none;
+      background: transparent;
+      color: #e6e8eb;
+      padding: 10px 14px;
+      font: inherit;
+      letter-spacing: 0.01em;
+      outline: none;
+    }
+    #aegis-search input::placeholder { color: #6a7480; }
+    #aegis-search-results {
+      border-top: 1px solid #1d232b;
+      max-height: 320px;
+      overflow-y: auto;
+    }
+    #aegis-search-results:empty { display: none; }
+    #aegis-search-results > div[role="option"] {
+      padding: 8px 14px;
+      cursor: pointer;
+      border-bottom: 1px solid #14181d;
+    }
+    #aegis-search-results > div[role="option"]:last-child {
+      border-bottom: none;
+    }
+    #aegis-search-results > div[role="option"]:hover,
+    #aegis-search-results > div[role="option"][aria-selected="true"] {
+      background: #2a3340;
+    }
+    #aegis-search-results .row-name {
+      color: #e6e8eb;
+      font-weight: 500;
+    }
+    #aegis-search-results .row-context {
+      color: #8d97a3;
+      font-size: 12px;
+      margin-top: 2px;
+    }
+
     footer {
       border-top: 1px solid #1d232b;
       font-size: 12px;
@@ -111,6 +175,16 @@
   </header>
   <main>
     <div id="aegis-host"></div>
+    <div id="aegis-search" role="combobox" aria-haspopup="listbox" aria-expanded="false">
+      <input
+        type="text"
+        id="aegis-search-input"
+        placeholder="Search a place or paste coordinates"
+        autocomplete="off"
+        spellcheck="false"
+      />
+      <div id="aegis-search-results" role="listbox"></div>
+    </div>
     <div id="basemap-toggle" role="group" aria-label="Basemap">
       <button type="button" data-mode="map" aria-pressed="false">Map</button>
       <button type="button" data-mode="satellite" aria-pressed="true">Satellite</button>
