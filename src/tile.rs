@@ -23,6 +23,65 @@ pub struct TileId {
 // in `crate::body::Basemap`. The renderer formats URLs via
 // `body::format_tile_url(template, z, x, y)`.
 
+/// Which tile-grid pyramid a basemap uses.
+///
+/// **WebMercator**: classic slippy XYZ. At zoom `z` the world is
+/// `2^z × 2^z` tiles covering `[-180°, +180°]` longitude and
+/// `[-MERCATOR_LAT_MAX, +MERCATOR_LAT_MAX]` (`≈ ±85.05°`)
+/// latitude — Mercator's pole-side projection blow-up clips the
+/// last few degrees, and the polar caps fill that band.
+///
+/// **Equirectangular**: Plate Carrée. At zoom `z` the world is
+/// `2·2^z × 2^z` tiles (2:1 aspect, matching the 360°×180° aspect
+/// of unprojected lon/lat) covering `[-180°, +180°]` × `[-90°,
+/// +90°]` with no distortion. NASA Trek uses this for Mars and
+/// Moon. The doubled x-dimension at z=0 (two tiles wide, one tall)
+/// is the structural difference the renderer + tile-dispatcher
+/// have to handle.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum TileProjection {
+    WebMercator,
+    Equirectangular,
+}
+
+/// Per-projection X dimension of the tile grid at zoom `z`.
+/// WebMercator: `2^z`. Equirectangular: `2·2^z`.
+pub fn tile_grid_width(projection: TileProjection, z: u8) -> u32 {
+    let n = 1u32 << z;
+    match projection {
+        TileProjection::WebMercator => n,
+        TileProjection::Equirectangular => 2 * n,
+    }
+}
+
+/// Per-projection Y dimension of the tile grid at zoom `z`. Both
+/// projections use `2^z`.
+pub fn tile_grid_height(z: u8) -> u32 {
+    1u32 << z
+}
+
+/// The world-space rect a tile covers, in the projection's
+/// normalised `[0, 1]` × `[0, 1]` coordinate system, as
+/// `[x_min, y_min, x_max, y_max]`.
+///
+/// **WebMercator**: `x ∈ [0, 1]` linear in longitude, `y ∈ [0, 1]`
+/// Mercator-stretched (so equal `y` strides at the pole are tiny
+/// strides in latitude). Denominator is `2^z` on both axes.
+///
+/// **Equirectangular**: `x ∈ [0, 1]` linear in longitude, `y ∈
+/// [0, 1]` linear in latitude. Denominator is `2·2^z` on x and
+/// `2^z` on y — the 2:1 aspect ratio of the EQ grid.
+pub fn tile_world_rect(projection: TileProjection, tile: TileId) -> [f32; 4] {
+    let n_x = tile_grid_width(projection, tile.z) as f32;
+    let n_y = tile_grid_height(tile.z) as f32;
+    [
+        tile.x as f32 / n_x,
+        tile.y as f32 / n_y,
+        (tile.x + 1) as f32 / n_x,
+        (tile.y + 1) as f32 / n_y,
+    ]
+}
+
 impl TileId {
     /// The tile containing `(lon, lat)` at zoom `z`. Tile coordinates
     /// are clamped to `[0, 2^z)` so a longitude slightly past the
@@ -37,19 +96,9 @@ impl TileId {
         TileId { z, x, y }
     }
 
-    /// The tile's extent in normalised Mercator world coords as
-    /// `(x_min, y_min, x_max, y_max)`. The tessellated globe-tile
-    /// shader uses this to interpolate per-vertex world positions
-    /// across the tile.
-    pub fn world_rect(&self) -> [f32; 4] {
-        let n = (1u32 << self.z) as f32;
-        [
-            self.x as f32 / n,
-            self.y as f32 / n,
-            (self.x + 1) as f32 / n,
-            (self.y + 1) as f32 / n,
-        ]
-    }
+    // The Mercator-only `world_rect()` instance method was removed in
+    // plan 0003 M1; the projection-aware free function
+    // `tile::tile_world_rect(projection, tile)` replaces it.
 
     // Per-provider tile URL formation moved to `body::format_tile_url`
     // in plan 0003 M0; URL templates live with the basemap data now

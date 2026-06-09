@@ -30,7 +30,17 @@ use wgpu::util::DeviceExt;
 
 use crate::body::{self, Basemap, BasemapId, Body, BodyId};
 use crate::camera::Camera;
-use crate::tile::{self, DecodedTile, TileId};
+use crate::tile::{self, DecodedTile, TileId, TileProjection};
+
+/// Map a `TileProjection` to the integer encoding the tile shader's
+/// `projection_kind` uniform expects (must agree with the
+/// `if (projection == 0u)` branch in `tile.wgsl`).
+fn projection_to_u32(p: TileProjection) -> u32 {
+    match p {
+        TileProjection::WebMercator => 0,
+        TileProjection::Equirectangular => 1,
+    }
+}
 use crate::vector::VectorLayer;
 
 const TILE_SHADER: &str = include_str!("shaders/tile.wgsl");
@@ -96,6 +106,11 @@ struct TileUniforms {
     camera_pos: [f32; 3],
     tile_alpha: f32,
     world_rect: [f32; 4],
+    /// 0 = WebMercator, 1 = Equirectangular. The shader's
+    /// `world_to_lonlat_rad` inverse differs across projections.
+    /// Plan 0003 M1.
+    projection_kind: u32,
+    _pad: [u32; 3],
 }
 
 /// Per-frame camera uniform consumed by `vector.wgsl`. Matches the
@@ -996,8 +1011,10 @@ impl Renderer {
     /// immediate-fetch branch in [`Self::set_basemap_mode`].
     fn dispatch_visible_sat_tiles(&mut self) {
         let canvas = self.size();
-        let max_z = self.active_basemap_ref().max_z;
-        let visible = self.camera.visible_tiles_capped(canvas, max_z);
+        let basemap = self.active_basemap_ref();
+        let visible = self
+            .camera
+            .visible_tiles_capped(canvas, basemap.max_z, basemap.projection);
         let visible_count = visible.len();
         let mut dispatched = 0;
         for id in visible {
@@ -1202,11 +1219,16 @@ impl Renderer {
         // stay cached on the GPU so re-zooming-in finds them
         // already uploaded.
         let current_z = self.camera.zoom.round().clamp(0.0, crate::camera::MAX_ZOOM) as u8;
+        // The Map cache lives on Earth's "map" basemap which is
+        // always WebMercator; pin that explicitly so the projection-
+        // kind uniform agrees with the tile-rect math.
+        let map_projection = crate::body::EARTH.basemap(BasemapId("map")).projection;
+        let map_projection_kind = projection_to_u32(map_projection);
         let mut draws: Vec<(&TileId, [f32; 4], &TileBinding)> = self
             .tiles
             .iter()
             .filter(|(id, _)| id.z <= current_z)
-            .map(|(id, binding)| (id, id.world_rect(), binding))
+            .map(|(id, binding)| (id, tile::tile_world_rect(map_projection, *id), binding))
             .collect();
         // Coarse-first: finer tiles overdraw their parents.
         draws.sort_by_key(|(id, _, _)| id.z);
@@ -1224,6 +1246,8 @@ impl Renderer {
                 camera_pos,
                 tile_alpha,
                 world_rect: *world_rect,
+                projection_kind: map_projection_kind,
+                _pad: [0; 3],
             };
             self.queue
                 .write_buffer(&binding.uniform_buf, 0, bytemuck::bytes_of(&u));
@@ -1238,12 +1262,24 @@ impl Renderer {
         // squares (a loaded high-z tile randomly hidden behind its
         // own parent). Same pattern as the Carto path above; the
         // satellite cache needs the same discipline.
+        // The Satellite cache uses the active basemap's projection
+        // (Earth/satellite is WebMercator; Mars/Moon basemaps in
+        // M2/M3 are Equirectangular). The world_rect math and the
+        // shader's inverse both pivot on this single value.
+        let sat_basemap = self.active_basemap_ref();
+        let sat_projection_kind = projection_to_u32(sat_basemap.projection);
         let sat_current_z = self.camera.zoom.round().clamp(0.0, crate::camera::MAX_ZOOM) as u8;
         let mut sat_draws: Vec<(&TileId, [f32; 4], &TileBinding)> = self
             .sat_tiles
             .iter()
             .filter(|(id, _)| id.z <= sat_current_z)
-            .map(|(id, binding)| (id, id.world_rect(), binding))
+            .map(|(id, binding)| {
+                (
+                    id,
+                    tile::tile_world_rect(sat_basemap.projection, *id),
+                    binding,
+                )
+            })
             .collect();
         sat_draws.sort_by_key(|(id, _, _)| id.z);
         for (_, world_rect, binding) in &sat_draws {
@@ -1252,6 +1288,8 @@ impl Renderer {
                 camera_pos,
                 tile_alpha: 1.0,
                 world_rect: *world_rect,
+                projection_kind: sat_projection_kind,
+                _pad: [0; 3],
             };
             self.queue
                 .write_buffer(&binding.uniform_buf, 0, bytemuck::bytes_of(&u));

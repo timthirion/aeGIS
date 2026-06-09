@@ -50,24 +50,10 @@ pub enum BodyId {
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct BasemapId(pub &'static str);
 
-/// Which tile-grid pyramid a basemap uses.
-///
-/// **WebMercator**: the classic slippy XYZ. At zoom `z` the world is
-/// `2^z × 2^z` tiles covering `[-180°, +180°]` longitude and
-/// `[-MERCATOR_LAT_MAX, +MERCATOR_LAT_MAX]` (`≈ ±85.05°`)
-/// latitude. The Mercator projection's distortion at the poles is
-/// why the cap latitude exists. Earth Carto + Esri use this.
-///
-/// **Equirectangular**: Plate Carrée. At zoom `z` the world is
-/// `2 * 2^z × 2^z` tiles (note the 2:1 aspect ratio) covering
-/// `[-180°, +180°]` × `[-90°, +90°]` with no distortion. NASA Trek
-/// uses this for Mars / Moon. Tile addresses + the shader's
-/// `world → lonlat` inverse both differ from WebMercator.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum TileProjection {
-    WebMercator,
-    Equirectangular,
-}
+// TileProjection moved to `crate::tile` in plan 0003 M1 — it's a
+// tile-pyramid concept rather than a body property. Re-exported via
+// the `pub use` below so existing callers don't break.
+pub use crate::tile::TileProjection;
 
 /// One basemap option a user can select for a body. Multiple
 /// basemaps per body let the UI do "Map / Satellite" on Earth and

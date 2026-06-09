@@ -18,8 +18,15 @@ struct Uniforms {
     // a smoothstep. Without it, the basemap's continent-scale text
     // overlays the satellite view distractingly at the lowest zooms.
     tile_alpha: f32,
-    // Tile's world rect in normalised Mercator: (xmin, ymin, xmax, ymax).
+    // Tile's world rect: (xmin, ymin, xmax, ymax). Interpretation
+    // depends on `projection_kind` — for WebMercator the values are
+    // in [0, 1] normalised-Mercator space (the slippy convention);
+    // for Equirectangular they're in [0, 1] linear lon/lat space
+    // (wx ∈ [0,1] → lon ∈ [-180°, +180°], wy ∈ [0,1] → lat ∈
+    // [+90°, -90°]).
     world_rect: vec4<f32>,
+    // 0 = WebMercator, 1 = Equirectangular. Plan 0003 M1.
+    projection_kind: u32,
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -42,10 +49,17 @@ const PI: f32 = 3.14159265358979323846;
 const GRID: u32 = 32u;
 const QUAD_VERTS: u32 = 6u;
 
-fn world_to_lonlat_rad(world: vec2<f32>) -> vec2<f32> {
+fn world_to_lonlat_rad(world: vec2<f32>, projection: u32) -> vec2<f32> {
     let lon_rad = world.x * 2.0 * PI - PI;
-    let n = PI * (1.0 - 2.0 * world.y);
-    let lat_rad = atan(sinh(n));
+    var lat_rad: f32;
+    if (projection == 0u) {
+        // WebMercator inverse: y stretches toward the poles.
+        let n = PI * (1.0 - 2.0 * world.y);
+        lat_rad = atan(sinh(n));
+    } else {
+        // Equirectangular: linear y → lat ∈ [+π/2, -π/2].
+        lat_rad = (0.5 - world.y) * PI;
+    }
     return vec2<f32>(lon_rad, lat_rad);
 }
 
@@ -71,7 +85,7 @@ fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
         (f32(qy) + local_uv.y) / f32(GRID),
     );
     let world = mix(u.world_rect.xy, u.world_rect.zw, tile_uv);
-    let lonlat = world_to_lonlat_rad(world);
+    let lonlat = world_to_lonlat_rad(world, u.projection_kind);
     let sphere = lonlat_to_sphere(lonlat);
     var out: VsOut;
     out.clip = u.view_proj * vec4<f32>(sphere, 1.0);

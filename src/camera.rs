@@ -21,7 +21,7 @@
 //! winit convention, not the OpenGL one.
 
 use crate::crs;
-use crate::tile::TileId;
+use crate::tile::{self, TileId, TileProjection};
 
 /// Pixel size of one raster tile at its native zoom. The OSM /
 /// Web-Mercator convention is 256.
@@ -253,15 +253,25 @@ impl Camera {
     /// tile selector in a later milestone. For Chicago at zoom 10 this
     /// is moot — and at zoom 0 the entire world is one tile.
     pub fn visible_tiles(&self, canvas: (u32, u32)) -> Vec<TileId> {
-        self.visible_tiles_capped(canvas, MAX_ZOOM as u8)
+        // Legacy entry point that assumes WebMercator. Tests + the
+        // Earth Carto dispatch use this; multi-projection callers go
+        // straight to `visible_tiles_capped` with an explicit
+        // `TileProjection`.
+        self.visible_tiles_capped(canvas, MAX_ZOOM as u8, TileProjection::WebMercator)
     }
 
     /// Like [`Self::visible_tiles`] but clamps the chosen zoom to
-    /// `max_z`. Used by providers whose pyramid stops short of
-    /// `MAX_ZOOM` (Esri World Imagery covers worldwide to z=19).
-    /// Past the cap, the camera keeps zooming but tile resolution
-    /// stays at the cap — the imagery just renders larger.
-    pub fn visible_tiles_capped(&self, canvas: (u32, u32), max_z: u8) -> Vec<TileId> {
+    /// `max_z` and accepts the basemap's tile-grid `projection`.
+    /// Used by providers whose pyramid stops short of `MAX_ZOOM`
+    /// (Esri caps at z=19; NASA Trek caps lower per layer). Past
+    /// the cap the camera keeps zooming but tile resolution stays
+    /// at the cap — the imagery just renders larger.
+    pub fn visible_tiles_capped(
+        &self,
+        canvas: (u32, u32),
+        max_z: u8,
+        projection: TileProjection,
+    ) -> Vec<TileId> {
         let max_z_f = (max_z as f64).min(MAX_ZOOM);
         let z = self.zoom.round().clamp(MIN_ZOOM, max_z_f) as u8;
 
@@ -272,35 +282,61 @@ impl Camera {
         // return a 4-tile-wide strip near the centre. Switch to a
         // sphere-cap test whenever any curvature is being rendered.
         if self.globeness() > 0.0 {
-            return self.visible_tiles_globe(canvas, z);
+            return self.visible_tiles_globe(canvas, z, projection);
         }
 
-        let n = 1u32 << z;
-        let n_f = n as f64;
-        let max_i = (n - 1) as i64;
+        let n_x = tile::tile_grid_width(projection, z);
+        let n_y = tile::tile_grid_height(z);
+        let n_x_f = n_x as f64;
+        let n_y_f = n_y as f64;
+        let max_x_i = (n_x - 1) as i64;
+        let max_y_i = (n_y - 1) as i64;
         let ppw = self.pixels_per_world();
-        let (wcx, wcy) = crs::lonlat_to_world(self.center_lonlat.0, self.center_lonlat.1);
-        let half_w_world = canvas.0 as f64 / 2.0 / ppw;
-        let half_h_world = canvas.1 as f64 / 2.0 / ppw;
-        let left = wcx - half_w_world;
-        let right = wcx + half_w_world;
-        let top = (wcy - half_h_world).max(0.0);
-        let bottom = (wcy + half_h_world).min(1.0);
+        // The viewport rect in projection-native world coords. For
+        // WebMercator we use the existing `crs::lonlat_to_world`
+        // (Mercator-y stretched). For Equirectangular the world is
+        // linear in lat: `world_y = (90 - lat) / 180`.
+        let (left, right, top, bottom) = match projection {
+            TileProjection::WebMercator => {
+                let (wcx, wcy) = crs::lonlat_to_world(self.center_lonlat.0, self.center_lonlat.1);
+                let half_w = canvas.0 as f64 / 2.0 / ppw;
+                let half_h = canvas.1 as f64 / 2.0 / ppw;
+                (
+                    wcx - half_w,
+                    wcx + half_w,
+                    (wcy - half_h).max(0.0),
+                    (wcy + half_h).min(1.0),
+                )
+            }
+            TileProjection::Equirectangular => {
+                // Treat one "world unit" the same in both projections
+                // (so the camera's pan/zoom scale stays consistent).
+                // The Equirectangular grid is twice as wide in tile
+                // count, so a tile is half as wide in world units —
+                // the `n_x = 2*2^z` already encodes that.
+                let lon = self.center_lonlat.0;
+                let lat = self.center_lonlat.1;
+                let eq_cx = (lon + 180.0) / 360.0;
+                let eq_cy = (90.0 - lat) / 180.0;
+                let half_w = canvas.0 as f64 / 2.0 / ppw;
+                let half_h = canvas.1 as f64 / 2.0 / ppw;
+                (
+                    eq_cx - half_w,
+                    eq_cx + half_w,
+                    (eq_cy - half_h).max(0.0),
+                    (eq_cy + half_h).min(1.0),
+                )
+            }
+        };
 
-        // Two-tile margin around the floored rect. The 1-tile margin
-        // we used previously still left a narrow rim (~30 device px)
-        // unfilled on initial load: the perspective camera projects
-        // tiles slightly differently from the flat-Mercator slippy
-        // expectation at the canvas corners, and the fractional-zoom
-        // ↔ rounded-zoom mismatch shifts the rect by a sub-tile
-        // amount that the 1-tile margin couldn't always absorb. Two
-        // tiles is comfortably more than the discrepancy and the
-        // extra ~8 tiles per dispatch are negligible at every zoom.
-        let clamp = |v: f64| (v as i64).clamp(0, max_i);
-        let tile_min_x = clamp((left * n_f).floor() - 2.0);
-        let tile_max_x = clamp((right * n_f).floor() + 2.0);
-        let tile_min_y = clamp((top * n_f).floor() - 2.0);
-        let tile_max_y = clamp((bottom * n_f).floor() + 2.0);
+        // Two-tile margin around the floored rect (see initial-load
+        // rim fix in plan 0002 epilogue).
+        let clamp_x = |v: f64| (v as i64).clamp(0, max_x_i);
+        let clamp_y = |v: f64| (v as i64).clamp(0, max_y_i);
+        let tile_min_x = clamp_x((left * n_x_f).floor() - 2.0);
+        let tile_max_x = clamp_x((right * n_x_f).floor() + 2.0);
+        let tile_min_y = clamp_y((top * n_y_f).floor() - 2.0);
+        let tile_max_y = clamp_y((bottom * n_y_f).floor() + 2.0);
 
         let mut tiles = Vec::new();
         for ty in tile_min_y..=tile_max_y {
@@ -331,9 +367,16 @@ impl Camera {
     /// firmly in view, and the centre test silently drops it. A small
     /// margin past the strict limb absorbs sub-tile slivers near the
     /// horizon.
-    fn visible_tiles_globe(&self, canvas: (u32, u32), z: u8) -> Vec<TileId> {
-        let n = 1u32 << z;
-        let n_f = n as f64;
+    fn visible_tiles_globe(
+        &self,
+        canvas: (u32, u32),
+        z: u8,
+        projection: TileProjection,
+    ) -> Vec<TileId> {
+        let n_x = tile::tile_grid_width(projection, z);
+        let n_y = tile::tile_grid_height(z);
+        let n_x_f = n_x as f64;
+        let n_y_f = n_y as f64;
         let lon_c = self.center_lonlat.0.to_radians();
         let lat_c = self.center_lonlat.1.to_radians();
         let cam_dir = [
@@ -359,13 +402,24 @@ impl Camera {
         ];
 
         let mut tiles = Vec::new();
-        for ty in 0..n {
-            for tx in 0..n {
+        for ty in 0..n_y {
+            for tx in 0..n_x {
                 let mut any_in_cap = false;
                 for &(sx, sy) in &SAMPLES {
-                    let wx = (tx as f64 + sx) / n_f;
-                    let wy = (ty as f64 + sy) / n_f;
-                    let (lon, lat) = crs::world_to_lonlat(wx, wy);
+                    let (lon, lat) = match projection {
+                        TileProjection::WebMercator => {
+                            let wx = (tx as f64 + sx) / n_x_f;
+                            let wy = (ty as f64 + sy) / n_y_f;
+                            crs::world_to_lonlat(wx, wy)
+                        }
+                        TileProjection::Equirectangular => {
+                            let wx = (tx as f64 + sx) / n_x_f;
+                            let wy = (ty as f64 + sy) / n_y_f;
+                            // Linear: wx ∈ [0,1] → lon ∈ [-180, 180];
+                            // wy ∈ [0,1] → lat ∈ [+90, -90].
+                            (wx * 360.0 - 180.0, 90.0 - wy * 180.0)
+                        }
+                    };
                     let lon_r = lon.to_radians();
                     let lat_r = lat.to_radians();
                     let p = [
