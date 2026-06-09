@@ -642,20 +642,23 @@ impl Renderer {
 
         // Per-frame cap uniforms. Same view_proj + camera_pos as the
         // other passes; the per-cap `pole_sign` and `color` are baked
-        // into each buffer. North = open-ocean blue; south = Antarctic
-        // ice white. Linear-space values for sRGB target — the surface
-        // applies the linear → sRGB transform on output.
+        // into each buffer. Cap colours are expressed in 8-bit sRGB
+        // (the colour space paint pickers and hex codes speak) and
+        // converted to linear here — the sRGB surface re-encodes on
+        // output, so the shader needs linear values for the round-
+        // trip to land on the originally-chosen colour.
+        // North = soft pale blue-grey; south = soft warm white.
         let north_cap = CapUniform {
             view_proj,
             camera_pos,
             pole_sign: 1.0,
-            color: [0.08, 0.20, 0.36, 1.0],
+            color: srgb8_to_linear_rgba(185, 204, 211, 255),
         };
         let south_cap = CapUniform {
             view_proj,
             camera_pos,
             pole_sign: -1.0,
-            color: [0.92, 0.94, 0.96, 1.0],
+            color: srgb8_to_linear_rgba(243, 239, 230, 255),
         };
         self.queue
             .write_buffer(&self.north_cap_buf, 0, bytemuck::bytes_of(&north_cap));
@@ -1132,6 +1135,32 @@ fn build_earth_resources(
     (pipeline, camera_buf, bind_group, texture, sampler)
 }
 
+/// Convert an 8-bit sRGB channel to linear-light. Used so cap (and
+/// future overlay) colours can live in the source as the same RGB-8
+/// triples a paint picker or hex code would surface, while the GPU
+/// receives the linear values the sRGB surface expects to
+/// gamma-encode on output. Matches the IEC 61966-2-1 piecewise
+/// transfer function exactly — the same formula Chrome, Firefox,
+/// and `wgpu::TextureFormat::Rgba8UnormSrgb` apply internally.
+fn srgb8_to_linear(c: u8) -> f32 {
+    let s = c as f32 / 255.0;
+    if s <= 0.04045 {
+        s / 12.92
+    } else {
+        ((s + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+fn srgb8_to_linear_rgba(r: u8, g: u8, b: u8, a: u8) -> [f32; 4] {
+    [
+        srgb8_to_linear(r),
+        srgb8_to_linear(g),
+        srgb8_to_linear(b),
+        // Alpha is straight-through — gamma applies to colour only.
+        a as f32 / 255.0,
+    ]
+}
+
 // `TILE_UNIFORM_SIZE` is `pub(crate)`-readable for future use but isn't
 // referenced from the renderer directly — keep it next to the struct
 // it describes so future bind-group-dynamic-offset code can pick it
@@ -1140,3 +1169,38 @@ fn build_earth_resources(
 const _: () = {
     let _ = TILE_UNIFORM_SIZE;
 };
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn srgb8_endpoints() {
+        // Black and white must round-trip exactly so cap (and future
+        // overlay) colours hit the intended endpoints on an sRGB
+        // surface. Anything else is a regression in the conversion.
+        assert_eq!(srgb8_to_linear(0), 0.0);
+        assert!((srgb8_to_linear(255) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn srgb8_middle_gray_matches_iec_61966() {
+        // 188 in sRGB is the classic "middle-gray" reference (a
+        // perceptual-50%-grey card). It must convert to ~0.5034 in
+        // linear-light per the IEC 61966-2-1 transfer function.
+        let mid = srgb8_to_linear(188);
+        assert!(
+            (mid - 0.5034).abs() < 1e-3,
+            "srgb8_to_linear(188) = {mid}, expected ≈ 0.5034"
+        );
+    }
+
+    #[test]
+    fn srgb8_to_linear_rgba_passes_alpha_straight_through() {
+        // Alpha is never gamma-encoded — even though the rgb channels
+        // get the sRGB transform, alpha is straight 0..1.
+        let rgba = srgb8_to_linear_rgba(0, 0, 0, 128);
+        assert_eq!(rgba[0], 0.0);
+        assert!((rgba[3] - 128.0 / 255.0).abs() < 1e-6);
+    }
+}
