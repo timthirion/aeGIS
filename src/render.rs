@@ -902,23 +902,26 @@ impl Renderer {
         let canvas = self.size();
         let snapshot = BmDwellSnapshot::from_camera(&self.camera, canvas);
         if Some(snapshot) != self.bm_dwell_snapshot {
-            // User has moved — reset the dwell counter.
+            // User has moved — reset the dwell counter and clear the
+            // failure blocklist so transient errors (GIBS rate-limit,
+            // intermittent network) get a fresh shot on the next
+            // dwell instead of permanently bricking a tile.
             self.bm_dwell_snapshot = Some(snapshot);
             self.bm_dwell_frames = 0;
+            self.bm_failed.clear();
             return;
         }
-        // Camera is still — count, but only fetch once per dwell.
-        if self.bm_dwell_frames == BM_DWELL_FRAMES {
-            // Already kicked off the fetch for this dwell snapshot.
-            self.bm_dwell_frames = self.bm_dwell_frames.saturating_add(1);
-            return;
-        }
+        // Camera is still — count up to the threshold, then dispatch
+        // exactly once. Past the dispatch frame we stay quiet until
+        // the user moves and the snapshot changes again.
         if self.bm_dwell_frames < BM_DWELL_FRAMES {
             self.bm_dwell_frames += 1;
             return;
         }
-        // Past the threshold — fire the visible-tile fetch.
-        self.dispatch_visible_bm_tiles();
+        if self.bm_dwell_frames == BM_DWELL_FRAMES {
+            self.dispatch_visible_bm_tiles();
+            self.bm_dwell_frames = self.bm_dwell_frames.saturating_add(1);
+        }
     }
 
     /// Unconditionally enqueue the visible BM tile set for fetch.
@@ -931,6 +934,8 @@ impl Renderer {
             return;
         };
         let visible = bm_tile::visible_tiles(&self.camera, canvas, gibs_z);
+        let visible_count = visible.len();
+        let mut dispatched = 0;
         for id in visible {
             if self.bm_tiles.contains_key(&id)
                 || self.bm_requested.contains(&id)
@@ -940,6 +945,16 @@ impl Renderer {
             }
             self.bm_requested.insert(id);
             self.dispatch_bm_tile_fetch(id);
+            dispatched += 1;
+        }
+        if dispatched > 0 {
+            log::info!(
+                "bm: dispatched {dispatched}/{visible_count} tiles at gibs_z={gibs_z} \
+                 (camera zoom={:.2}, in-flight={}, cached={})",
+                self.camera.zoom,
+                self.bm_requested.len(),
+                self.bm_tiles.len(),
+            );
         }
     }
 
