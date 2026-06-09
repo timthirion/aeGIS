@@ -38,14 +38,6 @@ fn caps_shader_validates() {
 }
 
 #[test]
-fn satellites_shader_validates() {
-    validate_wgsl(
-        include_str!("../src/shaders/satellites.wgsl"),
-        "satellites.wgsl",
-    );
-}
-
-#[test]
 fn earth_shader_validates() {
     validate_wgsl(include_str!("../src/shaders/earth.wgsl"), "earth.wgsl");
 }

@@ -9,7 +9,6 @@
 pub mod camera;
 pub mod crs;
 pub mod render;
-pub mod satellites;
 pub mod tile;
 pub mod vector;
 pub mod version;

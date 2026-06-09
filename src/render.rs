@@ -10,10 +10,10 @@
 //!    (spawning background fetches for anything not already loaded or
 //!    in flight).
 //! 3. **Draws** the Earth texture sphere (bundled Blue Marble PNG),
-//!    then every visible loaded tile on top, then the polar caps, the
-//!    vector overlay, and finally the satellite-orbit lines. The Earth
-//!    texture covers anywhere tiles haven't loaded yet — globe view,
-//!    cold cache, polar latitudes outside the Mercator pyramid.
+//!    then every visible loaded tile on top, then the polar caps, and
+//!    finally the vector overlay. The Earth texture covers anywhere
+//!    tiles haven't loaded yet — globe view, cold cache, polar
+//!    latitudes outside the Mercator pyramid, the back hemisphere.
 //!
 //! ## Threading
 //!
@@ -29,14 +29,12 @@ use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
 
 use crate::camera::Camera;
-use crate::satellites::{self, SatVertex};
 use crate::tile::{self, DecodedTile, TileId, CHICAGO_LONLAT};
 use crate::vector::VectorLayer;
 
 const TILE_SHADER: &str = include_str!("shaders/tile.wgsl");
 const VECTOR_SHADER: &str = include_str!("shaders/vector.wgsl");
 const CAPS_SHADER: &str = include_str!("shaders/caps.wgsl");
-const SATELLITES_SHADER: &str = include_str!("shaders/satellites.wgsl");
 const EARTH_SHADER: &str = include_str!("shaders/earth.wgsl");
 
 /// Blue Marble equirectangular Earth imagery, embedded at compile time
@@ -104,15 +102,6 @@ struct CapUniform {
     color: [f32; 4],
 }
 
-/// Per-frame camera uniform consumed by `satellites.wgsl`. Just the
-/// view-projection matrix — colour rides on each vertex, no position
-/// or back-face data needed (we draw the full orbital rings).
-#[repr(C)]
-#[derive(Copy, Clone, Debug, Default, Pod, Zeroable)]
-struct SatCameraUniform {
-    view_proj: [f32; 16],
-}
-
 /// Per-frame camera uniform consumed by `earth.wgsl`. 80 bytes —
 /// view_proj, camera_pos (used for the back-hemisphere discard), pad.
 #[repr(C)]
@@ -167,15 +156,6 @@ pub struct Renderer {
     north_cap_bind_group: wgpu::BindGroup,
     south_cap_buf: wgpu::Buffer,
     south_cap_bind_group: wgpu::BindGroup,
-
-    /// Satellite-orbit pipeline + the (single) vertex buffer of every
-    /// bundled orbit's line-list. Built once at startup; the per-frame
-    /// camera uniform updates view_proj.
-    sat_pipeline: wgpu::RenderPipeline,
-    sat_camera_buf: wgpu::Buffer,
-    sat_bind_group: wgpu::BindGroup,
-    sat_vertex_buf: wgpu::Buffer,
-    sat_vertex_count: u32,
 
     /// Earth-texture pipeline. Procedurally-tessellated unit sphere
     /// sampled from a bundled Blue Marble equirectangular PNG. Drawn
@@ -364,51 +344,6 @@ impl Renderer {
         let (earth_pipeline, earth_camera_buf, earth_bind_group, earth_texture, earth_sampler) =
             build_earth_resources(&device, &queue, format);
 
-        // Satellite orbits. Bundled vertices computed at startup —
-        // each orbit becomes a closed line-list ring around the globe.
-        // 256 samples per orbit balances smoothness against vertex
-        // count (≈4096 verts total across the bundled catalog).
-        const SAT_SAMPLES: usize = 256;
-        let sat_vertices = satellites::build_orbit_vertices(SAT_SAMPLES);
-        let sat_vertex_count = sat_vertices.len() as u32;
-        let sat_vertex_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("aegis-sat-vbo"),
-            contents: bytemuck::cast_slice(&sat_vertices),
-            usage: wgpu::BufferUsages::VERTEX,
-        });
-        let sat_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("aegis-sat-bgl"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            }],
-        });
-        let sat_camera_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("aegis-sat-camera"),
-            contents: bytemuck::bytes_of(&SatCameraUniform::default()),
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        });
-        let sat_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("aegis-sat-bg"),
-            layout: &sat_bgl,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: sat_camera_buf.as_entire_binding(),
-            }],
-        });
-        let sat_pipeline = build_satellites_pipeline(&device, format, &sat_bgl);
-        log::info!(
-            "satellites: bundled {} orbits ({} vertices)",
-            satellites::SATELLITES.len(),
-            sat_vertex_count
-        );
-
         let (completed_tx, completed_rx) = mpsc::channel();
 
         Renderer {
@@ -428,11 +363,6 @@ impl Renderer {
             north_cap_bind_group,
             south_cap_buf,
             south_cap_bind_group,
-            sat_pipeline,
-            sat_camera_buf,
-            sat_bind_group,
-            sat_vertex_buf,
-            sat_vertex_count,
             earth_pipeline,
             earth_camera_buf,
             earth_bind_group,
@@ -732,12 +662,6 @@ impl Renderer {
         self.queue
             .write_buffer(&self.south_cap_buf, 0, bytemuck::bytes_of(&south_cap));
 
-        // Satellite-camera uniform — view_proj only; per-vertex colour
-        // and position do the rest.
-        let sat_camera = SatCameraUniform { view_proj };
-        self.queue
-            .write_buffer(&self.sat_camera_buf, 0, bytemuck::bytes_of(&sat_camera));
-
         // Earth-texture camera uniform — view_proj + position (used
         // for the back-hemisphere discard in earth.wgsl).
         let earth_camera = EarthCameraUniform {
@@ -835,17 +759,6 @@ impl Renderer {
                 pass.set_bind_group(0, &self.vector_bind_group, &[]);
                 pass.set_vertex_buffer(0, vector.vertex_buf.slice(..));
                 pass.draw(0..vector.vertex_count, 0..1);
-            }
-
-            // Satellite orbital tracks last so the line work reads on
-            // top of the globe + country outlines. Single draw — all
-            // bundled orbits share one vertex buffer; per-vertex
-            // colour distinguishes them.
-            if self.sat_vertex_count > 0 {
-                pass.set_pipeline(&self.sat_pipeline);
-                pass.set_bind_group(0, &self.sat_bind_group, &[]);
-                pass.set_vertex_buffer(0, self.sat_vertex_buf.slice(..));
-                pass.draw(0..self.sat_vertex_count, 0..1);
             }
         }
         self.queue.submit(std::iter::once(encoder.finish()));
@@ -1217,72 +1130,6 @@ fn build_earth_resources(
     // texture + sampler must outlive the bind group, so we hand them
     // back to the caller for storage on `Renderer`.
     (pipeline, camera_buf, bind_group, texture, sampler)
-}
-
-fn build_satellites_pipeline(
-    device: &wgpu::Device,
-    format: wgpu::TextureFormat,
-    bgl: &wgpu::BindGroupLayout,
-) -> wgpu::RenderPipeline {
-    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some("aegis-sat-shader"),
-        source: wgpu::ShaderSource::Wgsl(SATELLITES_SHADER.into()),
-    });
-    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some("aegis-sat-layout"),
-        bind_group_layouts: &[Some(bgl)],
-        immediate_size: 0,
-    });
-    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: Some("aegis-sat-pipeline"),
-        layout: Some(&layout),
-        vertex: wgpu::VertexState {
-            module: &module,
-            entry_point: Some("vs_main"),
-            buffers: &[wgpu::VertexBufferLayout {
-                array_stride: std::mem::size_of::<SatVertex>() as wgpu::BufferAddress,
-                step_mode: wgpu::VertexStepMode::Vertex,
-                attributes: &[
-                    // pos: vec3<f32>
-                    wgpu::VertexAttribute {
-                        format: wgpu::VertexFormat::Float32x3,
-                        offset: 0,
-                        shader_location: 0,
-                    },
-                    // color: vec3<f32>
-                    wgpu::VertexAttribute {
-                        format: wgpu::VertexFormat::Float32x3,
-                        offset: (std::mem::size_of::<f32>() * 3) as wgpu::BufferAddress,
-                        shader_location: 1,
-                    },
-                ],
-            }],
-            compilation_options: Default::default(),
-        },
-        fragment: Some(wgpu::FragmentState {
-            module: &module,
-            entry_point: Some("fs_main"),
-            targets: &[Some(wgpu::ColorTargetState {
-                format,
-                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                write_mask: wgpu::ColorWrites::ALL,
-            })],
-            compilation_options: Default::default(),
-        }),
-        primitive: wgpu::PrimitiveState {
-            topology: wgpu::PrimitiveTopology::LineList,
-            strip_index_format: None,
-            front_face: wgpu::FrontFace::Ccw,
-            cull_mode: None,
-            polygon_mode: wgpu::PolygonMode::Fill,
-            unclipped_depth: false,
-            conservative: false,
-        },
-        depth_stencil: None,
-        multisample: wgpu::MultisampleState::default(),
-        multiview_mask: None,
-        cache: None,
-    })
 }
 
 // `TILE_UNIFORM_SIZE` is `pub(crate)`-readable for future use but isn't
