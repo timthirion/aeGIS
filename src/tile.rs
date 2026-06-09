@@ -26,15 +26,21 @@ pub struct TileId {
 pub enum TileProvider {
     /// Carto Voyager OSM-derived street basemap. PNG, retina @2x.
     Carto,
-    /// EOX-hosted Sentinel-2 cloudless mosaic. JPEG, 256×256, CC BY 4.0.
-    /// Requires the attribution
-    /// "Sentinel-2 cloudless by EOX IT Services GmbH" to be visible.
-    Sentinel2Cloudless,
+    /// Esri ArcGIS World Imagery. JPEG, 256×256, served from Esri's
+    /// global CDN. Free to use with attribution per Esri's basemap
+    /// terms; downstream deployments must surface the credit
+    /// "Source: Esri, Maxar, Earthstar Geographics, and the GIS User
+    /// Community" in the visible UI. We picked this over EOX's
+    /// Sentinel-2 cloudless after measuring ~6–10× lower latency from
+    /// the CDN — the prior source was leaving the visible hemisphere
+    /// patchy for seconds at a time.
+    EsriWorldImagery,
 }
 
-/// Highest zoom the Sentinel-2 cloudless layer publishes. Source
-/// resolution is ~10 m/pixel; finer than that is just JPEG stretch.
-pub const SENTINEL2_MAX_Z: u8 = 14;
+/// Highest zoom the Esri World Imagery layer reliably publishes
+/// worldwide. A handful of urban areas extend to z=20–23, but z=19 is
+/// the conservative cap that's covered everywhere the user might pan.
+pub const ESRI_WORLD_IMAGERY_MAX_Z: u8 = 19;
 
 impl TileId {
     /// The tile containing `(lon, lat)` at zoom `z`. Tile coordinates
@@ -74,10 +80,12 @@ impl TileId {
     /// crisp on high-DPR displays. Attribution: © OpenStreetMap
     /// contributors © CARTO.
     ///
-    /// **Sentinel-2 cloudless** (Satellite mode): 256×256 JPEG from
-    /// EOX's WMTS REST endpoint. Sentinel-2 native ~10 m/pixel,
-    /// global cloudless mosaic. License: CC BY 4.0. Attribution:
-    /// Sentinel-2 cloudless by EOX IT Services GmbH.
+    /// **Esri World Imagery** (Satellite mode): 256×256 JPEG from
+    /// Esri's `services.arcgisonline.com` tile endpoint. Aggregated
+    /// imagery (Maxar, Earthstar, etc.) served from a global CDN.
+    /// Free to use with attribution per Esri's basemap terms. Note
+    /// the path order is `{z}/{y}/{x}` — row before column — not the
+    /// XYZ slippy convention.
     pub fn tile_url(&self, provider: TileProvider) -> String {
         match provider {
             TileProvider::Carto => format!(
@@ -86,9 +94,9 @@ impl TileId {
                 x = self.x,
                 y = self.y,
             ),
-            TileProvider::Sentinel2Cloudless => format!(
-                "https://tiles.maps.eox.at/wmts/1.0.0/s2cloudless-2020_3857/default/g/\
-                 {z}/{y}/{x}.jpg",
+            TileProvider::EsriWorldImagery => format!(
+                "https://services.arcgisonline.com/ArcGIS/rest/services/World_Imagery/\
+                 MapServer/tile/{z}/{y}/{x}",
                 z = self.z,
                 x = self.x,
                 y = self.y,
@@ -149,7 +157,7 @@ pub fn decode_image(bytes: &[u8]) -> Result<DecodedTile, image::ImageError> {
 
 /// Native-only synchronous tile fetch. Sends an HTTP GET with the
 /// project's `User-Agent` and autodetects the response format (PNG
-/// for Carto, JPEG for Sentinel-2 cloudless — both providers share
+/// for Carto, JPEG for Esri World Imagery — both providers share
 /// this path).
 #[cfg(not(target_arch = "wasm32"))]
 pub fn fetch_tile_blocking(url: &str) -> Result<DecodedTile, String> {
@@ -239,12 +247,12 @@ mod tests {
     }
 
     #[test]
-    fn sentinel2_url_uses_eox_wmts_zyx_order() {
+    fn esri_world_imagery_url_uses_zyx_order() {
         let tile = TileId { z: 5, x: 9, y: 12 };
         assert_eq!(
-            tile.tile_url(TileProvider::Sentinel2Cloudless),
-            "https://tiles.maps.eox.at/wmts/1.0.0/s2cloudless-2020_3857/default/g/\
-             5/12/9.jpg"
+            tile.tile_url(TileProvider::EsriWorldImagery),
+            "https://services.arcgisonline.com/ArcGIS/rest/services/World_Imagery/\
+             MapServer/tile/5/12/9"
         );
     }
 

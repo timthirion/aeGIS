@@ -29,7 +29,9 @@ use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
 
 use crate::camera::Camera;
-use crate::tile::{self, DecodedTile, TileId, TileProvider, CHICAGO_LONLAT, SENTINEL2_MAX_Z};
+use crate::tile::{
+    self, DecodedTile, TileId, TileProvider, CHICAGO_LONLAT, ESRI_WORLD_IMAGERY_MAX_Z,
+};
 use crate::vector::VectorLayer;
 
 const TILE_SHADER: &str = include_str!("shaders/tile.wgsl");
@@ -244,7 +246,7 @@ pub struct Renderer {
     completed_tx: mpsc::Sender<TileFetchResult>,
     completed_rx: mpsc::Receiver<TileFetchResult>,
 
-    /// Satellite (Sentinel-2 cloudless) streaming cache. Same Web
+    /// Satellite (Esri World Imagery) streaming cache. Same Web
     /// Mercator XYZ pyramid as Carto, so we render through the
     /// existing `tile_pipeline` and reuse the same `TileUniforms`
     /// layout — only the URL provider and the per-tile JPEG content
@@ -742,7 +744,7 @@ impl Renderer {
     }
 
     // -----------------------------------------------------------------
-    // Satellite (Sentinel-2 cloudless) streaming layer. Parallel cache
+    // Satellite (Esri World Imagery) streaming layer. Parallel cache
     // to the Carto one above, same `TileId` keying because both use
     // the Web Mercator pyramid — only the URL provider and the JPEG
     // payload differ. Renders through the existing `tile_pipeline`,
@@ -884,7 +886,9 @@ impl Renderer {
     /// immediate-fetch branch in [`Self::set_basemap_mode`].
     fn dispatch_visible_sat_tiles(&mut self) {
         let canvas = self.size();
-        let visible = self.camera.visible_tiles_capped(canvas, SENTINEL2_MAX_Z);
+        let visible = self
+            .camera
+            .visible_tiles_capped(canvas, ESRI_WORLD_IMAGERY_MAX_Z);
         let visible_count = visible.len();
         let mut dispatched = 0;
         for id in visible {
@@ -936,7 +940,7 @@ impl Renderer {
     #[cfg(not(target_arch = "wasm32"))]
     fn dispatch_sat_tile_fetch(&self, id: TileId) {
         let tx = self.sat_completed_tx.clone();
-        let url = id.tile_url(TileProvider::Sentinel2Cloudless);
+        let url = id.tile_url(TileProvider::EsriWorldImagery);
         std::thread::spawn(move || {
             let result = tile::fetch_tile_blocking(&url);
             let _ = tx.send((id, result));
@@ -947,7 +951,7 @@ impl Renderer {
     #[cfg(target_arch = "wasm32")]
     fn dispatch_sat_tile_fetch(&self, id: TileId) {
         let tx = self.sat_completed_tx.clone();
-        let url = id.tile_url(TileProvider::Sentinel2Cloudless);
+        let url = id.tile_url(TileProvider::EsriWorldImagery);
         wasm_bindgen_futures::spawn_local(async move {
             let result = tile::fetch_tile_web(&url).await;
             let _ = tx.send((id, result));
@@ -1010,7 +1014,7 @@ impl Renderer {
                 .write_buffer(&binding.uniform_buf, 0, bytemuck::bytes_of(&u));
         }
 
-        // Satellite-tile draws — every loaded Sentinel-2 tile gets
+        // Satellite-tile draws — every loaded Esri World Imagery tile gets
         // queued; backface culling + the lazy dwell-fetch keep the
         // set bounded to roughly what's visible. Same `TileUniforms`
         // layout and `tile_pipeline` as Carto: both are Web Mercator,

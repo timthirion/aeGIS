@@ -98,10 +98,30 @@ live in [`AGENTS.md`](AGENTS.md). The planning discipline lives in
 
 ## License
 
-[Apache-2.0](LICENSE).
+aeGIS itself is [Apache-2.0](LICENSE).
 
-Map data carries the licenses of its sources. OSM-derived layers
-require `© OpenStreetMap contributors`; Protomaps adds itself;
-Natural Earth is public domain. The widget API surfaces these
-attributions via `attributionsFor(layer)`; the default UI chrome
-renders them.
+### Basemap tiles (third-party terms apply)
+
+aeGIS ships URLs to third-party tile providers, not the tiles
+themselves. Anyone running aeGIS — including forks, embedded
+deployments, and the live `timthirion.github.io/aeGIS` demo — is
+responsible for honouring the chosen provider's terms. The defaults:
+
+- **Map** basemap → CARTO Voyager (OSM-derived). Requires the visible
+  credit `© OpenStreetMap contributors © CARTO`. See
+  [carto.com/attributions](https://carto.com/attributions).
+- **Satellite** basemap → Esri World Imagery via
+  `services.arcgisonline.com`. Free to use under Esri's basemap
+  terms, with the required visible credit `Source: Esri, Maxar,
+  Earthstar Geographics, and the GIS User Community`. See Esri's
+  [copyright + trademark
+  policy](https://www.esri.com/en-us/legal/copyright-trademarks).
+  These tiles are *not* open-licensed — if you fork aeGIS and need
+  unrestricted commercial-redistribution rights to the imagery
+  itself, swap the provider before shipping.
+
+Other map data carries the licenses of its sources. OSM-derived
+layers require `© OpenStreetMap contributors`; Protomaps adds
+itself; Natural Earth is public domain. The widget API surfaces
+these attributions via `attributionsFor(layer)`; the default UI
+chrome renders them.

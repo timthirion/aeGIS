@@ -258,9 +258,9 @@ impl Camera {
 
     /// Like [`Self::visible_tiles`] but clamps the chosen zoom to
     /// `max_z`. Used by providers whose pyramid stops short of
-    /// `MAX_ZOOM` (Sentinel-2 cloudless tops out at z=14). Past that,
-    /// the camera keeps zooming but the satellite tile resolution
-    /// stays at z=14 — the imagery just renders larger.
+    /// `MAX_ZOOM` (Esri World Imagery covers worldwide to z=19).
+    /// Past the cap, the camera keeps zooming but tile resolution
+    /// stays at the cap — the imagery just renders larger.
     pub fn visible_tiles_capped(&self, canvas: (u32, u32), max_z: u8) -> Vec<TileId> {
         let max_z_f = (max_z as f64).min(MAX_ZOOM);
         let z = self.zoom.round().clamp(MIN_ZOOM, max_z_f) as u8;
