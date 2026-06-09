@@ -315,19 +315,25 @@ impl Camera {
         tiles
     }
 
-    /// Tiles at zoom `z` whose centre falls inside the camera's
+    /// Tiles at zoom `z` whose footprint touches the camera's
     /// front-facing spherical cap. Used by [`Self::visible_tiles_capped`]
     /// at low zoom where the slippy-map rectangle is the wrong shape.
     ///
     /// Cap geometry: with the sphere at unit radius and the camera at
     /// distance `D = 1 + altitude`, a surface point P is visible iff
     /// `P · C ≥ 1/D` (both as unit vectors from the sphere centre).
-    /// A small margin past the limb keeps tiles whose centre sits just
-    /// behind the horizon but whose camera-facing edge is still on
-    /// screen — important at low zoom where each tile spans tens of
-    /// degrees of longitude.
+    ///
+    /// We sample nine points per tile (centre + 4 corners + 4 edge
+    /// midpoints) and include the tile if any sample passes the cap
+    /// test. A centre-only check works at high zoom where tiles span
+    /// fractions of a degree, but at z=2 a tile spans 90° of longitude
+    /// — its centre can be well behind the limb while a corner is
+    /// firmly in view, and the centre test silently drops it. A small
+    /// margin past the strict limb absorbs sub-tile slivers near the
+    /// horizon.
     fn visible_tiles_globe(&self, canvas: (u32, u32), z: u8) -> Vec<TileId> {
         let n = 1u32 << z;
+        let n_f = n as f64;
         let lon_c = self.center_lonlat.0.to_radians();
         let lat_c = self.center_lonlat.1.to_radians();
         let cam_dir = [
@@ -338,21 +344,42 @@ impl Camera {
         let d = 1.0 + self.altitude(canvas);
         let limb_cos = (1.0 / d) - 0.05;
 
+        // Tile-local sample positions in `[0, 1]²` — centre, then the
+        // four corners, then the four edge midpoints.
+        const SAMPLES: [(f64, f64); 9] = [
+            (0.5, 0.5),
+            (0.0, 0.0),
+            (1.0, 0.0),
+            (0.0, 1.0),
+            (1.0, 1.0),
+            (0.5, 0.0),
+            (0.5, 1.0),
+            (0.0, 0.5),
+            (1.0, 0.5),
+        ];
+
         let mut tiles = Vec::new();
         for ty in 0..n {
             for tx in 0..n {
-                let wx = (tx as f64 + 0.5) / n as f64;
-                let wy = (ty as f64 + 0.5) / n as f64;
-                let (lon, lat) = crs::world_to_lonlat(wx, wy);
-                let lon_r = lon.to_radians();
-                let lat_r = lat.to_radians();
-                let p = [
-                    lat_r.cos() * lon_r.sin(),
-                    lat_r.sin(),
-                    lat_r.cos() * lon_r.cos(),
-                ];
-                let dot = p[0] * cam_dir[0] + p[1] * cam_dir[1] + p[2] * cam_dir[2];
-                if dot > limb_cos {
+                let mut any_in_cap = false;
+                for &(sx, sy) in &SAMPLES {
+                    let wx = (tx as f64 + sx) / n_f;
+                    let wy = (ty as f64 + sy) / n_f;
+                    let (lon, lat) = crs::world_to_lonlat(wx, wy);
+                    let lon_r = lon.to_radians();
+                    let lat_r = lat.to_radians();
+                    let p = [
+                        lat_r.cos() * lon_r.sin(),
+                        lat_r.sin(),
+                        lat_r.cos() * lon_r.cos(),
+                    ];
+                    let dot = p[0] * cam_dir[0] + p[1] * cam_dir[1] + p[2] * cam_dir[2];
+                    if dot > limb_cos {
+                        any_in_cap = true;
+                        break;
+                    }
+                }
+                if any_in_cap {
                     tiles.push(TileId { z, x: tx, y: ty });
                 }
             }
@@ -761,6 +788,25 @@ mod tests {
             (12..=42).contains(&tiles.len()),
             "unexpected visible-tile count at z=10 / 800x600: {}",
             tiles.len()
+        );
+    }
+
+    #[test]
+    fn visible_tiles_on_globe_includes_corner_visible_tiles() {
+        // At z=2 each tile spans 90° of longitude and ~30° of
+        // latitude — large enough that a tile centre can sit past
+        // the limb while a corner is still firmly in view. From a
+        // Chicago camera, tile (z=2, x=2, y=1) has its centre at
+        // (lon=45°, lat=41°) — outside the visible cap at altitude=2
+        // — but its west edge (lon=0°, lat=41°) is well inside. The
+        // dispatcher must include it; the centre-only check this
+        // method previously used silently dropped it.
+        let c = Camera::new(CHICAGO_LONLAT.0, CHICAGO_LONLAT.1, 2.0);
+        let tiles = c.visible_tiles((800, 600));
+        let corner_visible = TileId { z: 2, x: 2, y: 1 };
+        assert!(
+            tiles.contains(&corner_visible),
+            "z=2 tile with corner in view but centre past limb was dropped: {tiles:?}"
         );
     }
 
