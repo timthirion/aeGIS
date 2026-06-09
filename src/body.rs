@@ -210,11 +210,102 @@ pub static EARTH: Body = Body {
     show_political_overlays: true,
 };
 
-// Mars, Moon, and Middle-earth statics arrive in M2 / M3 / M4. For
-// now the renderer only knows Earth, so M0 is a pure refactor — no
-// visible behaviour change.
+// --- Mars -----------------------------------------------------------------
 
-static ALL_BODIES: &[&Body] = &[&EARTH];
+const MARS_FALLBACK_BYTES: &[u8] = include_bytes!("../data/mars/mars_2048x1024.jpg");
+
+const MARS_BASEMAPS: &[Basemap] = &[
+    Basemap {
+        id: BasemapId("color"),
+        display_name: "Color",
+        projection: TileProjection::Equirectangular,
+        url_template: "https://trek.nasa.gov/tiles/Mars/EQ/Mars_Viking_MDIM21_ClrMosaic_global_232m/1.0.0/default/default028mm/{z}/{y}/{x}.jpg",
+        // NASA Trek's Viking colour mosaic pyramid publishes through
+        // z=7 globally. Past that the imagery is just stretch.
+        max_z: 7,
+        attribution_html: "Imagery: <a href=\"https://trek.nasa.gov/mars/\">NASA</a> / Viking MDIM 2.1",
+        cap_colors: CapColors {
+            // Mars polar caps are CO2 + water ice with dust; both
+            // poles appear near-white. Match the unprojected fallback
+            // texture pole pixels.
+            north: [240, 235, 228, 255],
+            south: [240, 235, 228, 255],
+        },
+    },
+    Basemap {
+        id: BasemapId("terrain"),
+        display_name: "Terrain",
+        projection: TileProjection::Equirectangular,
+        url_template: "https://trek.nasa.gov/tiles/Mars/EQ/Mars_MGS_MOLA_ClrShade_merge_global_463m/1.0.0/default/default028mm/{z}/{y}/{x}.jpg",
+        max_z: 6,
+        attribution_html: "Topography: <a href=\"https://trek.nasa.gov/mars/\">NASA</a> / MGS MOLA Color Hillshade",
+        cap_colors: CapColors {
+            north: [180, 180, 188, 255],
+            south: [180, 180, 188, 255],
+        },
+    },
+];
+
+pub static MARS: Body = Body {
+    id: BodyId::Mars,
+    display_name: "Mars",
+    icon: "🔴",
+    equatorial_radius_m: 3_396_200.0,
+    basemaps: MARS_BASEMAPS,
+    home: HomeView {
+        // Olympus Mons — the largest volcano in the solar system.
+        // 226.2°E in the NASA +East convention normalises to -133.8°
+        // in our (-180, +180) form.
+        lon: -133.8,
+        lat: 18.65,
+        zoom: 4.0,
+    },
+    fallback_texture: MARS_FALLBACK_BYTES,
+    show_political_overlays: false,
+};
+
+// --- Moon -----------------------------------------------------------------
+
+const MOON_FALLBACK_BYTES: &[u8] = include_bytes!("../data/moon/moon_2048x1024.jpg");
+
+const MOON_BASEMAPS: &[Basemap] = &[
+    Basemap {
+        id: BasemapId("mosaic"),
+        display_name: "Mosaic",
+        projection: TileProjection::Equirectangular,
+        url_template: "https://trek.nasa.gov/tiles/Moon/EQ/LRO_WAC_Mosaic_Global_303ppd_v02/1.0.0/default/default028mm/{z}/{y}/{x}.jpg",
+        max_z: 7,
+        attribution_html: "Imagery: <a href=\"https://trek.nasa.gov/moon/\">NASA</a> / LRO LROC WAC",
+        cap_colors: CapColors {
+            // Lunar regolith — neutral grey, slightly cooler at the
+            // poles where the limb-grazing illumination skews
+            // shadows blue.
+            north: [180, 180, 188, 255],
+            south: [180, 180, 188, 255],
+        },
+    },
+];
+
+pub static MOON: Body = Body {
+    id: BodyId::Moon,
+    display_name: "Moon",
+    icon: "🌙",
+    equatorial_radius_m: 1_737_400.0,
+    basemaps: MOON_BASEMAPS,
+    home: HomeView {
+        // Apollo 11 landing site — Mare Tranquillitatis.
+        lon: 23.47,
+        lat: 0.67,
+        zoom: 4.0,
+    },
+    fallback_texture: MOON_FALLBACK_BYTES,
+    show_political_overlays: false,
+};
+
+// Middle-earth slot lands in M4 (architectural support only; tile
+// imagery is licensing-blocked per the module-level docs).
+
+static ALL_BODIES: &[&Body] = &[&EARTH, &MARS, &MOON];
 
 /// All bodies the renderer can currently render. Used by the body-
 /// switcher UI to enumerate options.

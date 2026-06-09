@@ -62,17 +62,12 @@ const SAT_DWELL_FRAMES: u32 = 30;
 /// single retry almost always lands on a working edge.
 const SAT_MAX_ATTEMPTS: u32 = 3;
 
-/// Blue Marble equirectangular Earth imagery, embedded at compile time
-/// so it ships with the wasm and native binaries alike. 4096×2048 JPEG,
-/// ~1.6 MB — downsampled from NASA's 8192×4096 TIFF source
-/// (`land_shallow_topo_8192`) and JPEG-re-encoded at quality 88.
-/// See `data/blue-marble/ATTRIBUTION.md`.
-///
-/// 4096 is **not** the WebGPU downlevel default — we explicitly raise
-/// `max_texture_dimension_2d` from 2048 → 4096 in `request_device` to
-/// allow this texture. Covers all modern devices (including mobile
-/// WebGPU); the WebGL2 floor we used to target stops here.
-const EARTH_JPG_BYTES: &[u8] = include_bytes!("../data/blue-marble/earth_4096x2048.jpg");
+// The bundled Blue Marble JPEG used to live at
+// `EARTH_JPG_BYTES = include_bytes!("../data/blue-marble/...")`
+// here; in plan 0003 M2 it became `body::EARTH.fallback_texture`
+// since every body now has a per-body fallback. The WebGPU
+// `max_texture_dimension_2d` raise from 2048 → 4096 in
+// `request_device` still covers the 4096×2048 Blue Marble texture.
 
 /// Vertex count for the full Earth sphere — `LAT_BANDS × LON_SEGMENTS`
 /// quads × 6 verts/quad. Mirrors the constants in `earth.wgsl`.
@@ -269,18 +264,11 @@ pub struct Renderer {
     south_cap_buf: wgpu::Buffer,
     south_cap_bind_group: wgpu::BindGroup,
 
-    /// Earth-texture pipeline. Procedurally-tessellated unit sphere
-    /// sampled from a bundled Blue Marble equirectangular PNG. Drawn
-    /// before tiles so loaded tiles overdraw the texture in their
-    /// region; covers polar latitudes the tile pyramid can't reach.
-    earth_pipeline: wgpu::RenderPipeline,
-    earth_camera_buf: wgpu::Buffer,
-    earth_bind_group: wgpu::BindGroup,
-    /// Kept alive so the bind-group's texture view + sampler stay
-    /// valid for the renderer's lifetime — same pattern as
-    /// `tile_sampler` and `TileBinding._texture`.
-    _earth_texture: wgpu::Texture,
-    _earth_sampler: wgpu::Sampler,
+    /// Shared fallback-texture pipeline + per-body GPU resources.
+    /// One pipeline draws an equirectangular sphere from whichever
+    /// body's `BodyResources` is bound at draw time. Plan 0003 M2.
+    body_pipeline: wgpu::RenderPipeline,
+    body_resources: HashMap<BodyId, BodyResources>,
 
     /// Tiles that have been decoded + uploaded to the GPU.
     tiles: HashMap<TileId, TileBinding>,
@@ -550,8 +538,16 @@ impl Renderer {
         // uniform. Decode failure on a baked-in asset means the
         // binary was corrupted, so this panics rather than fails
         // silently.
-        let (earth_pipeline, earth_camera_buf, earth_bind_group, earth_texture, earth_sampler) =
-            build_earth_resources(&device, &queue, format);
+        // Body fallback-texture pipeline. Shared across every body;
+        // each body gets its own bind group via `build_body_resources`.
+        let (body_pipeline, body_bgl) = build_body_pipeline(&device, format);
+        let mut body_resources: HashMap<BodyId, BodyResources> = HashMap::new();
+        for body in body::all() {
+            body_resources.insert(
+                body.id,
+                build_body_resources(&device, &queue, body, &body_bgl),
+            );
+        }
 
         // Blue Marble streaming pipeline. Bind-group layout is the
         // same shape as the Carto tile pipeline (uniform + texture +
@@ -579,11 +575,8 @@ impl Renderer {
             north_cap_bind_group,
             south_cap_buf,
             south_cap_bind_group,
-            earth_pipeline,
-            earth_camera_buf,
-            earth_bind_group,
-            _earth_texture: earth_texture,
-            _earth_sampler: earth_sampler,
+            body_pipeline,
+            body_resources,
             tiles: HashMap::new(),
             requested: HashSet::new(),
             failed: HashSet::new(),
@@ -622,6 +615,13 @@ impl Renderer {
     /// `self.active_body_ref().basemaps`.
     fn active_basemap_ref(&self) -> &'static Basemap {
         self.active_body_ref().basemap(self.active_basemap)
+    }
+
+    /// True if the active body+basemap is the only one served by the
+    /// eager `tiles` cache (Earth's Carto Map). Every other basemap
+    /// streams via the dwell-gated `sat_tiles` cache.
+    fn is_carto_map_mode(&self) -> bool {
+        self.active_body == BodyId::Earth && self.active_basemap == BasemapId("map")
     }
 
     /// User pan — pixel delta from a mouse drag. Cancels any
@@ -787,9 +787,10 @@ impl Renderer {
     /// makes zoom-out instant: by the time you scroll to z-1, those
     /// tiles are already on the GPU.
     pub fn ensure_visible_tiles(&mut self) {
-        if self.active_basemap != BasemapId("map") {
-            // Carto pyramid is hidden; don't burn requests on tiles
-            // we won't draw. The cache stays warm for cheap toggle-back.
+        if !self.is_carto_map_mode() {
+            // Carto pyramid is hidden (Earth's Satellite basemap or
+            // any non-Earth body). Don't burn requests on tiles we
+            // won't draw; the cache stays warm for cheap toggle-back.
             return;
         }
         let canvas = self.size();
@@ -980,7 +981,11 @@ impl Renderer {
     /// resets the counter so the streamed layer never gets in the way
     /// mid-gesture.
     pub fn ensure_visible_sat_tiles(&mut self) {
-        if self.active_basemap != BasemapId("satellite") {
+        if self.is_carto_map_mode() {
+            // Carto Map handles its own dispatch via
+            // `ensure_visible_tiles`. Every other basemap (Earth's
+            // Satellite, Mars's Color / Terrain, Moon's mosaic) flows
+            // through the dwell-gated streaming path here.
             return;
         }
         let canvas = self.size();
@@ -1061,7 +1066,10 @@ impl Renderer {
         // basemap.
         self.flyto = None;
         self.active_basemap = next;
-        if next == BasemapId("satellite") {
+        // Skip dwell when switching to any streaming basemap (Earth
+        // Satellite, Mars / Moon / future bodies). Switching to
+        // Carto Map is eager regardless.
+        if !self.is_carto_map_mode() {
             self.dispatch_visible_sat_tiles();
             let canvas = self.size();
             self.sat_dwell_snapshot = Some(SatDwellSnapshot::from_camera(&self.camera, canvas));
@@ -1079,6 +1087,77 @@ impl Renderer {
     /// switcher.
     pub fn active_body_id(&self) -> BodyId {
         self.active_body
+    }
+
+    /// Switch to a different body. Clears the streaming tile cache
+    /// (the old body's tiles aren't valid for the new one), sets
+    /// the active basemap to the new body's default, cancels any
+    /// in-flight fly-to, and snaps the camera to the new body's
+    /// `HomeView`. Calling with the current body is a no-op.
+    ///
+    /// The Carto Earth Map cache (`tiles`) is preserved — it's
+    /// Earth-specific and stays warm if you bounce back to Earth.
+    pub fn set_body(&mut self, body_id: BodyId) {
+        if self.active_body == body_id {
+            return;
+        }
+        let body = body::by_id(body_id);
+        self.flyto = None;
+        self.active_body = body_id;
+        self.active_basemap = body.default_basemap();
+        // Streaming cache + per-tile request bookkeeping all become
+        // stale across bodies. The Carto Earth-only `tiles` cache
+        // stays so an Earth → Mars → Earth round-trip is cheap.
+        self.sat_tiles.clear();
+        self.sat_requested.clear();
+        self.sat_failed.clear();
+        self.sat_attempts.clear();
+        self.sat_dwell_snapshot = None;
+        self.sat_dwell_frames = 0;
+        // Snap the camera to the new body's home view. M4 may
+        // upgrade this to a fly-to once a body-aware spherical
+        // transition is fleshed out.
+        self.camera = Camera::new(body.home.lon, body.home.lat, body.home.zoom);
+        // If the new body isn't Carto-eligible, kick off an
+        // immediate streaming dispatch so the first paint isn't
+        // bare fallback texture.
+        if !self.is_carto_map_mode() {
+            self.dispatch_visible_sat_tiles();
+            let canvas = self.size();
+            self.sat_dwell_snapshot = Some(SatDwellSnapshot::from_camera(&self.camera, canvas));
+            self.sat_dwell_frames = SAT_DWELL_FRAMES.saturating_add(1);
+        }
+    }
+
+    /// Set the active basemap on the current body directly (without
+    /// the `BasemapMode` compatibility shim). Used by the body
+    /// switcher when the user picks "Color" / "Terrain" / etc. that
+    /// don't map cleanly to `BasemapMode::{Map, Satellite}`.
+    pub fn set_basemap_by_id(&mut self, id: BasemapId) {
+        if self.active_basemap == id {
+            return;
+        }
+        // Verify the basemap exists on the active body — `Body::basemap`
+        // panics on miss, which would be the same effective behaviour
+        // but with a noisier error. We log instead.
+        let body = self.active_body_ref();
+        if !body.basemaps.iter().any(|b| b.id == id) {
+            log::warn!(
+                "set_basemap_by_id: body {:?} has no basemap '{}'",
+                body.id,
+                id.0
+            );
+            return;
+        }
+        self.flyto = None;
+        self.active_basemap = id;
+        // Same eagerness as set_basemap_mode for non-Carto basemaps.
+        if !self.is_carto_map_mode() {
+            self.dispatch_visible_sat_tiles();
+            let canvas = self.size();
+            self.sat_dwell_snapshot = Some(SatDwellSnapshot::from_camera(&self.camera, canvas));
+            self.sat_dwell_frames = SAT_DWELL_FRAMES.saturating_add(1);
+        }
     }
 
     // ---------------------------------------------------------------------
@@ -1346,15 +1425,20 @@ impl Renderer {
         self.queue
             .write_buffer(&self.south_cap_buf, 0, bytemuck::bytes_of(&south_cap));
 
-        // Earth-texture camera uniform — view_proj + position (used
-        // for the back-hemisphere discard in earth.wgsl).
-        let earth_camera = EarthCameraUniform {
+        // Body-texture camera uniform — view_proj + position (used
+        // for the back-hemisphere discard in earth.wgsl). Written
+        // into the active body's per-body camera buffer; other
+        // bodies' buffers are untouched (cheap — they don't render
+        // this frame).
+        let body_camera = EarthCameraUniform {
             view_proj,
             position: camera_pos,
             _pad0: 0.0,
         };
-        self.queue
-            .write_buffer(&self.earth_camera_buf, 0, bytemuck::bytes_of(&earth_camera));
+        if let Some(res) = self.body_resources.get(&self.active_body) {
+            self.queue
+                .write_buffer(&res.camera_buf, 0, bytemuck::bytes_of(&body_camera));
+        }
 
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(t)
@@ -1412,21 +1496,25 @@ impl Renderer {
                 multiview_mask: None,
             });
 
-            // Earth texture — bundled Blue Marble imagery covering
-            // the full sphere. Satellite-only: in Map mode the user
-            // explicitly opted out of the satellite look. Streamed BM
-            // tiles overdraw it where loaded; the texture remains the
-            // visible surface anywhere tiles haven't arrived yet
-            // (cold cache, panning ahead of fetches, polar latitudes
-            // the GIBS pyramid would need to fill, the back hemisphere
-            // — discarded).
-            if self.active_basemap == BasemapId("satellite") {
-                pass.set_pipeline(&self.earth_pipeline);
-                pass.set_bind_group(0, &self.earth_bind_group, &[]);
-                pass.draw(0..EARTH_DRAW_VERTS, 0..1);
+            // Body fallback texture — bundled equirectangular imagery
+            // covering the full sphere. Drawn under every basemap
+            // except Earth's "map" (Carto's opaque tiles already
+            // cover the world at every zoom, so the fallback would
+            // just burn fragments). For every other basemap the
+            // streaming tiles overdraw it where they've loaded;
+            // anywhere they haven't, the fallback is the surface
+            // the user sees.
+            let draw_fallback =
+                !(self.active_body == BodyId::Earth && self.active_basemap == BasemapId("map"));
+            if draw_fallback {
+                if let Some(res) = self.body_resources.get(&self.active_body) {
+                    pass.set_pipeline(&self.body_pipeline);
+                    pass.set_bind_group(0, &res.bind_group, &[]);
+                    pass.draw(0..EARTH_DRAW_VERTS, 0..1);
+                }
             }
 
-            if self.active_basemap == BasemapId("map") && !draws.is_empty() {
+            if self.is_carto_map_mode() && !draws.is_empty() {
                 pass.set_pipeline(&self.tile_pipeline);
                 // 32×32 grid of quads × 6 verts/quad — matches `GRID`
                 // + `QUAD_VERTS` in tile.wgsl. The grid is what lets
@@ -1446,7 +1534,7 @@ impl Renderer {
             // bundled Earth texture; tiles refine sharpness wherever
             // loaded. Same `tile_pipeline` as Carto since both are
             // Web Mercator.
-            if self.active_basemap == BasemapId("satellite") && !sat_draws.is_empty() {
+            if !self.is_carto_map_mode() && !sat_draws.is_empty() {
                 pass.set_pipeline(&self.tile_pipeline);
                 const TILE_GRID_VERTS: u32 = 32 * 32 * 6;
                 for (_, _, binding) in &sat_draws {
@@ -1677,27 +1765,39 @@ fn make_cap_binding(
 /// Build the earth-texture pipeline together with its uniform buffer
 /// and bind group. Decodes the bundled Blue Marble PNG, uploads it as
 /// an sRGB 2D texture, and wires the per-frame camera uniform.
-fn build_earth_resources(
+/// One body's fallback-texture GPU resources. Plan 0003 M2 makes
+/// this per-body; the renderer holds a small map keyed by `BodyId`
+/// and picks the active body's entry at draw time.
+struct BodyResources {
+    /// Held only to keep the texture view inside `bind_group`
+    /// alive for the lifetime of the renderer.
+    _texture: wgpu::Texture,
+    _sampler: wgpu::Sampler,
+    camera_buf: wgpu::Buffer,
+    bind_group: wgpu::BindGroup,
+}
+
+fn build_body_resources(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
-    format: wgpu::TextureFormat,
-) -> (
-    wgpu::RenderPipeline,
-    wgpu::Buffer,
-    wgpu::BindGroup,
-    wgpu::Texture,
-    wgpu::Sampler,
-) {
-    let decoded = tile::decode_image(EARTH_JPG_BYTES)
-        .expect("bundled Blue Marble JPEG failed to decode — binary is corrupt");
+    body: &Body,
+    bgl: &wgpu::BindGroupLayout,
+) -> BodyResources {
+    let decoded = tile::decode_image(body.fallback_texture).unwrap_or_else(|_| {
+        panic!(
+            "{} fallback JPEG failed to decode — binary is corrupt",
+            body.display_name
+        )
+    });
     log::info!(
-        "earth texture: decoded {}×{} from bundled JPEG",
+        "body fallback: {} decoded {}×{} from bundled JPEG",
+        body.display_name,
         decoded.width,
         decoded.height
     );
 
     let texture = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("aegis-earth-texture"),
+        label: Some("aegis-body-texture"),
         size: wgpu::Extent3d {
             width: decoded.width,
             height: decoded.height,
@@ -1733,7 +1833,7 @@ fn build_earth_resources(
     );
     let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
     let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-        label: Some("aegis-earth-sampler"),
+        label: Some("aegis-body-sampler"),
         // U wraps so the seam at lon = ±180° interpolates correctly
         // across the antimeridian; V clamps so the polar rows don't
         // smear past the texture top/bottom.
@@ -1745,9 +1845,46 @@ fn build_earth_resources(
         mipmap_filter: wgpu::MipmapFilterMode::Nearest,
         ..Default::default()
     });
+    let camera_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("aegis-body-camera"),
+        contents: bytemuck::bytes_of(&EarthCameraUniform::default()),
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+    });
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("aegis-body-bg"),
+        layout: bgl,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: camera_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(&view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::Sampler(&sampler),
+            },
+        ],
+    });
+    BodyResources {
+        _texture: texture,
+        _sampler: sampler,
+        camera_buf,
+        bind_group,
+    }
+}
 
+/// Build the shared pipeline + bind-group layout used by every body's
+/// fallback-texture draw. Resources differ per body (`build_body_resources`),
+/// but the shader + pipeline state are identical.
+fn build_body_pipeline(
+    device: &wgpu::Device,
+    format: wgpu::TextureFormat,
+) -> (wgpu::RenderPipeline, wgpu::BindGroupLayout) {
     let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("aegis-earth-bgl"),
+        label: Some("aegis-body-bgl"),
         entries: &[
             wgpu::BindGroupLayoutEntry {
                 binding: 0,
@@ -1777,41 +1914,17 @@ fn build_earth_resources(
             },
         ],
     });
-    let camera_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("aegis-earth-camera"),
-        contents: bytemuck::bytes_of(&EarthCameraUniform::default()),
-        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-    });
-    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("aegis-earth-bg"),
-        layout: &bgl,
-        entries: &[
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: camera_buf.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: wgpu::BindingResource::TextureView(&view),
-            },
-            wgpu::BindGroupEntry {
-                binding: 2,
-                resource: wgpu::BindingResource::Sampler(&sampler),
-            },
-        ],
-    });
-
     let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some("aegis-earth-shader"),
+        label: Some("aegis-body-shader"),
         source: wgpu::ShaderSource::Wgsl(EARTH_SHADER.into()),
     });
     let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some("aegis-earth-layout"),
+        label: Some("aegis-body-layout"),
         bind_group_layouts: &[Some(&bgl)],
         immediate_size: 0,
     });
     let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: Some("aegis-earth-pipeline"),
+        label: Some("aegis-body-pipeline"),
         layout: Some(&layout),
         vertex: wgpu::VertexState {
             module: &module,
@@ -1843,10 +1956,7 @@ fn build_earth_resources(
         multiview_mask: None,
         cache: None,
     });
-    // `view` lives only as long as `bind_group` references it; the
-    // texture + sampler must outlive the bind group, so we hand them
-    // back to the caller for storage on `Renderer`.
-    (pipeline, camera_buf, bind_group, texture, sampler)
+    (pipeline, bgl)
 }
 
 /// Convert an 8-bit sRGB channel to linear-light. Used so cap (and
