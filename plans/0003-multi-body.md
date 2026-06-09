@@ -254,6 +254,15 @@ re-renders the attribution panel.
 - [ ] Test: `Body::all().iter().map(|b| b.basemaps.len()).sum() >=
       1` and every basemap's URL template has the expected
       `{z}/{x}/{y}` (or `{z}/{y}/{x}`) substitution points.
+- [ ] **Body-aware search refactor** (absorbed from plan 0002 per
+      its Open questions resolution): `SearchTarget` and
+      `SearchResult` in `src/search.rs` gain `body: BodyId`.
+      `GeocoderClient::geocode` short-circuits with
+      `GeocodeError::WrongBody` when the active body isn't Earth
+      (Photon has no Olympus Mons). The search-result selection
+      path on the UI hides Earth-only results when looking at
+      Mars or Moon. Plan 0002 was Earth-only on purpose so this
+      refactor lives here, not there.
 
 ### M1 — Equirectangular tile projection (MAP-eq-projection)
 
