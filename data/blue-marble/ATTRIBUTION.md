@@ -1,24 +1,34 @@
 # Blue Marble Earth imagery
 
-`earth_2048x1024.jpg` is the canonical NASA **Blue Marble: Land
-Surface, Shallow Water, and Shaded Topography** (`land_shallow_topo_2048`)
-imagery, unmodified, an open dataset by NASA / Goddard Space Flight
-Center / Reto Stöckli.
+`earth_4096x2048.jpg` is a 4096×2048 downsample of NASA's
+**Blue Marble: Land Surface, Shallow Water, and Shaded Topography**
+(`land_shallow_topo_8192.tif`), an open dataset by NASA / Goddard
+Space Flight Center / Reto Stöckli.
 
 ## Provenance
 
-- Source URL: <https://eoimages.gsfc.nasa.gov/images/imagerecords/57000/57752/land_shallow_topo_2048.jpg>
+- Source URL: <https://eoimages.gsfc.nasa.gov/images/imagerecords/57000/57752/land_shallow_topo_8192.tif>
 - NASA's catalog entry: <https://visibleearth.nasa.gov/images/57752/blue-marble-land-surface-shallow-water-and-shaded-topography>
-- Bundled size: 2048 × 1024 JPEG (≈ 240 KB) — same bytes NASA serves.
+- Original: 8192 × 4096 TIFF (28 MB).
+- Bundled: 4096 × 2048 JPEG (~ 1.6 MB), `sips` Lanczos downsample
+  + quality-88 JPEG re-encode.
 
-We previously bundled a 1024×512 PNG (≈ 450 KB after format
-conversion). The larger native-resolution source is *smaller*
-because JPEG compresses photographs more efficiently than PNG, and
-gives 4× the pixel density on screen so the globe view stays sharp
-under closer cropping. WebGPU's downlevel WebGL2 limit caps
-`max_texture_dimension_2d` at 2048, so 2048×1024 is the largest
-equirectangular texture we can ship without dropping that
-compatibility floor.
+The previous bundled 2048×1024 (≈ 240 KB) read as blurry at globe
+view because the visible hemisphere covers ~1024×1024 of the texture
+mapped onto a sphere typically ≥ 1024 device-pixels across on
+retina screens — the texture was effectively 1:1 with no oversampling
+headroom. 4096×2048 gives 4× the linear density (16× more pixels),
+restoring crispness across the full zoom range the satellite layer
+covers.
+
+WebGPU's downlevel WebGL2 default caps `max_texture_dimension_2d` at
+2048; we explicitly raise it to 4096 in `request_device` to fit this
+texture. 4096 is at-or-below the limit on virtually every modern
+GPU including mobile WebGPU. Larger sources (the original 8192 TIFF,
+NASA's 21,600 × 10,800 BMNG-monthly mosaics) exceed reasonable
+single-asset bundle size; the path to that resolution range is
+streaming Blue Marble tiles from NASA GIBS (planned follow-on,
+tracked separately).
 
 ## Licence and attribution
 

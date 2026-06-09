@@ -38,14 +38,16 @@ const CAPS_SHADER: &str = include_str!("shaders/caps.wgsl");
 const EARTH_SHADER: &str = include_str!("shaders/earth.wgsl");
 
 /// Blue Marble equirectangular Earth imagery, embedded at compile time
-/// so it ships with the wasm and native binaries alike. 2048×1024 JPEG,
-/// ~240 KB — same bytes NASA Visible Earth serves as the canonical
-/// `land_shallow_topo_2048` source. See `data/blue-marble/ATTRIBUTION.md`.
+/// so it ships with the wasm and native binaries alike. 4096×2048 JPEG,
+/// ~1.6 MB — downsampled from NASA's 8192×4096 TIFF source
+/// (`land_shallow_topo_8192`) and JPEG-re-encoded at quality 88.
+/// See `data/blue-marble/ATTRIBUTION.md`.
 ///
-/// JPEG rather than PNG keeps the wasm bundle small (the PNG equivalent
-/// of this image is 1.6 MB); satellite imagery has no flat-colour
-/// regions for JPEG to artifact visibly.
-const EARTH_JPG_BYTES: &[u8] = include_bytes!("../data/blue-marble/earth_2048x1024.jpg");
+/// 4096 is **not** the WebGPU downlevel default — we explicitly raise
+/// `max_texture_dimension_2d` from 2048 → 4096 in `request_device` to
+/// allow this texture. Covers all modern devices (including mobile
+/// WebGPU); the WebGL2 floor we used to target stops here.
+const EARTH_JPG_BYTES: &[u8] = include_bytes!("../data/blue-marble/earth_4096x2048.jpg");
 
 /// Vertex count for the full Earth sphere — `LAT_BANDS × LON_SEGMENTS`
 /// quads × 6 verts/quad. Mirrors the constants in `earth.wgsl`.
@@ -221,15 +223,28 @@ impl Renderer {
             .expect("no compatible GPU adapter");
         log::info!("aegis adapter: {:?}", adapter.get_info());
 
+        // On wasm we previously rode the WebGL2 floor
+        // (`max_texture_dimension_2d = 2048`) for the widest device
+        // coverage. The 4096-wide Blue Marble texture we ship for
+        // globe view needs a higher ceiling — so we lift just that
+        // single limit from 2048 → 4096 and inherit everything else
+        // from the downlevel defaults. 4096 is the floor for any
+        // GPU advertising WebGPU (and a near-universal WebGL2
+        // ceiling), so this stays compatible with mobile and older
+        // discrete cards alike.
+        let required_limits = if cfg!(target_arch = "wasm32") {
+            wgpu::Limits {
+                max_texture_dimension_2d: 4096,
+                ..wgpu::Limits::downlevel_webgl2_defaults()
+            }
+        } else {
+            wgpu::Limits::default()
+        };
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("aegis-device"),
                 required_features: wgpu::Features::empty(),
-                required_limits: if cfg!(target_arch = "wasm32") {
-                    wgpu::Limits::downlevel_webgl2_defaults()
-                } else {
-                    wgpu::Limits::default()
-                },
+                required_limits,
                 ..Default::default()
             })
             .await
