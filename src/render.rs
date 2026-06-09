@@ -45,6 +45,14 @@ const EARTH_SHADER: &str = include_str!("shaders/earth.wgsl");
 /// on, short enough that a deliberate pause feels responsive.
 const SAT_DWELL_FRAMES: u32 = 30;
 
+/// How many times a satellite-tile fetch is allowed to try before we
+/// give up and mark it permanently failed for this camera position.
+/// The first attempt is "1," so this number includes the original
+/// dispatch — `3` means original + 2 retries. Esri's CDN sometimes
+/// serves a header-stripped response from a misconfigured edge; a
+/// single retry almost always lands on a working edge.
+const SAT_MAX_ATTEMPTS: u32 = 3;
+
 /// Blue Marble equirectangular Earth imagery, embedded at compile time
 /// so it ships with the wasm and native binaries alike. 4096×2048 JPEG,
 /// ~1.6 MB — downsampled from NASA's 8192×4096 TIFF source
@@ -256,6 +264,15 @@ pub struct Renderer {
     sat_tiles: HashMap<TileId, TileBinding>,
     sat_requested: HashSet<TileId>,
     sat_failed: HashSet<TileId>,
+    /// Per-tile attempt count. A tile that fails once gets re-dispatched
+    /// up to `SAT_MAX_ATTEMPTS - 1` more times before landing in
+    /// `sat_failed`. Esri's CloudFront-fronted basemap CDN occasionally
+    /// serves a cached response without the `Access-Control-Allow-Origin`
+    /// header from an edge node; the browser blocks that response and
+    /// our fetch sees a generic fetch error, but the next attempt almost
+    /// always lands on a different edge (or revalidates against origin)
+    /// and succeeds.
+    sat_attempts: HashMap<TileId, u32>,
     sat_completed_tx: mpsc::Sender<TileFetchResult>,
     sat_completed_rx: mpsc::Receiver<TileFetchResult>,
     /// Dwell-tracking state for the lazy satellite fetch. Snapshot
@@ -518,6 +535,7 @@ impl Renderer {
             sat_tiles: HashMap::new(),
             sat_requested: HashSet::new(),
             sat_failed: HashSet::new(),
+            sat_attempts: HashMap::new(),
             sat_completed_tx,
             sat_completed_rx,
             sat_dwell_snapshot: None,
@@ -838,11 +856,27 @@ impl Renderer {
             match self.sat_completed_rx.try_recv() {
                 Ok((id, Ok(decoded))) => {
                     self.upload_sat_tile(id, decoded.width, decoded.height, &decoded.rgba);
+                    self.sat_attempts.remove(&id);
                 }
                 Ok((id, Err(e))) => {
-                    self.sat_requested.remove(&id);
-                    self.sat_failed.insert(id);
-                    log::warn!("sat tile fetch failed for {id:?}: {e}");
+                    let attempts = self.sat_attempts.entry(id).or_insert(0);
+                    *attempts += 1;
+                    if *attempts < SAT_MAX_ATTEMPTS {
+                        // Keep `sat_requested` set so a concurrent
+                        // dispatch from a fresh dwell doesn't double up.
+                        log::info!(
+                            "sat tile retry {}/{SAT_MAX_ATTEMPTS} for {id:?}: {e}",
+                            *attempts
+                        );
+                        self.dispatch_sat_tile_fetch(id);
+                    } else {
+                        self.sat_requested.remove(&id);
+                        self.sat_failed.insert(id);
+                        log::warn!(
+                            "sat tile fetch failed after {SAT_MAX_ATTEMPTS} attempts \
+                             for {id:?}: {e}"
+                        );
+                    }
                 }
                 Err(mpsc::TryRecvError::Empty) | Err(mpsc::TryRecvError::Disconnected) => break,
             }
@@ -862,13 +896,14 @@ impl Renderer {
         let canvas = self.size();
         let snapshot = SatDwellSnapshot::from_camera(&self.camera, canvas);
         if Some(snapshot) != self.sat_dwell_snapshot {
-            // User has moved — reset the dwell counter and clear the
-            // failure blocklist so transient errors (provider rate
-            // limit, intermittent network) get a fresh shot on the
-            // next dwell instead of permanently bricking a tile.
+            // User has moved — reset the dwell counter, clear the
+            // failure blocklist, and zero the retry counter so any
+            // tile that hit its attempt cap at the previous position
+            // gets a fresh budget here.
             self.sat_dwell_snapshot = Some(snapshot);
             self.sat_dwell_frames = 0;
             self.sat_failed.clear();
+            self.sat_attempts.clear();
             return;
         }
         if self.sat_dwell_frames < SAT_DWELL_FRAMES {
