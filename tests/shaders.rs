@@ -41,3 +41,11 @@ fn vector_shader_validates() {
 fn caps_shader_validates() {
     validate_wgsl(include_str!("../src/shaders/caps.wgsl"), "caps.wgsl");
 }
+
+#[test]
+fn satellites_shader_validates() {
+    validate_wgsl(
+        include_str!("../src/shaders/satellites.wgsl"),
+        "satellites.wgsl",
+    );
+}
