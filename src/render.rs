@@ -1049,19 +1049,12 @@ impl Renderer {
         // Coarse-first: finer tiles overdraw their parents.
         draws.sort_by_key(|(id, _, _)| id.z);
 
-        // Zoom-driven satellite → basemap fade. At very low camera
-        // zoom (globe view) we want the bundled Blue Marble texture
-        // to be the entire view — no continent-scale text labels
-        // overlaying the photograph. As the user zooms in past
-        // ~zoom 2, tiles smoothstep in over a 1.5-stop window so
-        // they're fully present by ~zoom 3.5 (city / region view).
-        const TILE_FADE_START: f64 = 2.0;
-        const TILE_FADE_END: f64 = 3.5;
-        let t = ((self.camera.zoom - TILE_FADE_START) / (TILE_FADE_END - TILE_FADE_START))
-            .clamp(0.0, 1.0);
-        // Smoothstep: 3t² − 2t³ for a continuous derivative at the
-        // endpoints, no perceptible "snap" when crossing them.
-        let tile_alpha = (t * t * (3.0 - 2.0 * t)) as f32;
+        // Carto tiles render at full opacity at every zoom. The
+        // earlier zoom-driven fade existed so the bundled Blue Marble
+        // texture showed through at globe view; with the basemap
+        // toggle, Map is *purely* Carto (no satellite mix) and the
+        // fade would just expose the background colour.
+        let tile_alpha = 1.0_f32;
 
         for (_, world_rect, binding) in &draws {
             let u = TileUniforms {
@@ -1206,15 +1199,19 @@ impl Renderer {
                 multiview_mask: None,
             });
 
-            // Earth texture first — covers the full sphere with the
-            // bundled Blue Marble imagery. Loaded tiles will overdraw
-            // it in their region; the texture remains the visible
-            // surface anywhere tiles haven't loaded yet (cold cache,
-            // panning ahead of fetches, polar latitudes the Mercator
-            // pyramid can't reach, the back hemisphere — discarded).
-            pass.set_pipeline(&self.earth_pipeline);
-            pass.set_bind_group(0, &self.earth_bind_group, &[]);
-            pass.draw(0..EARTH_DRAW_VERTS, 0..1);
+            // Earth texture — bundled Blue Marble imagery covering
+            // the full sphere. Satellite-only: in Map mode the user
+            // explicitly opted out of the satellite look. Streamed BM
+            // tiles overdraw it where loaded; the texture remains the
+            // visible surface anywhere tiles haven't arrived yet
+            // (cold cache, panning ahead of fetches, polar latitudes
+            // the GIBS pyramid would need to fill, the back hemisphere
+            // — discarded).
+            if self.basemap_mode == BasemapMode::Satellite {
+                pass.set_pipeline(&self.earth_pipeline);
+                pass.set_bind_group(0, &self.earth_bind_group, &[]);
+                pass.draw(0..EARTH_DRAW_VERTS, 0..1);
+            }
 
             if self.basemap_mode == BasemapMode::Map && !draws.is_empty() {
                 pass.set_pipeline(&self.tile_pipeline);
@@ -1244,16 +1241,18 @@ impl Renderer {
                 }
             }
 
-            // Polar caps — fill the spherical band the Mercator tile
-            // pyramid can't cover (|lat| > 85.051°). Drawn after the
-            // tiles so the cap colour overrides any background pixels
-            // that show through near the poles; the per-fragment
-            // visibility discard handles the back hemisphere.
-            pass.set_pipeline(&self.cap_pipeline);
-            pass.set_bind_group(0, &self.north_cap_bind_group, &[]);
-            pass.draw(0..CAP_DRAW_VERTS, 0..1);
-            pass.set_bind_group(0, &self.south_cap_bind_group, &[]);
-            pass.draw(0..CAP_DRAW_VERTS, 0..1);
+            // Polar caps — Map-only. They exist to fill the band
+            // Web Mercator can't tile (|lat| > 85.051°). In Satellite
+            // mode the Earth texture + EPSG:4326 BM tiles already
+            // cover ±90° so drawing the caps would obscure legitimate
+            // imagery there.
+            if self.basemap_mode == BasemapMode::Map {
+                pass.set_pipeline(&self.cap_pipeline);
+                pass.set_bind_group(0, &self.north_cap_bind_group, &[]);
+                pass.draw(0..CAP_DRAW_VERTS, 0..1);
+                pass.set_bind_group(0, &self.south_cap_bind_group, &[]);
+                pass.draw(0..CAP_DRAW_VERTS, 0..1);
+            }
 
             // Vector overlay on top of the basemap.
             if let Some(vector) = &self.vector {
