@@ -9,10 +9,11 @@
 //! 2. **Ensures** the currently-visible tile set has been requested
 //!    (spawning background fetches for anything not already loaded or
 //!    in flight).
-//! 3. **Draws** every visible loaded tile as a quad in screen-NDC,
-//!    using the camera's `tile_ndc_rect` to position each one. The
-//!    M0 gradient stays as the fallback when no tiles are loaded yet
-//!    (initial frame on a cold cache).
+//! 3. **Draws** the Earth texture sphere (bundled Blue Marble PNG),
+//!    then every visible loaded tile on top, then the polar caps, the
+//!    vector overlay, and finally the satellite-orbit lines. The Earth
+//!    texture covers anywhere tiles haven't loaded yet — globe view,
+//!    cold cache, polar latitudes outside the Mercator pyramid.
 //!
 //! ## Threading
 //!
@@ -32,11 +33,20 @@ use crate::satellites::{self, SatVertex};
 use crate::tile::{self, DecodedTile, TileId, CHICAGO_LONLAT};
 use crate::vector::VectorLayer;
 
-const CLEAR_SHADER: &str = include_str!("shaders/clear.wgsl");
 const TILE_SHADER: &str = include_str!("shaders/tile.wgsl");
 const VECTOR_SHADER: &str = include_str!("shaders/vector.wgsl");
 const CAPS_SHADER: &str = include_str!("shaders/caps.wgsl");
 const SATELLITES_SHADER: &str = include_str!("shaders/satellites.wgsl");
+const EARTH_SHADER: &str = include_str!("shaders/earth.wgsl");
+
+/// Blue Marble equirectangular Earth imagery, embedded at compile time
+/// so it ships with the wasm and native binaries alike. 1024×512 PNG,
+/// ~450 KB. See `data/blue-marble/ATTRIBUTION.md`.
+const EARTH_PNG_BYTES: &[u8] = include_bytes!("../data/blue-marble/earth_1024x512.png");
+
+/// Vertex count for the full Earth sphere — `LAT_BANDS × LON_SEGMENTS`
+/// quads × 6 verts/quad. Mirrors the constants in `earth.wgsl`.
+const EARTH_DRAW_VERTS: u32 = 64 * 128 * 6;
 
 /// Triangles per polar cap. Matches `RING_VERTS` in `caps.wgsl`.
 const CAP_RING_VERTS: u32 = 64;
@@ -103,6 +113,16 @@ struct SatCameraUniform {
     view_proj: [f32; 16],
 }
 
+/// Per-frame camera uniform consumed by `earth.wgsl`. 80 bytes —
+/// view_proj, camera_pos (used for the back-hemisphere discard), pad.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, Pod, Zeroable)]
+struct EarthCameraUniform {
+    view_proj: [f32; 16],
+    position: [f32; 3],
+    _pad0: f32,
+}
+
 /// A vector-layer that's been uploaded as a GPU vertex buffer, ready
 /// to render as a LineList.
 struct VectorBinding {
@@ -128,8 +148,6 @@ pub struct Renderer {
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
-
-    clear_pipeline: wgpu::RenderPipeline,
 
     tile_pipeline: wgpu::RenderPipeline,
     tile_bgl: wgpu::BindGroupLayout,
@@ -158,6 +176,19 @@ pub struct Renderer {
     sat_bind_group: wgpu::BindGroup,
     sat_vertex_buf: wgpu::Buffer,
     sat_vertex_count: u32,
+
+    /// Earth-texture pipeline. Procedurally-tessellated unit sphere
+    /// sampled from a bundled Blue Marble equirectangular PNG. Drawn
+    /// before tiles so loaded tiles overdraw the texture in their
+    /// region; covers polar latitudes the tile pyramid can't reach.
+    earth_pipeline: wgpu::RenderPipeline,
+    earth_camera_buf: wgpu::Buffer,
+    earth_bind_group: wgpu::BindGroup,
+    /// Kept alive so the bind-group's texture view + sampler stay
+    /// valid for the renderer's lifetime — same pattern as
+    /// `tile_sampler` and `TileBinding._texture`.
+    _earth_texture: wgpu::Texture,
+    _earth_sampler: wgpu::Sampler,
 
     /// Tiles that have been decoded + uploaded to the GPU.
     tiles: HashMap<TileId, TileBinding>,
@@ -232,8 +263,6 @@ impl Renderer {
             desired_maximum_frame_latency: 2,
         };
         surface.configure(&device, &config);
-
-        let clear_pipeline = build_clear_pipeline(&device, format);
 
         let tile_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("aegis-tile-bgl"),
@@ -326,6 +355,15 @@ impl Renderer {
         let (south_cap_buf, south_cap_bind_group) =
             make_cap_binding(&device, &vector_bgl, "aegis-south-cap", -1.0);
 
+        // Earth texture sphere. Decode the bundled Blue Marble PNG at
+        // startup, upload as an sRGB 2D texture, and build the
+        // procedurally-tessellated pipeline + per-frame camera
+        // uniform. Decode failure on a baked-in asset means the
+        // binary was corrupted, so this panics rather than fails
+        // silently.
+        let (earth_pipeline, earth_camera_buf, earth_bind_group, earth_texture, earth_sampler) =
+            build_earth_resources(&device, &queue, format);
+
         // Satellite orbits. Bundled vertices computed at startup —
         // each orbit becomes a closed line-list ring around the globe.
         // 256 samples per orbit balances smoothness against vertex
@@ -378,7 +416,6 @@ impl Renderer {
             device,
             queue,
             config,
-            clear_pipeline,
             tile_pipeline,
             tile_bgl,
             tile_sampler,
@@ -396,6 +433,11 @@ impl Renderer {
             sat_bind_group,
             sat_vertex_buf,
             sat_vertex_count,
+            earth_pipeline,
+            earth_camera_buf,
+            earth_bind_group,
+            _earth_texture: earth_texture,
+            _earth_sampler: earth_sampler,
             tiles: HashMap::new(),
             requested: HashSet::new(),
             failed: HashSet::new(),
@@ -696,6 +738,16 @@ impl Renderer {
         self.queue
             .write_buffer(&self.sat_camera_buf, 0, bytemuck::bytes_of(&sat_camera));
 
+        // Earth-texture camera uniform — view_proj + position (used
+        // for the back-hemisphere discard in earth.wgsl).
+        let earth_camera = EarthCameraUniform {
+            view_proj,
+            position: camera_pos,
+            _pad0: 0.0,
+        };
+        self.queue
+            .write_buffer(&self.earth_camera_buf, 0, bytemuck::bytes_of(&earth_camera));
+
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(t)
             | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
@@ -743,6 +795,16 @@ impl Renderer {
                 multiview_mask: None,
             });
 
+            // Earth texture first — covers the full sphere with the
+            // bundled Blue Marble imagery. Loaded tiles will overdraw
+            // it in their region; the texture remains the visible
+            // surface anywhere tiles haven't loaded yet (cold cache,
+            // panning ahead of fetches, polar latitudes the Mercator
+            // pyramid can't reach, the back hemisphere — discarded).
+            pass.set_pipeline(&self.earth_pipeline);
+            pass.set_bind_group(0, &self.earth_bind_group, &[]);
+            pass.draw(0..EARTH_DRAW_VERTS, 0..1);
+
             if !draws.is_empty() {
                 pass.set_pipeline(&self.tile_pipeline);
                 // 8×8 grid of quads × 6 verts/quad — matches `GRID`
@@ -754,11 +816,6 @@ impl Renderer {
                     pass.set_bind_group(0, &binding.bind_group, &[]);
                     pass.draw(0..TILE_GRID_VERTS, 0..1);
                 }
-            } else {
-                // Cold cache (nothing loaded yet) — show the M0
-                // gradient as a "loading" state.
-                pass.set_pipeline(&self.clear_pipeline);
-                pass.draw(0..3, 0..1);
             }
 
             // Polar caps — fill the spherical band the Mercator tile
@@ -794,54 +851,6 @@ impl Renderer {
         self.queue.submit(std::iter::once(encoder.finish()));
         frame.present();
     }
-}
-
-fn build_clear_pipeline(
-    device: &wgpu::Device,
-    format: wgpu::TextureFormat,
-) -> wgpu::RenderPipeline {
-    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some("aegis-clear-shader"),
-        source: wgpu::ShaderSource::Wgsl(CLEAR_SHADER.into()),
-    });
-    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some("aegis-clear-layout"),
-        bind_group_layouts: &[],
-        immediate_size: 0,
-    });
-    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: Some("aegis-clear-pipeline"),
-        layout: Some(&layout),
-        vertex: wgpu::VertexState {
-            module: &module,
-            entry_point: Some("vs_main"),
-            buffers: &[],
-            compilation_options: Default::default(),
-        },
-        fragment: Some(wgpu::FragmentState {
-            module: &module,
-            entry_point: Some("fs_main"),
-            targets: &[Some(wgpu::ColorTargetState {
-                format,
-                blend: None,
-                write_mask: wgpu::ColorWrites::ALL,
-            })],
-            compilation_options: Default::default(),
-        }),
-        primitive: wgpu::PrimitiveState {
-            topology: wgpu::PrimitiveTopology::TriangleList,
-            strip_index_format: None,
-            front_face: wgpu::FrontFace::Ccw,
-            cull_mode: None,
-            polygon_mode: wgpu::PolygonMode::Fill,
-            unclipped_depth: false,
-            conservative: false,
-        },
-        depth_stencil: None,
-        multisample: wgpu::MultisampleState::default(),
-        multiview_mask: None,
-        cache: None,
-    })
 }
 
 fn build_tile_pipeline(
@@ -1033,6 +1042,181 @@ fn make_cap_binding(
         }],
     });
     (buf, bind_group)
+}
+
+/// Build the earth-texture pipeline together with its uniform buffer
+/// and bind group. Decodes the bundled Blue Marble PNG, uploads it as
+/// an sRGB 2D texture, and wires the per-frame camera uniform.
+fn build_earth_resources(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    format: wgpu::TextureFormat,
+) -> (
+    wgpu::RenderPipeline,
+    wgpu::Buffer,
+    wgpu::BindGroup,
+    wgpu::Texture,
+    wgpu::Sampler,
+) {
+    let decoded = tile::decode_png(EARTH_PNG_BYTES)
+        .expect("bundled Blue Marble PNG failed to decode — binary is corrupt");
+    log::info!(
+        "earth texture: decoded {}×{} from bundled PNG",
+        decoded.width,
+        decoded.height
+    );
+
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("aegis-earth-texture"),
+        size: wgpu::Extent3d {
+            width: decoded.width,
+            height: decoded.height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        // sRGB so the PNG-source colour space matches what the sRGB
+        // surface expects — same convention the tile pipeline uses.
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: &texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        &decoded.rgba,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(decoded.width * 4),
+            rows_per_image: Some(decoded.height),
+        },
+        wgpu::Extent3d {
+            width: decoded.width,
+            height: decoded.height,
+            depth_or_array_layers: 1,
+        },
+    );
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("aegis-earth-sampler"),
+        // U wraps so the seam at lon = ±180° interpolates correctly
+        // across the antimeridian; V clamps so the polar rows don't
+        // smear past the texture top/bottom.
+        address_mode_u: wgpu::AddressMode::Repeat,
+        address_mode_v: wgpu::AddressMode::ClampToEdge,
+        address_mode_w: wgpu::AddressMode::ClampToEdge,
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Linear,
+        mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+        ..Default::default()
+    });
+
+    let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("aegis-earth-bgl"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+        ],
+    });
+    let camera_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("aegis-earth-camera"),
+        contents: bytemuck::bytes_of(&EarthCameraUniform::default()),
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+    });
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("aegis-earth-bg"),
+        layout: &bgl,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: camera_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(&view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::Sampler(&sampler),
+            },
+        ],
+    });
+
+    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("aegis-earth-shader"),
+        source: wgpu::ShaderSource::Wgsl(EARTH_SHADER.into()),
+    });
+    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("aegis-earth-layout"),
+        bind_group_layouts: &[Some(&bgl)],
+        immediate_size: 0,
+    });
+    let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("aegis-earth-pipeline"),
+        layout: Some(&layout),
+        vertex: wgpu::VertexState {
+            module: &module,
+            entry_point: Some("vs_main"),
+            buffers: &[],
+            compilation_options: Default::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &module,
+            entry_point: Some("fs_main"),
+            targets: &[Some(wgpu::ColorTargetState {
+                format,
+                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            compilation_options: Default::default(),
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            strip_index_format: None,
+            front_face: wgpu::FrontFace::Ccw,
+            cull_mode: None,
+            polygon_mode: wgpu::PolygonMode::Fill,
+            unclipped_depth: false,
+            conservative: false,
+        },
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        multiview_mask: None,
+        cache: None,
+    });
+    // `view` lives only as long as `bind_group` references it; the
+    // texture + sampler must outlive the bind group, so we hand them
+    // back to the caller for storage on `Renderer`.
+    (pipeline, camera_buf, bind_group, texture, sampler)
 }
 
 fn build_satellites_pipeline(

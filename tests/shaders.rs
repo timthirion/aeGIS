@@ -23,11 +23,6 @@ fn validate_wgsl(source: &str, label: &str) {
 }
 
 #[test]
-fn clear_shader_validates() {
-    validate_wgsl(include_str!("../src/shaders/clear.wgsl"), "clear.wgsl");
-}
-
-#[test]
 fn tile_shader_validates() {
     validate_wgsl(include_str!("../src/shaders/tile.wgsl"), "tile.wgsl");
 }
@@ -48,4 +43,9 @@ fn satellites_shader_validates() {
         include_str!("../src/shaders/satellites.wgsl"),
         "satellites.wgsl",
     );
+}
+
+#[test]
+fn earth_shader_validates() {
+    validate_wgsl(include_str!("../src/shaders/earth.wgsl"), "earth.wgsl");
 }
