@@ -39,6 +39,7 @@ dependencies = [
  "log",
  "naga 26.0.0",
  "pollster",
+ "regex",
  "thiserror 2.0.18",
  "wasm-bindgen",
  "wasm-bindgen-futures",
