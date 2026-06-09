@@ -28,7 +28,13 @@ struct VsOut {
 };
 
 const PI: f32 = 3.14159265358979323846;
-const GRID: u32 = 8u;
+// `GRID × GRID` quads per tile. A z=0 tile covers the entire globe;
+// at GRID=8 the silhouette degenerates to a ~16-facet polygon
+// because the tile mesh sits on the same sphere positions as the
+// underlying Earth-texture sphere and wins the depth tie. GRID=32
+// → 1024 quads (2048 tris) per tile, smooth at the globe scale and
+// still cheap at high zoom where each tile covers a tiny region.
+const GRID: u32 = 32u;
 const QUAD_VERTS: u32 = 6u;
 
 fn world_to_lonlat_rad(world: vec2<f32>) -> vec2<f32> {

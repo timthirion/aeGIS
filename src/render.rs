@@ -753,11 +753,14 @@ impl Renderer {
 
             if !draws.is_empty() {
                 pass.set_pipeline(&self.tile_pipeline);
-                // 8×8 grid of quads × 6 verts/quad — matches `GRID`
+                // 32×32 grid of quads × 6 verts/quad — matches `GRID`
                 // + `QUAD_VERTS` in tile.wgsl. The grid is what lets
                 // each tile curve onto the globe at low zoom rather
-                // than rendering as a flat NDC quad.
-                const TILE_GRID_VERTS: u32 = 8 * 8 * 6;
+                // than rendering as a flat NDC quad. Higher GRID =
+                // smoother silhouette when one tile covers the whole
+                // sphere (z=0); cost is trivial at high zoom where
+                // each tile covers a tiny region.
+                const TILE_GRID_VERTS: u32 = 32 * 32 * 6;
                 for (_, _, binding) in &draws {
                     pass.set_bind_group(0, &binding.bind_group, &[]);
                     pass.draw(0..TILE_GRID_VERTS, 0..1);
