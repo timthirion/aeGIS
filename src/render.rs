@@ -1215,23 +1215,36 @@ impl Renderer {
         // other passes; the per-cap `pole_sign` and `color` are baked
         // into each buffer.
         //
-        // Cap colours are the user's hand-picked **sRGB** values
-        // (north = pale Arctic blue, south = warm Antarctic ice).
-        // `srgb8_to_linear_rgba` round-trips them through the sRGB
-        // surface so what lands on screen is exactly the picked
-        // triple — no shading, no lighting, no compositing tricks
-        // alter them between the uniform and the framebuffer.
+        // Cap colours are mode-specific. In Map mode the caps are
+        // the user's hand-picked stylised palette (Arctic blue +
+        // Antarctic cream). In Satellite mode the caps cover the
+        // degenerate-UV region of the Blue Marble equirectangular
+        // texture at the actual pole (every vertex at lat=±π/2
+        // collapses to one sphere point with varying UV → garbage
+        // sample), so they need to match the true imagery colour
+        // there: pale ice-blue for the Arctic Ocean and bright
+        // white for the Antarctic ice sheet.
+        let (north_cap_color, south_cap_color) = match self.basemap_mode {
+            BasemapMode::Map => (
+                srgb8_to_linear_rgba(170, 206, 212, 255),
+                srgb8_to_linear_rgba(246, 239, 229, 255),
+            ),
+            BasemapMode::Satellite => (
+                srgb8_to_linear_rgba(190, 215, 230, 255),
+                srgb8_to_linear_rgba(248, 250, 252, 255),
+            ),
+        };
         let north_cap = CapUniform {
             view_proj,
             camera_pos,
             pole_sign: 1.0,
-            color: srgb8_to_linear_rgba(170, 206, 212, 255),
+            color: north_cap_color,
         };
         let south_cap = CapUniform {
             view_proj,
             camera_pos,
             pole_sign: -1.0,
-            color: srgb8_to_linear_rgba(246, 239, 229, 255),
+            color: south_cap_color,
         };
         self.queue
             .write_buffer(&self.north_cap_buf, 0, bytemuck::bytes_of(&north_cap));
@@ -1347,18 +1360,20 @@ impl Renderer {
                 }
             }
 
-            // Polar caps — Map-only. They exist to fill the band
-            // Web Mercator can't tile (|lat| > 85.051°). In Satellite
-            // mode the Earth texture + EPSG:4326 BM tiles already
-            // cover ±90° so drawing the caps would obscure legitimate
-            // imagery there.
-            if self.basemap_mode == BasemapMode::Map {
-                pass.set_pipeline(&self.cap_pipeline);
-                pass.set_bind_group(0, &self.north_cap_bind_group, &[]);
-                pass.draw(0..CAP_DRAW_VERTS, 0..1);
-                pass.set_bind_group(0, &self.south_cap_bind_group, &[]);
-                pass.draw(0..CAP_DRAW_VERTS, 0..1);
-            }
+            // Polar caps — drawn in both modes. They fill the
+            // |lat| > 85.051° band that Web Mercator can't tile, and
+            // (importantly) they also cover the degenerate-UV disc
+            // the Blue Marble equirectangular texture produces at
+            // the actual pole. Without the cap in Satellite mode a
+            // small distorted disc of the texture was visible
+            // through the south pole. The cap colours are mode-
+            // specific so Satellite-mode caps match the real polar
+            // imagery rather than the stylised Map palette.
+            pass.set_pipeline(&self.cap_pipeline);
+            pass.set_bind_group(0, &self.north_cap_bind_group, &[]);
+            pass.draw(0..CAP_DRAW_VERTS, 0..1);
+            pass.set_bind_group(0, &self.south_cap_bind_group, &[]);
+            pass.draw(0..CAP_DRAW_VERTS, 0..1);
 
             // Vector overlay on top of the basemap.
             if let Some(vector) = &self.vector {

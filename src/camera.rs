@@ -287,20 +287,20 @@ impl Camera {
         let top = (wcy - half_h_world).max(0.0);
         let bottom = (wcy + half_h_world).min(1.0);
 
-        // One-tile margin around the floored rect. Without it, tiles
-        // that are partially clipped by the viewport edge can fall
-        // outside the dispatched set — the rendered viewport is
-        // wider than the slippy-floor rect when the camera is at a
-        // fractional zoom (ppw uses self.zoom, tile addresses use
-        // round(self.zoom)), and at low-altitude perspective the
-        // canvas corners see slightly more world per pixel than the
-        // centre. The margin is cheap (~4 extra tiles) and covers
-        // both cases plus any DPR-rounding drift.
+        // Two-tile margin around the floored rect. The 1-tile margin
+        // we used previously still left a narrow rim (~30 device px)
+        // unfilled on initial load: the perspective camera projects
+        // tiles slightly differently from the flat-Mercator slippy
+        // expectation at the canvas corners, and the fractional-zoom
+        // ↔ rounded-zoom mismatch shifts the rect by a sub-tile
+        // amount that the 1-tile margin couldn't always absorb. Two
+        // tiles is comfortably more than the discrepancy and the
+        // extra ~8 tiles per dispatch are negligible at every zoom.
         let clamp = |v: f64| (v as i64).clamp(0, max_i);
-        let tile_min_x = clamp((left * n_f).floor() - 1.0);
-        let tile_max_x = clamp((right * n_f).floor() + 1.0);
-        let tile_min_y = clamp((top * n_f).floor() - 1.0);
-        let tile_max_y = clamp((bottom * n_f).floor() + 1.0);
+        let tile_min_x = clamp((left * n_f).floor() - 2.0);
+        let tile_max_x = clamp((right * n_f).floor() + 2.0);
+        let tile_min_y = clamp((top * n_f).floor() - 2.0);
+        let tile_max_y = clamp((bottom * n_f).floor() + 2.0);
 
         let mut tiles = Vec::new();
         for ty in tile_min_y..=tile_max_y {
@@ -780,12 +780,12 @@ mod tests {
             "Chicago tile not in visible set: {tiles:?}"
         );
         // 800×600 viewport at z=10 with 256-px tiles covers about
-        // 3-4 tiles wide × 3 tall, plus a one-tile margin on every
-        // side (so edge-clipped tiles still get dispatched) — about
-        // 5-6 × 4-5 = 20-30, with [12, 42] as a generous outer
-        // bound that won't flap if the Chicago coords nudge.
+        // 3-4 tiles wide × 3 tall, plus a two-tile margin on every
+        // side (so the rim is always dispatched) — about 7-8 × 6-7
+        // ≈ 42-56, with [24, 80] as a generous outer bound that
+        // won't flap if the Chicago coords nudge.
         assert!(
-            (12..=42).contains(&tiles.len()),
+            (24..=80).contains(&tiles.len()),
             "unexpected visible-tile count at z=10 / 800x600: {}",
             tiles.len()
         );
