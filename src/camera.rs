@@ -253,7 +253,17 @@ impl Camera {
     /// tile selector in a later milestone. For Chicago at zoom 10 this
     /// is moot — and at zoom 0 the entire world is one tile.
     pub fn visible_tiles(&self, canvas: (u32, u32)) -> Vec<TileId> {
-        let z = self.zoom.round().clamp(MIN_ZOOM, MAX_ZOOM) as u8;
+        self.visible_tiles_capped(canvas, MAX_ZOOM as u8)
+    }
+
+    /// Like [`Self::visible_tiles`] but clamps the chosen zoom to
+    /// `max_z`. Used by providers whose pyramid stops short of
+    /// `MAX_ZOOM` (Sentinel-2 cloudless tops out at z=14). Past that,
+    /// the camera keeps zooming but the satellite tile resolution
+    /// stays at z=14 — the imagery just renders larger.
+    pub fn visible_tiles_capped(&self, canvas: (u32, u32), max_z: u8) -> Vec<TileId> {
+        let max_z_f = (max_z as f64).min(MAX_ZOOM);
+        let z = self.zoom.round().clamp(MIN_ZOOM, max_z_f) as u8;
         let n = 1u32 << z;
         let n_f = n as f64;
         let max_i = (n - 1) as i64;

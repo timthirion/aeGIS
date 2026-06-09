@@ -28,22 +28,20 @@ use std::sync::mpsc;
 use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
 
-use crate::bm_tile::{self, BmTileId};
 use crate::camera::Camera;
-use crate::tile::{self, DecodedTile, TileId, CHICAGO_LONLAT};
+use crate::tile::{self, DecodedTile, TileId, TileProvider, CHICAGO_LONLAT, SENTINEL2_MAX_Z};
 use crate::vector::VectorLayer;
 
 const TILE_SHADER: &str = include_str!("shaders/tile.wgsl");
 const VECTOR_SHADER: &str = include_str!("shaders/vector.wgsl");
 const CAPS_SHADER: &str = include_str!("shaders/caps.wgsl");
 const EARTH_SHADER: &str = include_str!("shaders/earth.wgsl");
-const BM_TILE_SHADER: &str = include_str!("shaders/bm_tile.wgsl");
 
 /// Frames the camera state must stay unchanged before we consider it
-/// "settled" and trigger a Blue Marble fetch. At 60 fps this is
+/// "settled" and trigger a satellite-tile fetch. At 60 fps this is
 /// ~0.5 s — long enough that mid-pan / mid-zoom intent isn't acted
 /// on, short enough that a deliberate pause feels responsive.
-const BM_DWELL_FRAMES: u32 = 30;
+const SAT_DWELL_FRAMES: u32 = 30;
 
 /// Blue Marble equirectangular Earth imagery, embedded at compile time
 /// so it ships with the wasm and native binaries alike. 4096×2048 JPEG,
@@ -143,19 +141,6 @@ pub enum BasemapMode {
     Satellite,
 }
 
-/// Per-tile uniform consumed by `bm_tile.wgsl`. Same 96-byte layout
-/// as [`TileUniforms`] but the last `vec4` carries the tile's
-/// **geographic** bounds in degrees (lon_min, lat_min, lon_max,
-/// lat_max) instead of normalised-Mercator world coords.
-#[repr(C)]
-#[derive(Copy, Clone, Debug, Default, Pod, Zeroable)]
-struct BmTileUniforms {
-    view_proj: [f32; 16],
-    camera_pos: [f32; 3],
-    tile_alpha: f32,
-    lon_lat_bounds: [f32; 4],
-}
-
 /// A vector-layer that's been uploaded as a GPU vertex buffer, ready
 /// to render as a LineList.
 struct VectorBinding {
@@ -174,25 +159,22 @@ struct TileBinding {
 /// Fetch completion delivered to the renderer's tile-load channel.
 type TileFetchResult = (TileId, Result<DecodedTile, String>);
 
-/// Fetch completion for the Blue Marble streaming layer.
-type BmTileFetchResult = (BmTileId, Result<DecodedTile, String>);
-
 /// Snapshot of the camera state used to detect "the user has settled
 /// here." We bucket fractional zooms (so a 0.001-zoom drift from
 /// floating-point in the projection matrix doesn't keep resetting
 /// the counter) and round center coords to the nearest 1e-6° — well
-/// under one tile span at every level GIBS publishes.
+/// under one tile span at every level we stream.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-struct BmDwellSnapshot {
+struct SatDwellSnapshot {
     zoom_thousandths: i32,
     lon_micros: i64,
     lat_micros: i64,
     canvas: (u32, u32),
 }
 
-impl BmDwellSnapshot {
-    fn from_camera(camera: &Camera, canvas: (u32, u32)) -> BmDwellSnapshot {
-        BmDwellSnapshot {
+impl SatDwellSnapshot {
+    fn from_camera(camera: &Camera, canvas: (u32, u32)) -> SatDwellSnapshot {
+        SatDwellSnapshot {
             zoom_thousandths: (camera.zoom * 1000.0).round() as i32,
             lon_micros: (camera.center_lonlat.0 * 1_000_000.0).round() as i64,
             lat_micros: (camera.center_lonlat.1 * 1_000_000.0).round() as i64,
@@ -262,29 +244,25 @@ pub struct Renderer {
     completed_tx: mpsc::Sender<TileFetchResult>,
     completed_rx: mpsc::Receiver<TileFetchResult>,
 
-    /// Blue Marble streaming pipeline + cache. Parallel structure to
-    /// the Carto-side `tiles` / `requested` / `failed` maps, but
-    /// keyed by `BmTileId` (EPSG:4326, GIBS) and rendered through a
-    /// separate equirectangular-projection shader. Drawn *after* the
-    /// Carto layer so a settled-region satellite imagery overlay
-    /// wins where loaded; until tiles arrive the Carto basemap is
-    /// what the user sees.
-    bm_tile_pipeline: wgpu::RenderPipeline,
-    bm_tile_bgl: wgpu::BindGroupLayout,
-    bm_tile_sampler: wgpu::Sampler,
-    bm_tiles: HashMap<BmTileId, TileBinding>,
-    bm_requested: HashSet<BmTileId>,
-    bm_failed: HashSet<BmTileId>,
-    bm_completed_tx: mpsc::Sender<BmTileFetchResult>,
-    bm_completed_rx: mpsc::Receiver<BmTileFetchResult>,
-    /// Dwell-tracking state for the lazy fetch. We snapshot the
-    /// camera every frame; when consecutive frames produce the same
-    /// snapshot for `BM_DWELL_FRAMES` frames we treat the user as
-    /// having settled and trigger a `ensure_visible_bm_tiles`. Any
+    /// Satellite (Sentinel-2 cloudless) streaming cache. Same Web
+    /// Mercator XYZ pyramid as Carto, so we render through the
+    /// existing `tile_pipeline` and reuse the same `TileUniforms`
+    /// layout — only the URL provider and the per-tile JPEG content
+    /// differ. Keeping a separate cache from `tiles` lets the user
+    /// toggle Map ↔ Satellite without one mode's bitmaps bleeding
+    /// into the other.
+    sat_tiles: HashMap<TileId, TileBinding>,
+    sat_requested: HashSet<TileId>,
+    sat_failed: HashSet<TileId>,
+    sat_completed_tx: mpsc::Sender<TileFetchResult>,
+    sat_completed_rx: mpsc::Receiver<TileFetchResult>,
+    /// Dwell-tracking state for the lazy satellite fetch. Snapshot
+    /// the camera every frame; after `SAT_DWELL_FRAMES` frames at
+    /// the same snapshot, fetch the visible-tile set once. Any
     /// movement resets the counter — the streamed layer never gets
     /// in the way mid-gesture.
-    bm_dwell_snapshot: Option<BmDwellSnapshot>,
-    bm_dwell_frames: u32,
+    sat_dwell_snapshot: Option<SatDwellSnapshot>,
+    sat_dwell_frames: u32,
 
     /// Which basemap to draw + fetch. Toggled by the UI overlay
     /// (web) or the `B` key (native); see [`Self::set_basemap_mode`].
@@ -504,23 +482,7 @@ impl Renderer {
         // sampler), so we reuse `tile_bgl`. Separate pipeline because
         // the WGSL is different — the BM shader does equirectangular
         // projection, not inverse Mercator.
-        let bm_tile_pipeline = build_bm_tile_pipeline(&device, format, &tile_bgl);
-        let bm_tile_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("aegis-bm-tile-sampler"),
-            // U wraps (antimeridian seam at tile edges); V clamps so
-            // the pole rows don't smear. Same convention as the
-            // Earth-texture sphere sampler.
-            address_mode_u: wgpu::AddressMode::Repeat,
-            address_mode_v: wgpu::AddressMode::ClampToEdge,
-            address_mode_w: wgpu::AddressMode::ClampToEdge,
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
-            ..Default::default()
-        });
-        let bm_tile_bgl = tile_bgl.clone();
-        let (bm_completed_tx, bm_completed_rx) = mpsc::channel();
-
+        let (sat_completed_tx, sat_completed_rx) = mpsc::channel();
         let (completed_tx, completed_rx) = mpsc::channel();
 
         Renderer {
@@ -551,16 +513,13 @@ impl Renderer {
             failed: HashSet::new(),
             completed_tx,
             completed_rx,
-            bm_tile_pipeline,
-            bm_tile_bgl,
-            bm_tile_sampler,
-            bm_tiles: HashMap::new(),
-            bm_requested: HashSet::new(),
-            bm_failed: HashSet::new(),
-            bm_completed_tx,
-            bm_completed_rx,
-            bm_dwell_snapshot: None,
-            bm_dwell_frames: 0,
+            sat_tiles: HashMap::new(),
+            sat_requested: HashSet::new(),
+            sat_failed: HashSet::new(),
+            sat_completed_tx,
+            sat_completed_rx,
+            sat_dwell_snapshot: None,
+            sat_dwell_frames: 0,
             basemap_mode: BasemapMode::default(),
             // Default view: a partly-globey zoom centred between
             // the Americas so the headline globe view is the first
@@ -762,7 +721,7 @@ impl Renderer {
     #[cfg(not(target_arch = "wasm32"))]
     fn dispatch_tile_fetch(&self, id: TileId) {
         let tx = self.completed_tx.clone();
-        let url = id.tile_url();
+        let url = id.tile_url(TileProvider::Carto);
         std::thread::spawn(move || {
             let result = tile::fetch_tile_blocking(&url);
             let _ = tx.send((id, result));
@@ -775,7 +734,7 @@ impl Renderer {
     #[cfg(target_arch = "wasm32")]
     fn dispatch_tile_fetch(&self, id: TileId) {
         let tx = self.completed_tx.clone();
-        let url = id.tile_url();
+        let url = id.tile_url(TileProvider::Carto);
         wasm_bindgen_futures::spawn_local(async move {
             let result = tile::fetch_tile_web(&url).await;
             let _ = tx.send((id, result));
@@ -783,25 +742,26 @@ impl Renderer {
     }
 
     // -----------------------------------------------------------------
-    // Blue Marble streaming layer — parallel structure to the Carto
-    // tile cache above, keyed by `BmTileId` and rendered through the
-    // equirectangular pipeline.
+    // Satellite (Sentinel-2 cloudless) streaming layer. Parallel cache
+    // to the Carto one above, same `TileId` keying because both use
+    // the Web Mercator pyramid — only the URL provider and the JPEG
+    // payload differ. Renders through the existing `tile_pipeline`,
+    // so this section is fetch / cache / dwell plumbing only.
     // -----------------------------------------------------------------
 
-    /// Upload a decoded BM tile to the GPU and bind it under `id`.
-    /// Identical shape to [`Self::upload_tile`] (the bind-group
-    /// layout is the same; only the uniform contents differ at draw
-    /// time).
-    fn upload_bm_tile(&mut self, id: BmTileId, width: u32, height: u32, rgba: &[u8]) {
+    /// Upload a decoded satellite tile to the GPU and bind it under
+    /// `id`. Same shape as [`Self::upload_tile`] but writes into the
+    /// `sat_*` cache.
+    fn upload_sat_tile(&mut self, id: TileId, width: u32, height: u32, rgba: &[u8]) {
         assert_eq!(
             rgba.len(),
             (width * height * 4) as usize,
-            "upload_bm_tile {id:?}: rgba.len()={} doesn't match {width}×{height}×4",
+            "upload_sat_tile {id:?}: rgba.len()={} doesn't match {width}×{height}×4",
             rgba.len()
         );
 
         let texture = self.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("aegis-bm-tile-texture"),
+            label: Some("aegis-sat-tile-texture"),
             size: wgpu::Extent3d {
                 width,
                 height,
@@ -837,13 +797,13 @@ impl Renderer {
         let uniform_buf = self
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("aegis-bm-tile-uniform"),
-                contents: bytemuck::bytes_of(&BmTileUniforms::default()),
+                label: Some("aegis-sat-tile-uniform"),
+                contents: bytemuck::bytes_of(&TileUniforms::default()),
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             });
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("aegis-bm-tile-bg"),
-            layout: &self.bm_tile_bgl,
+            label: Some("aegis-sat-tile-bg"),
+            layout: &self.tile_bgl,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
@@ -855,12 +815,12 @@ impl Renderer {
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: wgpu::BindingResource::Sampler(&self.bm_tile_sampler),
+                    resource: wgpu::BindingResource::Sampler(&self.tile_sampler),
                 },
             ],
         });
-        self.bm_requested.remove(&id);
-        self.bm_tiles.insert(
+        self.sat_requested.remove(&id);
+        self.sat_tiles.insert(
             id,
             TileBinding {
                 _texture: texture,
@@ -870,90 +830,81 @@ impl Renderer {
         );
     }
 
-    /// Drain any BM-tile fetch completions and upload them. Mirror
-    /// of [`Self::drain_completed_fetches`] keyed by `BmTileId`.
-    pub fn drain_bm_completed_fetches(&mut self) {
+    /// Drain any satellite-tile fetch completions and upload them.
+    pub fn drain_sat_completed_fetches(&mut self) {
         loop {
-            match self.bm_completed_rx.try_recv() {
+            match self.sat_completed_rx.try_recv() {
                 Ok((id, Ok(decoded))) => {
-                    self.upload_bm_tile(id, decoded.width, decoded.height, &decoded.rgba);
+                    self.upload_sat_tile(id, decoded.width, decoded.height, &decoded.rgba);
                 }
                 Ok((id, Err(e))) => {
-                    self.bm_requested.remove(&id);
-                    self.bm_failed.insert(id);
-                    log::warn!("bm tile fetch failed for {id:?}: {e}");
+                    self.sat_requested.remove(&id);
+                    self.sat_failed.insert(id);
+                    log::warn!("sat tile fetch failed for {id:?}: {e}");
                 }
                 Err(mpsc::TryRecvError::Empty) | Err(mpsc::TryRecvError::Disconnected) => break,
             }
         }
     }
 
-    /// Dwell-gated BM fetch. Should be called from the frame loop on
-    /// every tick (after `ensure_visible_tiles`). The first
-    /// `BM_DWELL_FRAMES` frames at any new camera position do
-    /// nothing; once the user has settled we fetch the visible BM
-    /// tile set for the camera's matching GIBS zoom level and stop
-    /// until they move again. Movement resets the counter so the
-    /// streaming layer never gets in the way mid-gesture.
-    pub fn ensure_visible_bm_tiles(&mut self) {
+    /// Dwell-gated satellite fetch. Call from the frame loop on every
+    /// tick. The first `SAT_DWELL_FRAMES` frames at any new camera
+    /// position do nothing; once the user has settled we fetch the
+    /// visible-tile set once and stop until they move again. Movement
+    /// resets the counter so the streamed layer never gets in the way
+    /// mid-gesture.
+    pub fn ensure_visible_sat_tiles(&mut self) {
         if self.basemap_mode != BasemapMode::Satellite {
             return;
         }
         let canvas = self.size();
-        let snapshot = BmDwellSnapshot::from_camera(&self.camera, canvas);
-        if Some(snapshot) != self.bm_dwell_snapshot {
+        let snapshot = SatDwellSnapshot::from_camera(&self.camera, canvas);
+        if Some(snapshot) != self.sat_dwell_snapshot {
             // User has moved — reset the dwell counter and clear the
-            // failure blocklist so transient errors (GIBS rate-limit,
-            // intermittent network) get a fresh shot on the next
-            // dwell instead of permanently bricking a tile.
-            self.bm_dwell_snapshot = Some(snapshot);
-            self.bm_dwell_frames = 0;
-            self.bm_failed.clear();
+            // failure blocklist so transient errors (provider rate
+            // limit, intermittent network) get a fresh shot on the
+            // next dwell instead of permanently bricking a tile.
+            self.sat_dwell_snapshot = Some(snapshot);
+            self.sat_dwell_frames = 0;
+            self.sat_failed.clear();
             return;
         }
-        // Camera is still — count up to the threshold, then dispatch
-        // exactly once. Past the dispatch frame we stay quiet until
-        // the user moves and the snapshot changes again.
-        if self.bm_dwell_frames < BM_DWELL_FRAMES {
-            self.bm_dwell_frames += 1;
+        if self.sat_dwell_frames < SAT_DWELL_FRAMES {
+            self.sat_dwell_frames += 1;
             return;
         }
-        if self.bm_dwell_frames == BM_DWELL_FRAMES {
-            self.dispatch_visible_bm_tiles();
-            self.bm_dwell_frames = self.bm_dwell_frames.saturating_add(1);
+        if self.sat_dwell_frames == SAT_DWELL_FRAMES {
+            self.dispatch_visible_sat_tiles();
+            self.sat_dwell_frames = self.sat_dwell_frames.saturating_add(1);
         }
     }
 
-    /// Unconditionally enqueue the visible BM tile set for fetch.
-    /// Used by both the dwell-gated path above and the immediate-fetch
-    /// branch in [`Self::set_basemap_mode`] (where the user just
-    /// clicked Satellite and we don't want the half-second dwell wait).
-    fn dispatch_visible_bm_tiles(&mut self) {
+    /// Unconditionally enqueue the visible satellite-tile set for
+    /// fetch. Used by both the dwell-gated path above and the
+    /// immediate-fetch branch in [`Self::set_basemap_mode`].
+    fn dispatch_visible_sat_tiles(&mut self) {
         let canvas = self.size();
-        let Some(gibs_z) = bm_tile::gibs_zoom_for(self.camera.zoom) else {
-            return;
-        };
-        let visible = bm_tile::visible_tiles(&self.camera, canvas, gibs_z);
+        let visible = self.camera.visible_tiles_capped(canvas, SENTINEL2_MAX_Z);
         let visible_count = visible.len();
         let mut dispatched = 0;
         for id in visible {
-            if self.bm_tiles.contains_key(&id)
-                || self.bm_requested.contains(&id)
-                || self.bm_failed.contains(&id)
+            if self.sat_tiles.contains_key(&id)
+                || self.sat_requested.contains(&id)
+                || self.sat_failed.contains(&id)
             {
                 continue;
             }
-            self.bm_requested.insert(id);
-            self.dispatch_bm_tile_fetch(id);
+            self.sat_requested.insert(id);
+            self.dispatch_sat_tile_fetch(id);
             dispatched += 1;
         }
         if dispatched > 0 {
             log::info!(
-                "bm: dispatched {dispatched}/{visible_count} tiles at gibs_z={gibs_z} \
+                "sat: dispatched {dispatched}/{visible_count} tiles \
                  (camera zoom={:.2}, in-flight={}, cached={})",
                 self.camera.zoom,
-                self.bm_requested.len(),
-                self.bm_tiles.len(),
+                self.sat_requested.len(),
+                self.sat_tiles.len(),
             );
         }
     }
@@ -974,37 +925,29 @@ impl Renderer {
         }
         self.basemap_mode = mode;
         if mode == BasemapMode::Satellite {
-            self.dispatch_visible_bm_tiles();
-            // Skip the next ensure_visible_bm_tiles dwell wait so a
-            // subsequent camera move re-triggers correctly. Snapshot
-            // matches the current camera; counter is "past threshold,
-            // already dispatched" — any movement resets cleanly.
+            self.dispatch_visible_sat_tiles();
             let canvas = self.size();
-            self.bm_dwell_snapshot = Some(BmDwellSnapshot::from_camera(&self.camera, canvas));
-            self.bm_dwell_frames = BM_DWELL_FRAMES.saturating_add(1);
+            self.sat_dwell_snapshot = Some(SatDwellSnapshot::from_camera(&self.camera, canvas));
+            self.sat_dwell_frames = SAT_DWELL_FRAMES.saturating_add(1);
         }
     }
 
-    /// Native: spawn a thread per BM tile request. Same shape as
-    /// [`Self::dispatch_tile_fetch`] but the completion channel is
-    /// the BM-specific one and the fetcher uses image autodetect
-    /// (GIBS serves JPEG, Carto serves PNG — the shared HTTP path
-    /// already handles both).
+    /// Native: spawn a thread per satellite-tile request.
     #[cfg(not(target_arch = "wasm32"))]
-    fn dispatch_bm_tile_fetch(&self, id: BmTileId) {
-        let tx = self.bm_completed_tx.clone();
-        let url = id.url();
+    fn dispatch_sat_tile_fetch(&self, id: TileId) {
+        let tx = self.sat_completed_tx.clone();
+        let url = id.tile_url(TileProvider::Sentinel2Cloudless);
         std::thread::spawn(move || {
             let result = tile::fetch_tile_blocking(&url);
             let _ = tx.send((id, result));
         });
     }
 
-    /// Web: spawn a JS-event-loop task per BM tile request.
+    /// Web: spawn a JS-event-loop task per satellite-tile request.
     #[cfg(target_arch = "wasm32")]
-    fn dispatch_bm_tile_fetch(&self, id: BmTileId) {
-        let tx = self.bm_completed_tx.clone();
-        let url = id.url();
+    fn dispatch_sat_tile_fetch(&self, id: TileId) {
+        let tx = self.sat_completed_tx.clone();
+        let url = id.tile_url(TileProvider::Sentinel2Cloudless);
         wasm_bindgen_futures::spawn_local(async move {
             let result = tile::fetch_tile_web(&url).await;
             let _ = tx.send((id, result));
@@ -1067,24 +1010,22 @@ impl Renderer {
                 .write_buffer(&binding.uniform_buf, 0, bytemuck::bytes_of(&u));
         }
 
-        // Blue Marble streaming draws — every loaded BM tile gets
-        // queued; backface culling + the lazy fetch keep the set
-        // bounded to roughly what's visible. Uniform layout uses
-        // lon_lat_bounds (degrees) instead of world_rect, but
-        // otherwise mirrors the Carto path. `tile_alpha = 1.0`
-        // because BM tiles only fetch once the user has settled
-        // (no cross-fade window to align with).
-        let bm_draws: Vec<(&BmTileId, [f32; 4], &TileBinding)> = self
-            .bm_tiles
+        // Satellite-tile draws — every loaded Sentinel-2 tile gets
+        // queued; backface culling + the lazy dwell-fetch keep the
+        // set bounded to roughly what's visible. Same `TileUniforms`
+        // layout and `tile_pipeline` as Carto: both are Web Mercator,
+        // and the satellite tiles only differ in their JPEG payload.
+        let sat_draws: Vec<(&TileId, [f32; 4], &TileBinding)> = self
+            .sat_tiles
             .iter()
-            .map(|(id, binding)| (id, id.lon_lat_bounds(), binding))
+            .map(|(id, binding)| (id, id.world_rect(), binding))
             .collect();
-        for (_, bounds, binding) in &bm_draws {
-            let u = BmTileUniforms {
+        for (_, world_rect, binding) in &sat_draws {
+            let u = TileUniforms {
                 view_proj,
                 camera_pos,
                 tile_alpha: 1.0,
-                lon_lat_bounds: *bounds,
+                world_rect: *world_rect,
             };
             self.queue
                 .write_buffer(&binding.uniform_buf, 0, bytemuck::bytes_of(&u));
@@ -1229,15 +1170,16 @@ impl Renderer {
                 }
             }
 
-            // Blue Marble streaming layer — Satellite-only. Drawn
-            // over the bundled Earth texture; tiles refine sharpness
-            // wherever loaded. Same 32×32 GRID as Carto.
-            if self.basemap_mode == BasemapMode::Satellite && !bm_draws.is_empty() {
-                pass.set_pipeline(&self.bm_tile_pipeline);
-                const BM_TILE_GRID_VERTS: u32 = 32 * 32 * 6;
-                for (_, _, binding) in &bm_draws {
+            // Satellite-tile layer — Satellite-only. Drawn over the
+            // bundled Earth texture; tiles refine sharpness wherever
+            // loaded. Same `tile_pipeline` as Carto since both are
+            // Web Mercator.
+            if self.basemap_mode == BasemapMode::Satellite && !sat_draws.is_empty() {
+                pass.set_pipeline(&self.tile_pipeline);
+                const TILE_GRID_VERTS: u32 = 32 * 32 * 6;
+                for (_, _, binding) in &sat_draws {
                     pass.set_bind_group(0, &binding.bind_group, &[]);
-                    pass.draw(0..BM_TILE_GRID_VERTS, 0..1);
+                    pass.draw(0..TILE_GRID_VERTS, 0..1);
                 }
             }
 
@@ -1299,55 +1241,6 @@ fn build_tile_pipeline(
                 // `(1 - globeness)` during the flat → globe
                 // transition. Standard SRC_ALPHA over (straight
                 // alpha, not premultiplied).
-                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                write_mask: wgpu::ColorWrites::ALL,
-            })],
-            compilation_options: Default::default(),
-        }),
-        primitive: wgpu::PrimitiveState {
-            topology: wgpu::PrimitiveTopology::TriangleList,
-            strip_index_format: None,
-            front_face: wgpu::FrontFace::Ccw,
-            cull_mode: None,
-            polygon_mode: wgpu::PolygonMode::Fill,
-            unclipped_depth: false,
-            conservative: false,
-        },
-        depth_stencil: None,
-        multisample: wgpu::MultisampleState::default(),
-        multiview_mask: None,
-        cache: None,
-    })
-}
-
-fn build_bm_tile_pipeline(
-    device: &wgpu::Device,
-    format: wgpu::TextureFormat,
-    bgl: &wgpu::BindGroupLayout,
-) -> wgpu::RenderPipeline {
-    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some("aegis-bm-tile-shader"),
-        source: wgpu::ShaderSource::Wgsl(BM_TILE_SHADER.into()),
-    });
-    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some("aegis-bm-tile-layout"),
-        bind_group_layouts: &[Some(bgl)],
-        immediate_size: 0,
-    });
-    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: Some("aegis-bm-tile-pipeline"),
-        layout: Some(&layout),
-        vertex: wgpu::VertexState {
-            module: &module,
-            entry_point: Some("vs_main"),
-            buffers: &[],
-            compilation_options: Default::default(),
-        },
-        fragment: Some(wgpu::FragmentState {
-            module: &module,
-            entry_point: Some("fs_main"),
-            targets: &[Some(wgpu::ColorTargetState {
-                format,
                 blend: Some(wgpu::BlendState::ALPHA_BLENDING),
                 write_mask: wgpu::ColorWrites::ALL,
             })],

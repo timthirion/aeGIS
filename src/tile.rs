@@ -18,6 +18,24 @@ pub struct TileId {
     pub y: u32,
 }
 
+/// Which provider's tile pyramid a `TileId` resolves to. Both
+/// providers use the same Web Mercator XYZ pyramid (so the geometry
+/// math is identical), only the URL and the practical max-zoom
+/// differ.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum TileProvider {
+    /// Carto Voyager OSM-derived street basemap. PNG, retina @2x.
+    Carto,
+    /// EOX-hosted Sentinel-2 cloudless mosaic. JPEG, 256×256, CC BY 4.0.
+    /// Requires the attribution
+    /// "Sentinel-2 cloudless by EOX IT Services GmbH" to be visible.
+    Sentinel2Cloudless,
+}
+
+/// Highest zoom the Sentinel-2 cloudless layer publishes. Source
+/// resolution is ~10 m/pixel; finer than that is just JPEG stretch.
+pub const SENTINEL2_MAX_Z: u8 = 14;
+
 impl TileId {
     /// The tile containing `(lon, lat)` at zoom `z`. Tile coordinates
     /// are clamped to `[0, 2^z)` so a longitude slightly past the
@@ -46,29 +64,36 @@ impl TileId {
         ]
     }
 
-    /// URL for a 512×512 PNG raster tile from Carto's Voyager
-    /// basemap (the `@2x` retina variant). Carto serves these
-    /// CORS-enabled with no API key, OSM-derived.
+    /// URL for this tile from the given provider. Both providers
+    /// share the Web Mercator XYZ pyramid, so the `(z, x, y)` triple
+    /// is provider-independent — only the endpoint changes.
     ///
-    /// **Why `@2x` rather than the plain 256×256 form:** on retina
-    /// displays (DPR ≥ 2) the plain tiles render at half their
-    /// designed CSS pixel size, so labels designed for "12 px
-    /// display" land at 6 px and read as illegibly small (see
-    /// `map_text.png` from the user's session feedback). The 512×512
-    /// retina tiles have 4× the pixel density so they stay crisp at
-    /// the same on-screen footprint. The bandwidth cost is the same
-    /// shape: tile count is unchanged, only the per-tile decode
-    /// scales linearly with pixel area.
+    /// **Carto Voyager** (Map mode): 512×512 PNG retina tile. CORS-
+    /// enabled, no API key, OSM-derived. The `@2x` form has 4× the
+    /// pixel density of the standard 256×256 tiles so labels stay
+    /// crisp on high-DPR displays. Attribution: © OpenStreetMap
+    /// contributors © CARTO.
     ///
-    /// Attribution: © OpenStreetMap contributors © CARTO. Surface in
-    /// the attribution overlay (M4) when present.
-    pub fn tile_url(&self) -> String {
-        format!(
-            "https://a.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}@2x.png",
-            z = self.z,
-            x = self.x,
-            y = self.y,
-        )
+    /// **Sentinel-2 cloudless** (Satellite mode): 256×256 JPEG from
+    /// EOX's WMTS REST endpoint. Sentinel-2 native ~10 m/pixel,
+    /// global cloudless mosaic. License: CC BY 4.0. Attribution:
+    /// Sentinel-2 cloudless by EOX IT Services GmbH.
+    pub fn tile_url(&self, provider: TileProvider) -> String {
+        match provider {
+            TileProvider::Carto => format!(
+                "https://a.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}@2x.png",
+                z = self.z,
+                x = self.x,
+                y = self.y,
+            ),
+            TileProvider::Sentinel2Cloudless => format!(
+                "https://s2maps-tiles.eu/wmts/1.0.0/s2cloudless-2020_3857/default/g/\
+                 {z}/{y}/{x}.jpg",
+                z = self.z,
+                x = self.x,
+                y = self.y,
+            ),
+        }
     }
 }
 
@@ -124,8 +149,8 @@ pub fn decode_image(bytes: &[u8]) -> Result<DecodedTile, image::ImageError> {
 
 /// Native-only synchronous tile fetch. Sends an HTTP GET with the
 /// project's `User-Agent` and autodetects the response format (PNG
-/// for Carto, JPEG for NASA GIBS — both basemap layers share this
-/// path).
+/// for Carto, JPEG for Sentinel-2 cloudless — both providers share
+/// this path).
 #[cfg(not(target_arch = "wasm32"))]
 pub fn fetch_tile_blocking(url: &str) -> Result<DecodedTile, String> {
     let request = ehttp::Request {
@@ -208,8 +233,18 @@ mod tests {
             }
         );
         assert_eq!(
-            tile.tile_url(),
+            tile.tile_url(TileProvider::Carto),
             "https://a.basemaps.cartocdn.com/rastertiles/voyager/10/262/380@2x.png"
+        );
+    }
+
+    #[test]
+    fn sentinel2_url_uses_eox_wmts_zyx_order() {
+        let tile = TileId { z: 5, x: 9, y: 12 };
+        assert_eq!(
+            tile.tile_url(TileProvider::Sentinel2Cloudless),
+            "https://s2maps-tiles.eu/wmts/1.0.0/s2cloudless-2020_3857/default/g/\
+             5/12/9.jpg"
         );
     }
 
