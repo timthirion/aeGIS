@@ -46,17 +46,25 @@ impl TileId {
         ]
     }
 
-    /// URL for a 256×256 PNG raster tile from Carto's Voyager basemap
-    /// (OpenStreetMap-derived). Carto serves CORS-enabled tiles with
-    /// no API key required, which is what lets the GitHub Pages build
-    /// fetch them — OSM's own tile CDN blocks browser fetches from
-    /// deployed apps per its usage policy.
+    /// URL for a 512×512 PNG raster tile from Carto's Voyager
+    /// basemap (the `@2x` retina variant). Carto serves these
+    /// CORS-enabled with no API key, OSM-derived.
+    ///
+    /// **Why `@2x` rather than the plain 256×256 form:** on retina
+    /// displays (DPR ≥ 2) the plain tiles render at half their
+    /// designed CSS pixel size, so labels designed for "12 px
+    /// display" land at 6 px and read as illegibly small (see
+    /// `map_text.png` from the user's session feedback). The 512×512
+    /// retina tiles have 4× the pixel density so they stay crisp at
+    /// the same on-screen footprint. The bandwidth cost is the same
+    /// shape: tile count is unchanged, only the per-tile decode
+    /// scales linearly with pixel area.
     ///
     /// Attribution: © OpenStreetMap contributors © CARTO. Surface in
     /// the attribution overlay (M4) when present.
     pub fn tile_url(&self) -> String {
         format!(
-            "https://a.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}.png",
+            "https://a.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}@2x.png",
             z = self.z,
             x = self.x,
             y = self.y,
@@ -185,7 +193,7 @@ mod tests {
         );
         assert_eq!(
             tile.tile_url(),
-            "https://a.basemaps.cartocdn.com/rastertiles/voyager/10/262/380.png"
+            "https://a.basemaps.cartocdn.com/rastertiles/voyager/10/262/380@2x.png"
         );
     }
 
