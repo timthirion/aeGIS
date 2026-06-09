@@ -54,7 +54,7 @@ globe view).
 
 See [`plans/README.md`](README.md) for the full convention. One
 `plans/NNNN-*.md` per concrete piece of work, zero-padded and
-globally incrementing (next free number: `0002`). Milestones use
+globally incrementing (next free number: `0004`). Milestones use
 track prefixes (`MAP-`, `CRS-`, `FMT-`, `IDX-`, `UI-`) +
 semantic slugs.
 
@@ -223,6 +223,15 @@ class concept — DEM-draped terrain (Phase 11+) would extend it.
 - [`0001-foundation.md`](0001-foundation.md) — Foundation:
   pixels native + web, Web Mercator slippy map, GeoJSON overlay,
   verification harness, embeddable widget skeleton.
+- [`0002-search.md`](0002-search.md) — Search: one floating box
+  that handles lat/lon coordinates (offline parse) and place
+  queries (Photon / Nominatim geocoder), plus a camera fly-to
+  animation.
+- [`0003-multi-body.md`](0003-multi-body.md) — Multi-body globes:
+  a `Body` abstraction, Equirectangular tile-grid support, and
+  Mars + Moon basemaps from NASA Trek public-domain pyramids.
+  Architectural prep for fictional worlds (Middle-earth, etc.),
+  gated on tile-source licensing.
 
 ## Done
 
