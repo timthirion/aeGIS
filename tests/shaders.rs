@@ -36,3 +36,8 @@ fn tile_shader_validates() {
 fn vector_shader_validates() {
     validate_wgsl(include_str!("../src/shaders/vector.wgsl"), "vector.wgsl");
 }
+
+#[test]
+fn caps_shader_validates() {
+    validate_wgsl(include_str!("../src/shaders/caps.wgsl"), "caps.wgsl");
+}

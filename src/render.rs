@@ -34,6 +34,12 @@ use crate::vector::VectorLayer;
 const CLEAR_SHADER: &str = include_str!("shaders/clear.wgsl");
 const TILE_SHADER: &str = include_str!("shaders/tile.wgsl");
 const VECTOR_SHADER: &str = include_str!("shaders/vector.wgsl");
+const CAPS_SHADER: &str = include_str!("shaders/caps.wgsl");
+
+/// Triangles per polar cap. Matches `RING_VERTS` in `caps.wgsl`.
+const CAP_RING_VERTS: u32 = 64;
+/// Vertex count per cap = 3 verts × `CAP_RING_VERTS` triangles.
+const CAP_DRAW_VERTS: u32 = 3 * CAP_RING_VERTS;
 
 const TILE_UNIFORM_SIZE: u64 = std::mem::size_of::<TileUniforms>() as u64;
 
@@ -73,6 +79,19 @@ struct VectorCameraUniform {
     color: [f32; 4],
 }
 
+/// Per-cap uniform consumed by `caps.wgsl`. Same 80-byte layout as
+/// `VectorCameraUniform` with `position` reused for camera_pos and
+/// the trailing f32 carrying `pole_sign` (+1 north, −1 south) instead
+/// of pad.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, Pod, Zeroable)]
+struct CapUniform {
+    view_proj: [f32; 16],
+    camera_pos: [f32; 3],
+    pole_sign: f32,
+    color: [f32; 4],
+}
+
 /// A vector-layer that's been uploaded as a GPU vertex buffer, ready
 /// to render as a LineList.
 struct VectorBinding {
@@ -109,6 +128,16 @@ pub struct Renderer {
     vector_camera_buf: wgpu::Buffer,
     vector_bind_group: wgpu::BindGroup,
     vector: Option<VectorBinding>,
+
+    /// Polar-cap pipeline + one uniform buffer per cap. The shader is
+    /// pure-procedural (no vertex buffer), so each draw needs only its
+    /// own uniform bind-group to differentiate north (blue ocean) from
+    /// south (white ice sheet).
+    cap_pipeline: wgpu::RenderPipeline,
+    north_cap_buf: wgpu::Buffer,
+    north_cap_bind_group: wgpu::BindGroup,
+    south_cap_buf: wgpu::Buffer,
+    south_cap_bind_group: wgpu::BindGroup,
 
     /// Tiles that have been decoded + uploaded to the GPU.
     tiles: HashMap<TileId, TileBinding>,
@@ -267,6 +296,16 @@ impl Renderer {
         });
         let vector_pipeline = build_vector_pipeline(&device, format, &vector_bgl);
 
+        // Polar caps. Both use the same bind-group layout as the
+        // vector pipeline (single uniform). Two buffers + two bind
+        // groups so a single `render()` can draw north and south
+        // without a per-frame uniform rewrite.
+        let cap_pipeline = build_cap_pipeline(&device, format, &vector_bgl);
+        let (north_cap_buf, north_cap_bind_group) =
+            make_cap_binding(&device, &vector_bgl, "aegis-north-cap", 1.0);
+        let (south_cap_buf, south_cap_bind_group) =
+            make_cap_binding(&device, &vector_bgl, "aegis-south-cap", -1.0);
+
         let (completed_tx, completed_rx) = mpsc::channel();
 
         Renderer {
@@ -282,6 +321,11 @@ impl Renderer {
             vector_camera_buf,
             vector_bind_group,
             vector: None,
+            cap_pipeline,
+            north_cap_buf,
+            north_cap_bind_group,
+            south_cap_buf,
+            south_cap_bind_group,
             tiles: HashMap::new(),
             requested: HashSet::new(),
             failed: HashSet::new(),
@@ -554,6 +598,28 @@ impl Renderer {
             bytemuck::bytes_of(&vector_camera),
         );
 
+        // Per-frame cap uniforms. Same view_proj + camera_pos as the
+        // other passes; the per-cap `pole_sign` and `color` are baked
+        // into each buffer. North = open-ocean blue; south = Antarctic
+        // ice white. Linear-space values for sRGB target — the surface
+        // applies the linear → sRGB transform on output.
+        let north_cap = CapUniform {
+            view_proj,
+            camera_pos,
+            pole_sign: 1.0,
+            color: [0.08, 0.20, 0.36, 1.0],
+        };
+        let south_cap = CapUniform {
+            view_proj,
+            camera_pos,
+            pole_sign: -1.0,
+            color: [0.92, 0.94, 0.96, 1.0],
+        };
+        self.queue
+            .write_buffer(&self.north_cap_buf, 0, bytemuck::bytes_of(&north_cap));
+        self.queue
+            .write_buffer(&self.south_cap_buf, 0, bytemuck::bytes_of(&south_cap));
+
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(t)
             | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
@@ -618,6 +684,17 @@ impl Renderer {
                 pass.set_pipeline(&self.clear_pipeline);
                 pass.draw(0..3, 0..1);
             }
+
+            // Polar caps — fill the spherical band the Mercator tile
+            // pyramid can't cover (|lat| > 85.051°). Drawn after the
+            // tiles so the cap colour overrides any background pixels
+            // that show through near the poles; the per-fragment
+            // visibility discard handles the back hemisphere.
+            pass.set_pipeline(&self.cap_pipeline);
+            pass.set_bind_group(0, &self.north_cap_bind_group, &[]);
+            pass.draw(0..CAP_DRAW_VERTS, 0..1);
+            pass.set_bind_group(0, &self.south_cap_bind_group, &[]);
+            pass.draw(0..CAP_DRAW_VERTS, 0..1);
 
             // Vector overlay on top of the basemap.
             if let Some(vector) = &self.vector {
@@ -790,6 +867,85 @@ fn build_vector_pipeline(
         multiview_mask: None,
         cache: None,
     })
+}
+
+fn build_cap_pipeline(
+    device: &wgpu::Device,
+    format: wgpu::TextureFormat,
+    bgl: &wgpu::BindGroupLayout,
+) -> wgpu::RenderPipeline {
+    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("aegis-caps-shader"),
+        source: wgpu::ShaderSource::Wgsl(CAPS_SHADER.into()),
+    });
+    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("aegis-caps-layout"),
+        bind_group_layouts: &[Some(bgl)],
+        immediate_size: 0,
+    });
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("aegis-caps-pipeline"),
+        layout: Some(&layout),
+        vertex: wgpu::VertexState {
+            module: &module,
+            entry_point: Some("vs_main"),
+            buffers: &[],
+            compilation_options: Default::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &module,
+            entry_point: Some("fs_main"),
+            targets: &[Some(wgpu::ColorTargetState {
+                format,
+                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            compilation_options: Default::default(),
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            strip_index_format: None,
+            front_face: wgpu::FrontFace::Ccw,
+            cull_mode: None,
+            polygon_mode: wgpu::PolygonMode::Fill,
+            unclipped_depth: false,
+            conservative: false,
+        },
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
+/// Create the (buffer, bind-group) pair for one polar cap. `pole_sign`
+/// stamps the initial uniform; `render()` overwrites view_proj +
+/// camera_pos every frame but the pole_sign sticks for the lifetime
+/// of the renderer (north == +1, south == −1).
+fn make_cap_binding(
+    device: &wgpu::Device,
+    bgl: &wgpu::BindGroupLayout,
+    label: &str,
+    pole_sign: f32,
+) -> (wgpu::Buffer, wgpu::BindGroup) {
+    let init = CapUniform {
+        pole_sign,
+        ..CapUniform::default()
+    };
+    let buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some(label),
+        contents: bytemuck::bytes_of(&init),
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+    });
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some(label),
+        layout: bgl,
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: buf.as_entire_binding(),
+        }],
+    });
+    (buf, bind_group)
 }
 
 // `TILE_UNIFORM_SIZE` is `pub(crate)`-readable for future use but isn't
