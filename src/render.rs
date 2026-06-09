@@ -137,6 +137,13 @@ pub struct Renderer {
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
+    /// Format used for the per-frame render-pass attachment view —
+    /// the **sRGB variant** of the surface's configured format. The
+    /// GPU applies linear → sRGB encoding when writing to a view in
+    /// this format, so the canvas stores gamma-encoded bytes even
+    /// when the surface's native format is linear (the common case
+    /// on WebGPU canvases).
+    view_format: wgpu::TextureFormat,
 
     tile_pipeline: wgpu::RenderPipeline,
     tile_bgl: wgpu::BindGroupLayout,
@@ -223,26 +230,62 @@ impl Renderer {
             .expect("failed to create device");
 
         let surface_caps = surface.get_capabilities(&adapter);
-        // Prefer sRGB surface so PNG-sourced sRGB bytes render correctly
-        // (auto sRGB↔linear conversions cancel — see M1.5 commit notes).
-        let format = surface_caps
+        // Surface format selection has to thread one needle: **the canvas
+        // gets sRGB-encoded on writeout**, regardless of whether the
+        // underlying surface format is sRGB-suffixed.
+        //
+        // On native, wgpu typically advertises both `…Unorm` and
+        // `…UnormSrgb` for the same swapchain, and we can configure with
+        // the sRGB variant directly. On WebGPU, browsers' canvas
+        // configuration only accepts the non-sRGB formats
+        // (`bgra8unorm` / `rgba8unorm`) — the sRGB variants aren't valid
+        // canvas formats. Configuring the surface with the linear
+        // format means our shader output gets stored verbatim, then
+        // displayed as raw sRGB bytes — one gamma curve too dark
+        // (Earth texture, tiles, caps all visibly dim).
+        //
+        // The fix is the surface's `view_formats` mechanism: configure
+        // with the canvas's native (linear) format but declare the sRGB
+        // variant as a permitted view. Each frame we cast the surface
+        // texture to its sRGB view; the GPU then applies the linear →
+        // sRGB encoding on writeout, so the bytes that land in the
+        // canvas are correctly gamma-encoded. The browser displays them
+        // directly without further conversion → on-screen pixels match
+        // what the shader output as linear-light values.
+        let preferred = surface_caps
             .formats
             .iter()
             .copied()
-            .find(|f| f.is_srgb())
+            .find(|f| !f.is_srgb())
             .unwrap_or(surface_caps.formats[0]);
+        let view_format = preferred.add_srgb_suffix();
+        log::info!(
+            "aegis surface: configured as {:?}, rendering through {:?}",
+            preferred,
+            view_format
+        );
 
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            format,
+            format: preferred,
             width: width.max(1),
             height: height.max(1),
             present_mode: surface_caps.present_modes[0],
             alpha_mode: surface_caps.alpha_modes[0],
-            view_formats: vec![],
+            // Empty if the surface is already sRGB (view_format ==
+            // preferred); else permit the sRGB cast.
+            view_formats: if view_format != preferred {
+                vec![view_format]
+            } else {
+                vec![]
+            },
             desired_maximum_frame_latency: 2,
         };
         surface.configure(&device, &config);
+        // Pipelines target the sRGB *view* format, not the configured
+        // surface format — that's the format the render-pass attachment
+        // will be in each frame.
+        let format = view_format;
 
         let tile_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("aegis-tile-bgl"),
@@ -351,6 +394,7 @@ impl Renderer {
             device,
             queue,
             config,
+            view_format,
             tile_pipeline,
             tile_bgl,
             tile_sampler,
@@ -703,9 +747,18 @@ impl Renderer {
                 return;
             }
         };
-        let view = frame
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
+        // Cast the surface texture to its sRGB-encoded view (declared
+        // via `view_formats` in the surface configuration). The GPU
+        // applies linear → sRGB encoding on writeout against this
+        // view, so the canvas stores correctly gamma-encoded bytes
+        // even when the surface's native format is linear. Without
+        // this cast, our linear-light shader output gets stored
+        // verbatim and the browser displays it as raw sRGB bytes —
+        // visibly dim across every pipeline.
+        let view = frame.texture.create_view(&wgpu::TextureViewDescriptor {
+            format: Some(self.view_format),
+            ..wgpu::TextureViewDescriptor::default()
+        });
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
