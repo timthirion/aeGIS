@@ -1014,16 +1014,23 @@ impl Renderer {
                 .write_buffer(&binding.uniform_buf, 0, bytemuck::bytes_of(&u));
         }
 
-        // Satellite-tile draws — every loaded Esri World Imagery tile gets
-        // queued; backface culling + the lazy dwell-fetch keep the
-        // set bounded to roughly what's visible. Same `TileUniforms`
-        // layout and `tile_pipeline` as Carto: both are Web Mercator,
-        // and the satellite tiles only differ in their JPEG payload.
-        let sat_draws: Vec<(&TileId, [f32; 4], &TileBinding)> = self
+        // Satellite-tile draws — every loaded Esri World Imagery tile
+        // at or below the current camera zoom gets queued, sorted
+        // coarse-first so finer tiles overdraw their parents. Without
+        // the filter + sort, a stale parent tile cached from a prior
+        // zoom-out can land *on top* of a freshly-fetched child at
+        // the current zoom, producing a checkerboard of crisp + blurry
+        // squares (a loaded high-z tile randomly hidden behind its
+        // own parent). Same pattern as the Carto path above; the
+        // satellite cache needs the same discipline.
+        let sat_current_z = self.camera.zoom.round().clamp(0.0, crate::camera::MAX_ZOOM) as u8;
+        let mut sat_draws: Vec<(&TileId, [f32; 4], &TileBinding)> = self
             .sat_tiles
             .iter()
+            .filter(|(id, _)| id.z <= sat_current_z)
             .map(|(id, binding)| (id, id.world_rect(), binding))
             .collect();
+        sat_draws.sort_by_key(|(id, _, _)| id.z);
         for (_, world_rect, binding) in &sat_draws {
             let u = TileUniforms {
                 view_proj,
