@@ -102,9 +102,13 @@ aeGIS exists to consume open data. The defaults the project will document,
 test against, and ship integration paths for:
 
 - **OpenStreetMap (ODbL)** — the universal vector base. Bulk extracts via
-  [Geofabrik](https://download.geofabrik.de/); raster tiles via OSM's CDN
-  (development only — production deployments must mirror or self-host);
-  query API via Overpass.
+  [Geofabrik](https://download.geofabrik.de/); query API via Overpass.
+  Raster tiles via OSM's own CDN are **local-dev only** — OSM's tile-
+  usage policy blocks deployed apps (the live GitHub Pages build saw
+  CORS denials + 503s). For deployed/demo use the live app pulls Carto's
+  Voyager OSM-derived basemap (`a.basemaps.cartocdn.com`) which serves
+  CORS-enabled tiles with no API key; for production self-host via
+  PMTiles (below).
 - **Protomaps (open data; MIT software, ODbL data)** — global vector
   basemap distributed as PMTiles. The recommended path for production
   vector basemaps because it self-hosts as a single file with no tile
@@ -112,6 +116,10 @@ test against, and ship integration paths for:
 - **Natural Earth (public domain)** — country / state / river / city
   vector + raster basemap data. Small enough to ship in-repo as test
   fixtures.
+- **NASA Visible Earth — Blue Marble (public domain)** — global
+  equirectangular Earth imagery. Bundled at 1024×512 (≈450 KB) as the
+  always-on globe-view background; the basemap tiles overdraw it in
+  their region.
 - **USGS, NASA Earthdata, Copernicus Sentinel, NOAA** — open satellite
   imagery, DEMs, bathymetry, weather. Mostly accessed via STAC catalogs.
 - **STAC** (SpatioTemporal Asset Catalog) — the open spec for indexing
