@@ -115,6 +115,12 @@ pub struct Renderer {
     /// Tile IDs with a fetch in flight (de-dupes repeated requests
     /// while the user pans across the same set).
     requested: HashSet<TileId>,
+    /// Tile IDs whose fetch failed — keeps us from re-requesting them
+    /// every frame for the rest of the session. The previous behaviour
+    /// (remove from `requested` on failure) caused a tight retry loop
+    /// when the tile host was unreachable, filling the console with
+    /// thousands of the same fetch error per second.
+    failed: HashSet<TileId>,
     completed_tx: mpsc::Sender<TileFetchResult>,
     completed_rx: mpsc::Receiver<TileFetchResult>,
 
@@ -278,6 +284,7 @@ impl Renderer {
             vector: None,
             tiles: HashMap::new(),
             requested: HashSet::new(),
+            failed: HashSet::new(),
             completed_tx,
             completed_rx,
             // Default view: a partly-globey zoom centred between
@@ -421,6 +428,7 @@ impl Renderer {
                 }
                 Ok((id, Err(e))) => {
                     self.requested.remove(&id);
+                    self.failed.insert(id);
                     log::warn!("tile fetch failed for {id:?}: {e}");
                 }
                 Err(mpsc::TryRecvError::Empty) | Err(mpsc::TryRecvError::Disconnected) => break,
@@ -460,7 +468,8 @@ impl Renderer {
     }
 
     fn request_if_new(&mut self, id: TileId) {
-        if self.tiles.contains_key(&id) || self.requested.contains(&id) {
+        if self.tiles.contains_key(&id) || self.requested.contains(&id) || self.failed.contains(&id)
+        {
             return;
         }
         self.requested.insert(id);
@@ -473,7 +482,7 @@ impl Renderer {
     #[cfg(not(target_arch = "wasm32"))]
     fn dispatch_tile_fetch(&self, id: TileId) {
         let tx = self.completed_tx.clone();
-        let url = id.osm_url();
+        let url = id.tile_url();
         std::thread::spawn(move || {
             let result = tile::fetch_tile_blocking(&url);
             let _ = tx.send((id, result));
@@ -486,7 +495,7 @@ impl Renderer {
     #[cfg(target_arch = "wasm32")]
     fn dispatch_tile_fetch(&self, id: TileId) {
         let tx = self.completed_tx.clone();
-        let url = id.osm_url();
+        let url = id.tile_url();
         wasm_bindgen_futures::spawn_local(async move {
             let result = tile::fetch_tile_web(&url).await;
             let _ = tx.send((id, result));

@@ -46,17 +46,17 @@ impl TileId {
         ]
     }
 
-    /// URL for a 256×256 PNG raster tile from OpenStreetMap's standard
-    /// tile CDN. **Development / low-volume use only** per the
-    /// [OSM tile-usage policy](https://operations.osmfoundation.org/policies/tiles/);
-    /// production deployments must self-host (plan 0004 will introduce
-    /// the PMTiles path).
+    /// URL for a 256×256 PNG raster tile from Carto's Voyager basemap
+    /// (OpenStreetMap-derived). Carto serves CORS-enabled tiles with
+    /// no API key required, which is what lets the GitHub Pages build
+    /// fetch them — OSM's own tile CDN blocks browser fetches from
+    /// deployed apps per its usage policy.
     ///
-    /// OSM requires a non-default `User-Agent` on every request — see
-    /// [`OSM_USER_AGENT`].
-    pub fn osm_url(&self) -> String {
+    /// Attribution: © OpenStreetMap contributors © CARTO. Surface in
+    /// the attribution overlay (M4) when present.
+    pub fn tile_url(&self) -> String {
         format!(
-            "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+            "https://a.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}.png",
             z = self.z,
             x = self.x,
             y = self.y,
@@ -64,11 +64,10 @@ impl TileId {
     }
 }
 
-/// `User-Agent` header value to send with OSM tile requests. OSM's tile
-/// CDN refuses traffic with `User-Agent: libcurl/...` or other generic
-/// values — see their usage policy. We identify as the project so
-/// they can correlate any future traffic spike to its origin.
-pub const OSM_USER_AGENT: &str = concat!(
+/// `User-Agent` value for native HTTP — identifies the project to any
+/// tile provider that logs / rate-limits by UA. Carto doesn't require
+/// it, but well-behaved clients still send one.
+pub const TILE_USER_AGENT: &str = concat!(
     "aegis/",
     env!("CARGO_PKG_VERSION"),
     " (https://github.com/timthirion/aeGIS)"
@@ -106,7 +105,7 @@ pub fn decode_png(bytes: &[u8]) -> Result<DecodedTile, image::ImageError> {
 #[cfg(not(target_arch = "wasm32"))]
 pub fn fetch_tile_blocking(url: &str) -> Result<DecodedTile, String> {
     let request = ehttp::Request {
-        headers: ehttp::Headers::new(&[("User-Agent", OSM_USER_AGENT), ("Accept", "image/png")]),
+        headers: ehttp::Headers::new(&[("User-Agent", TILE_USER_AGENT), ("Accept", "image/png")]),
         ..ehttp::Request::get(url)
     };
     let response = ehttp::fetch_blocking(&request).map_err(|e| format!("fetch: {e}"))?;
@@ -185,18 +184,18 @@ mod tests {
             }
         );
         assert_eq!(
-            tile.osm_url(),
-            "https://tile.openstreetmap.org/10/262/380.png"
+            tile.tile_url(),
+            "https://a.basemaps.cartocdn.com/rastertiles/voyager/10/262/380.png"
         );
     }
 
     #[test]
     fn user_agent_identifies_project_and_version() {
-        // Important: OSM uses User-Agent to track + (if needed) rate-
-        // limit specific applications. The string must identify both.
-        assert!(OSM_USER_AGENT.starts_with("aegis/"));
-        assert!(OSM_USER_AGENT.contains(env!("CARGO_PKG_VERSION")));
-        assert!(OSM_USER_AGENT.contains("github.com"));
+        // Well-behaved clients always send a real UA so the tile host
+        // can correlate any traffic spike to its origin.
+        assert!(TILE_USER_AGENT.starts_with("aegis/"));
+        assert!(TILE_USER_AGENT.contains(env!("CARGO_PKG_VERSION")));
+        assert!(TILE_USER_AGENT.contains("github.com"));
     }
 
     #[test]
