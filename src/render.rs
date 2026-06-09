@@ -657,27 +657,23 @@ impl Renderer {
         // other passes; the per-cap `pole_sign` and `color` are baked
         // into each buffer.
         //
-        // No shading happens anywhere on the sphere (no lighting,
-        // no shadowing, no per-fragment darkening) — the colours
-        // round-trip through the sRGB pipeline exactly. The previous
-        // pass at these values (185,204,211 / 243,239,230) read as
-        // "too dark" because macOS's Digital Color Meter defaults to
-        // **Display in P3** on wide-gamut Macs, and that picker
-        // reports the *display-native* values, not sRGB. Interpreting
-        // those numbers as sRGB lands a few percent dimmer than the
-        // user actually picked. Bumped each channel toward white;
-        // iterate from here.
+        // Cap colours are the user's hand-picked **sRGB** values
+        // (north = pale Arctic blue, south = warm Antarctic ice).
+        // `srgb8_to_linear_rgba` round-trips them through the sRGB
+        // surface so what lands on screen is exactly the picked
+        // triple — no shading, no lighting, no compositing tricks
+        // alter them between the uniform and the framebuffer.
         let north_cap = CapUniform {
             view_proj,
             camera_pos,
             pole_sign: 1.0,
-            color: srgb8_to_linear_rgba(214, 228, 234, 255),
+            color: srgb8_to_linear_rgba(170, 206, 212, 255),
         };
         let south_cap = CapUniform {
             view_proj,
             camera_pos,
             pole_sign: -1.0,
-            color: srgb8_to_linear_rgba(252, 250, 246, 255),
+            color: srgb8_to_linear_rgba(246, 239, 229, 255),
         };
         self.queue
             .write_buffer(&self.north_cap_buf, 0, bytemuck::bytes_of(&north_cap));
