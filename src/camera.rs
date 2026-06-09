@@ -133,14 +133,20 @@ impl Camera {
     /// Combined view × perspective-projection 4x4 matrix in
     /// **column-major** order (the convention `wgpu` / WGSL's
     /// `mat4x4<f32>` reads).
+    ///
+    /// The `near` plane scales with altitude (~10% of the altitude,
+    /// floored at `1e-6`) so the sphere surface is always inside the
+    /// visible depth range. A fixed `near` would clip the entire
+    /// scene at zoom ≥ ~12, when the camera-to-surface distance drops
+    /// below the fixed value and everything visible falls behind the
+    /// near plane.
     pub fn view_projection_matrix(&self, canvas: (u32, u32)) -> [f32; 16] {
         let cam_pos = self.camera_3d_position(canvas);
         let aspect = canvas.0 as f32 / canvas.1.max(1) as f32;
-        // Standard look-at: eye → origin. "Up" handling near the
-        // poles: when the camera is nearly along the +Y axis (overhead
-        // view), the canonical +Y up would be parallel to the look
-        // direction. Pick an up vector that always has a usable
-        // tangent component.
+        // "Up" handling near the poles: when the camera is nearly
+        // along the +Y axis (overhead view), the canonical +Y up
+        // would be parallel to the look direction. Pick an up vector
+        // that always has a usable tangent component.
         let up = if self.center_lonlat.1.abs() > 89.0 {
             // Looking nearly straight down (or up) — use +Z as up so
             // the look direction (+Y or -Y) crosses it cleanly.
@@ -149,7 +155,12 @@ impl Camera {
             [0.0, 1.0, 0.0]
         };
         let view = look_at(cam_pos, [0.0, 0.0, 0.0], up);
-        let proj = perspective(60.0_f32.to_radians(), aspect, 0.01, 100.0);
+        let altitude = self.altitude(canvas) as f32;
+        let near = (altitude * 0.1).max(1e-6);
+        // far must comfortably contain the far side of the sphere
+        // (camera-to-far-vertex distance = D + 1 = altitude + 2).
+        let far = (altitude + 2.0).max(10.0) * 1.5;
+        let proj = perspective(60.0_f32.to_radians(), aspect, near, far);
         mat4_mul(proj, view)
     }
 
@@ -299,17 +310,23 @@ impl Camera {
 // Column-major throughout (the WGSL `mat4x4<f32>` convention).
 // ---------------------------------------------------------------------------
 
-/// Right-handed perspective projection matrix. Maps `+y up`, looking
-/// down `-z`, with `near` and `far` as positive distances.
+/// Right-handed perspective projection matrix for the **wgpu /
+/// Vulkan / DirectX clip-space convention** (depth in `[0, 1]`,
+/// not OpenGL's `[-1, +1]`). Maps `+y up`, looking down `-z`, with
+/// `near` and `far` as positive distances.
+///
+/// Critical for wgpu: using the OpenGL convention here would map
+/// near-plane vertices to clip-z = -1, outside wgpu's valid range,
+/// so the whole foreground would get clipped.
 fn perspective(fov_y_rad: f32, aspect: f32, near: f32, far: f32) -> [f32; 16] {
     let f = 1.0 / (fov_y_rad / 2.0).tan();
     let nf = 1.0 / (near - far);
     let mut m = [0.0_f32; 16];
     m[0] = f / aspect;
     m[5] = f;
-    m[10] = (far + near) * nf;
+    m[10] = far * nf;
     m[11] = -1.0;
-    m[14] = 2.0 * far * near * nf;
+    m[14] = near * far * nf;
     m
 }
 
@@ -427,6 +444,41 @@ mod tests {
                 "globeness({zoom}) = {g} exceeded prior {last}"
             );
             last = g;
+        }
+    }
+
+    #[test]
+    fn view_projection_visible_at_high_zoom() {
+        // Regression test for "high zoom garbles the map" — caused
+        // by (a) OpenGL-convention perspective matrix and (b)
+        // hardcoded near=0.01 plane clipping the sphere surface
+        // once altitude dropped below 0.01 (zoom ≥ 12).
+        //
+        // For each test zoom: project the sphere point under the
+        // camera (which sits at `camera_3d_position`, pointing at
+        // the sphere centre) and confirm it lands inside the wgpu
+        // clip-space cube (x, y, z ∈ [-1, 1] for x/y and [0, 1] for z).
+        let canvas = (1000_u32, 1000_u32);
+        for &zoom in &[0.0, 2.0, 5.0, 10.0, 14.0, 18.0] {
+            let cam = Camera::new(0.0, 0.0, zoom);
+            let m = cam.view_projection_matrix(canvas);
+            // Surface point at camera centre = (0, 0, 1) for cam at
+            // (lon=0, lat=0) in our sphere convention.
+            let p = [0.0_f32, 0.0, 1.0, 1.0];
+            // Column-major mat * vec.
+            let mut clip = [0.0_f32; 4];
+            for row in 0..4 {
+                let mut s = 0.0;
+                for col in 0..4 {
+                    s += m[col * 4 + row] * p[col];
+                }
+                clip[row] = s;
+            }
+            let z = clip[2] / clip[3];
+            assert!(
+                (0.0..=1.0).contains(&z),
+                "z={zoom}: camera-centre sphere point projects to clip-z {z:?} (must be in [0, 1] for wgpu)"
+            );
         }
     }
 
