@@ -12,7 +12,12 @@ struct Uniforms {
     view_proj: mat4x4<f32>,
     // 3D camera position (used for backface culling).
     camera_pos: vec3<f32>,
-    _pad0: f32,
+    // Per-frame zoom-driven fade applied to the tile's output alpha.
+    // The renderer ramps this from 0 (globe view — Blue Marble texture
+    // dominates) to 1 (mid-to-high zoom — tiles fully visible) via
+    // a smoothstep. Without it, the basemap's continent-scale text
+    // overlays the satellite view distractingly at the lowest zooms.
+    tile_alpha: f32,
     // Tile's world rect in normalised Mercator: (xmin, ymin, xmax, ymax).
     world_rect: vec4<f32>,
 };
@@ -80,5 +85,6 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     if (in.visibility < 0.0) {
         discard;
     }
-    return textureSample(tile_tex, tile_sampler, in.uv);
+    let sample = textureSample(tile_tex, tile_sampler, in.uv);
+    return vec4<f32>(sample.rgb, sample.a * u.tile_alpha);
 }

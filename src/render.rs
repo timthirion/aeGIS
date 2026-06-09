@@ -64,14 +64,15 @@ pub fn make_instance() -> wgpu::Instance {
 /// Per-tile uniform consumed by `tile.wgsl`. Matches the WGSL
 /// `Uniforms` struct byte-for-byte (6 × `vec4` = 96 bytes):
 /// - rows 0–3: view-projection matrix (column-major)
-/// - row 4: camera position (xyz) + 1 pad
+/// - row 4: camera position (xyz) + per-frame `tile_alpha` (the
+///   smoothstepped zoom-fade multiplier)
 /// - row 5: tile's world rect (xmin, ymin, xmax, ymax)
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default, Pod, Zeroable)]
 struct TileUniforms {
     view_proj: [f32; 16],
     camera_pos: [f32; 3],
-    _pad0: f32,
+    tile_alpha: f32,
     world_rect: [f32; 4],
 }
 
@@ -670,11 +671,25 @@ impl Renderer {
         // Coarse-first: finer tiles overdraw their parents.
         draws.sort_by_key(|(id, _, _)| id.z);
 
+        // Zoom-driven satellite → basemap fade. At very low camera
+        // zoom (globe view) we want the bundled Blue Marble texture
+        // to be the entire view — no continent-scale text labels
+        // overlaying the photograph. As the user zooms in past
+        // ~zoom 2, tiles smoothstep in over a 1.5-stop window so
+        // they're fully present by ~zoom 3.5 (city / region view).
+        const TILE_FADE_START: f64 = 2.0;
+        const TILE_FADE_END: f64 = 3.5;
+        let t = ((self.camera.zoom - TILE_FADE_START) / (TILE_FADE_END - TILE_FADE_START))
+            .clamp(0.0, 1.0);
+        // Smoothstep: 3t² − 2t³ for a continuous derivative at the
+        // endpoints, no perceptible "snap" when crossing them.
+        let tile_alpha = (t * t * (3.0 - 2.0 * t)) as f32;
+
         for (_, world_rect, binding) in &draws {
             let u = TileUniforms {
                 view_proj,
                 camera_pos,
-                _pad0: 0.0,
+                tile_alpha,
                 world_rect: *world_rect,
             };
             self.queue
