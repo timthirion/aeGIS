@@ -8,6 +8,7 @@
 
 pub mod camera;
 pub mod crs;
+pub mod net;
 pub mod render;
 pub mod search;
 pub mod tile;

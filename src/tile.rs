@@ -105,14 +105,10 @@ impl TileId {
     }
 }
 
-/// `User-Agent` value for native HTTP — identifies the project to any
-/// tile provider that logs / rate-limits by UA. Carto doesn't require
-/// it, but well-behaved clients still send one.
-pub const TILE_USER_AGENT: &str = concat!(
-    "aegis/",
-    env!("CARGO_PKG_VERSION"),
-    " (https://github.com/timthirion/aeGIS)"
-);
+/// `User-Agent` value for native HTTP. Re-export of `net::USER_AGENT`
+/// kept for backwards-compat with the existing test that pins the
+/// project-identifying shape.
+pub const TILE_USER_AGENT: &str = crate::net::USER_AGENT;
 
 /// Longitude/latitude of a notable place — used as the default centre
 /// for plan 0001's "first tile" demo.
@@ -155,21 +151,13 @@ pub fn decode_image(bytes: &[u8]) -> Result<DecodedTile, image::ImageError> {
     })
 }
 
-/// Native-only synchronous tile fetch. Sends an HTTP GET with the
-/// project's `User-Agent` and autodetects the response format (PNG
-/// for Carto, JPEG for Esri World Imagery — both providers share
-/// this path).
+/// Native-only synchronous tile fetch. Bytes from `net::fetch_bytes_blocking`,
+/// then `decode_image` for the format autodetect (PNG for Carto, JPEG for
+/// Esri World Imagery — both providers share this path).
 #[cfg(not(target_arch = "wasm32"))]
 pub fn fetch_tile_blocking(url: &str) -> Result<DecodedTile, String> {
-    let request = ehttp::Request {
-        headers: ehttp::Headers::new(&[("User-Agent", TILE_USER_AGENT), ("Accept", "image/*")]),
-        ..ehttp::Request::get(url)
-    };
-    let response = ehttp::fetch_blocking(&request).map_err(|e| format!("fetch: {e}"))?;
-    if !response.ok {
-        return Err(format!("HTTP {} for {}", response.status, url));
-    }
-    decode_image(&response.bytes).map_err(|e| format!("decode: {e}"))
+    let bytes = crate::net::fetch_bytes_blocking(url).map_err(|e| format!("fetch: {e}"))?;
+    decode_image(&bytes).map_err(|e| format!("decode: {e}"))
 }
 
 /// Web-only async tile fetch. Spawns a task on the browser's event
@@ -185,30 +173,15 @@ pub fn fetch_tile_async(url: &str, on_done: impl 'static + FnOnce(Result<Decoded
     });
 }
 
-/// Async tile fetch via the browser's `fetch` API. Used by the
-/// renderer's per-tile dispatcher (spawn_local).
+/// Async tile fetch via the browser's `fetch` API. Bytes from
+/// `net::fetch_bytes_async`, then `decode_image` for format
+/// autodetect. Used by the renderer's per-tile dispatcher
+/// (spawn_local).
 #[cfg(target_arch = "wasm32")]
 pub async fn fetch_tile_web(url: &str) -> Result<DecodedTile, String> {
-    use wasm_bindgen::JsCast;
-    use wasm_bindgen_futures::JsFuture;
-
-    let window = web_sys::window().ok_or("no global window")?;
-    let resp_value = JsFuture::from(window.fetch_with_str(url))
+    let bytes = crate::net::fetch_bytes_async(url)
         .await
-        .map_err(|e| format!("fetch: {e:?}"))?;
-    let resp: web_sys::Response = resp_value
-        .dyn_into()
-        .map_err(|e| format!("Response cast: {e:?}"))?;
-    if !resp.ok() {
-        return Err(format!("HTTP {} for {}", resp.status(), url));
-    }
-    let buffer = JsFuture::from(
-        resp.array_buffer()
-            .map_err(|e| format!("array_buffer: {e:?}"))?,
-    )
-    .await
-    .map_err(|e| format!("array_buffer await: {e:?}"))?;
-    let bytes = js_sys::Uint8Array::new(&buffer).to_vec();
+        .map_err(|e| format!("fetch: {e}"))?;
     decode_image(&bytes).map_err(|e| format!("decode: {e}"))
 }
 

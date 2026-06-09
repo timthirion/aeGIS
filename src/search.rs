@@ -156,6 +156,416 @@ fn parse_bare_decimal(s: &str) -> Option<(f64, f64)> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Geocoder client — turn a place-query string into a Vec of candidate
+// SearchResults via Photon (primary) with Nominatim as a per-session
+// fallback if Photon errors. Plan 0002 M1.
+// ---------------------------------------------------------------------------
+
+use crate::net;
+use serde::Deserialize;
+use thiserror::Error;
+
+/// Categorical kind of a geocoder result. Drives the default fly-to
+/// zoom when the result has no bounding box and the renderer
+/// settles on a single point. Values calibrated against the typical
+/// "feels right at this zoom" target across the test cities.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ResultKind {
+    /// A country — render at a continental-scale zoom.
+    Country,
+    /// A state, province, or region — sub-country, multi-city.
+    Region,
+    /// A city or town.
+    City,
+    /// A street address or building.
+    Address,
+    /// A point of interest (museum, landmark, station, etc.).
+    Poi,
+    /// Anything Photon returns whose `osm_value` we don't recognise.
+    Unknown,
+}
+
+impl ResultKind {
+    /// Default flat-Mercator zoom for a result of this kind when no
+    /// bounding box is available. Picked to frame the typical
+    /// instance: a country fits in z=4, a city in z=12, a building
+    /// in z=17. These are the values the M3 fly-to uses when the
+    /// bbox-fit path isn't applicable.
+    pub fn default_zoom(self) -> f64 {
+        match self {
+            ResultKind::Country => 4.0,
+            ResultKind::Region => 6.0,
+            ResultKind::City => 12.0,
+            ResultKind::Address | ResultKind::Poi => 17.0,
+            ResultKind::Unknown => 10.0,
+        }
+    }
+
+    /// Map Photon's `osm_value` field (and a few other hints) to the
+    /// project's kind enum. Photon tags follow OSM's
+    /// `place=country / state / city / ...` taxonomy directly.
+    fn from_photon(osm_key: &str, osm_value: &str) -> ResultKind {
+        match (osm_key, osm_value) {
+            ("place", "country") => ResultKind::Country,
+            ("place", "state" | "region" | "province") => ResultKind::Region,
+            ("place", "city" | "town" | "village" | "hamlet") => ResultKind::City,
+            ("highway" | "building", _) => ResultKind::Address,
+            ("tourism" | "amenity" | "leisure" | "historic" | "natural", _) => ResultKind::Poi,
+            _ => ResultKind::Unknown,
+        }
+    }
+}
+
+/// One geocoder result mapped from a Photon (or Nominatim) feature.
+/// Lon-first internally — same convention as the rest of the crate.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SearchResult {
+    /// Short label, e.g. `"Topeka"`. Falls back to `osm_value`
+    /// when Photon has no name.
+    pub name: String,
+    /// Human-readable context, e.g. `"Kansas, USA"`. Built from
+    /// Photon's `state` / `country` / `city` fields, omitting the
+    /// ones that duplicate `name`.
+    pub context: String,
+    /// `(lon, lat)` of the result's representative point.
+    pub lonlat: (f64, f64),
+    /// `(lon_min, lat_min, lon_max, lat_max)` if the geocoder
+    /// returned one. Triggers the bbox-fit fly-to path in M3.
+    pub bbox: Option<[f64; 4]>,
+    pub kind: ResultKind,
+}
+
+/// Errors a geocoder call can produce. Each variant has a clear
+/// caller policy: `Network` / `Unavailable` → retry with the
+/// fallback (or surface "unreachable" to the user); `Empty` → show
+/// "no matches"; `Decode` → genuine bug, flag in logs.
+#[derive(Debug, Error)]
+pub enum GeocodeError {
+    #[error("network / transport: {0}")]
+    Network(String),
+    #[error("provider unavailable (HTTP {0})")]
+    Unavailable(u16),
+    #[error("response decode: {0}")]
+    Decode(String),
+    /// The query was malformed (empty after trim, etc.) — caller
+    /// shouldn't have called geocode in the first place.
+    #[error("malformed query")]
+    Malformed,
+}
+
+impl From<net::NetError> for GeocodeError {
+    fn from(e: net::NetError) -> GeocodeError {
+        match e {
+            net::NetError::Transport(s) => GeocodeError::Network(s),
+            net::NetError::HttpStatus { status, .. } => GeocodeError::Unavailable(status),
+        }
+    }
+}
+
+/// Which geocoder backend a given call should target. Used by
+/// `GeocoderClient` to remember a session-level switch from Photon
+/// to Nominatim after the first Photon failure.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+enum Backend {
+    #[default]
+    Photon,
+    Nominatim,
+}
+
+/// Stateful geocoder client. Holds the active backend so a single
+/// Photon failure switches the rest of the session to Nominatim
+/// rather than retrying Photon every keystroke. The struct exists
+/// (rather than free functions) precisely so tests can swap in a
+/// mock client to assert the debounce + fallback paths without
+/// hitting the network.
+#[derive(Clone, Debug, Default)]
+pub struct GeocoderClient {
+    backend: Backend,
+}
+
+impl GeocoderClient {
+    pub fn new() -> GeocoderClient {
+        GeocoderClient::default()
+    }
+
+    /// Which backend the next `geocode` call will hit.
+    pub fn active_backend(&self) -> &'static str {
+        match self.backend {
+            Backend::Photon => "photon",
+            Backend::Nominatim => "nominatim",
+        }
+    }
+
+    /// URL the next `geocode` call will fetch for `query`. Public
+    /// so tests can verify the URL shape and so the M2 UI can show
+    /// it in a "request:" debug log if desired.
+    pub fn url_for(&self, query: &str, near: Option<(f64, f64)>) -> String {
+        let encoded = url_encode(query);
+        match self.backend {
+            Backend::Photon => {
+                let mut url = format!("https://photon.komoot.io/api/?q={encoded}&limit=5&lang=en");
+                if let Some((lon, lat)) = near {
+                    use std::fmt::Write;
+                    let _ = write!(&mut url, "&lat={lat}&lon={lon}");
+                }
+                url
+            }
+            Backend::Nominatim => format!(
+                "https://nominatim.openstreetmap.org/search?q={encoded}&format=json&limit=5\
+                 &addressdetails=1"
+            ),
+        }
+    }
+}
+
+/// Percent-encode the query string for inclusion in a URL. Strictly
+/// the subset of characters that matter for our geocoder URLs —
+/// spaces, commas, and the small set of reserved characters that
+/// could appear in a place name. Not a general-purpose encoder.
+fn url_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 4);
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char);
+            }
+            _ => {
+                let hi = b >> 4;
+                let lo = b & 0x0f;
+                fn nibble(n: u8) -> char {
+                    if n < 10 {
+                        (b'0' + n) as char
+                    } else {
+                        (b'A' + n - 10) as char
+                    }
+                }
+                out.push('%');
+                out.push(nibble(hi));
+                out.push(nibble(lo));
+            }
+        }
+    }
+    out
+}
+
+// --- Photon response shape ------------------------------------------------
+
+/// What Photon's `/api/?q=...` returns: a GeoJSON-ish
+/// `FeatureCollection` where each feature's `geometry.coordinates`
+/// is `[lon, lat]` and `properties` carries the place attributes.
+#[derive(Deserialize)]
+struct PhotonResponse {
+    features: Vec<PhotonFeature>,
+}
+
+#[derive(Deserialize)]
+struct PhotonFeature {
+    geometry: PhotonGeometry,
+    properties: PhotonProperties,
+}
+
+#[derive(Deserialize)]
+struct PhotonGeometry {
+    coordinates: [f64; 2], // [lon, lat]
+}
+
+#[derive(Deserialize, Default)]
+struct PhotonProperties {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    country: Option<String>,
+    #[serde(default)]
+    state: Option<String>,
+    #[serde(default)]
+    city: Option<String>,
+    #[serde(default)]
+    osm_key: Option<String>,
+    #[serde(default)]
+    osm_value: Option<String>,
+    /// Photon returns `extent` as `[w, n, e, s]` (longitude west,
+    /// latitude NORTH, longitude east, latitude SOUTH) — note the
+    /// north-before-south order, which is the opposite of the
+    /// `[min_lon, min_lat, max_lon, max_lat]` shape `SearchResult`
+    /// stores. The mapper re-orders.
+    #[serde(default)]
+    extent: Option<[f64; 4]>,
+}
+
+fn photon_features_to_results(features: Vec<PhotonFeature>) -> Vec<SearchResult> {
+    features.into_iter().map(photon_feature_to_result).collect()
+}
+
+fn photon_feature_to_result(feat: PhotonFeature) -> SearchResult {
+    let [lon, lat] = feat.geometry.coordinates;
+    let osm_key = feat.properties.osm_key.as_deref().unwrap_or("");
+    let osm_value = feat.properties.osm_value.as_deref().unwrap_or("");
+    let kind = ResultKind::from_photon(osm_key, osm_value);
+    let name = feat
+        .properties
+        .name
+        .clone()
+        .unwrap_or_else(|| osm_value.to_owned());
+    let context = build_context(&feat.properties, &name);
+    let bbox = feat.properties.extent.map(|[w, n, e, s]| [w, s, e, n]);
+    SearchResult {
+        name,
+        context,
+        lonlat: (lon, lat),
+        bbox,
+        kind,
+    }
+}
+
+fn build_context(p: &PhotonProperties, name: &str) -> String {
+    let mut parts: Vec<&str> = Vec::with_capacity(3);
+    for field in [&p.city, &p.state, &p.country] {
+        if let Some(s) = field.as_deref() {
+            if !s.is_empty() && s != name && !parts.contains(&s) {
+                parts.push(s);
+            }
+        }
+    }
+    parts.join(", ")
+}
+
+// --- Nominatim response shape --------------------------------------------
+
+/// Nominatim's `format=json` returns a JSON array of place objects.
+/// We map a minimal subset to `SearchResult` so the fallback path
+/// surfaces useful results even when Photon is down.
+#[derive(Deserialize)]
+struct NominatimResult {
+    lat: String,
+    lon: String,
+    display_name: String,
+    #[serde(default)]
+    class: Option<String>,
+    #[serde(default, rename = "type")]
+    type_: Option<String>,
+    #[serde(default)]
+    boundingbox: Option<[String; 4]>, // [lat_min, lat_max, lon_min, lon_max]
+}
+
+fn nominatim_results_to_results(raw: Vec<NominatimResult>) -> Vec<SearchResult> {
+    raw.into_iter().filter_map(nominatim_to_result).collect()
+}
+
+fn nominatim_to_result(r: NominatimResult) -> Option<SearchResult> {
+    let lat: f64 = r.lat.parse().ok()?;
+    let lon: f64 = r.lon.parse().ok()?;
+    let class = r.class.as_deref().unwrap_or("");
+    let type_ = r.type_.as_deref().unwrap_or("");
+    let kind = ResultKind::from_photon(class, type_); // Nominatim uses the same OSM tag values
+    let (name, context) = match r.display_name.split_once(", ") {
+        Some((n, rest)) => (n.to_owned(), rest.to_owned()),
+        None => (r.display_name.clone(), String::new()),
+    };
+    let bbox = r
+        .boundingbox
+        .and_then(|[lat_min, lat_max, lon_min, lon_max]| {
+            Some([
+                lon_min.parse().ok()?,
+                lat_min.parse().ok()?,
+                lon_max.parse().ok()?,
+                lat_max.parse().ok()?,
+            ])
+        });
+    Some(SearchResult {
+        name,
+        context,
+        lonlat: (lon, lat),
+        bbox,
+        kind,
+    })
+}
+
+// --- Public geocode entry points -----------------------------------------
+
+/// Native synchronous geocode. Blocks the calling thread; intended
+/// for native worker threads or the M2 `Renderer::search_and_fly_to`
+/// blocking API.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn geocode_blocking(
+    client: &mut GeocoderClient,
+    query: &str,
+    near: Option<(f64, f64)>,
+) -> Result<Vec<SearchResult>, GeocodeError> {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return Err(GeocodeError::Malformed);
+    }
+
+    // Try the active backend first.
+    let url = client.url_for(trimmed, near);
+    let result = net::fetch_bytes_blocking(&url).map_err(GeocodeError::from);
+
+    match result {
+        Ok(bytes) => decode_for_backend(client.backend, &bytes),
+        Err(GeocodeError::Network(_)) | Err(GeocodeError::Unavailable(_))
+            if client.backend == Backend::Photon =>
+        {
+            // First Photon failure of the session — switch to
+            // Nominatim and try once more. Subsequent Photon
+            // failures (if any) just propagate.
+            client.backend = Backend::Nominatim;
+            let url = client.url_for(trimmed, near);
+            let bytes = net::fetch_bytes_blocking(&url).map_err(GeocodeError::from)?;
+            decode_for_backend(client.backend, &bytes)
+        }
+        Err(other) => Err(other),
+    }
+}
+
+/// Web async geocode. Same logic as the blocking variant; the
+/// caller `.await`s the future. Implemented separately because the
+/// native + web fetchers have different signatures.
+#[cfg(target_arch = "wasm32")]
+pub async fn geocode_async(
+    client: &mut GeocoderClient,
+    query: &str,
+    near: Option<(f64, f64)>,
+) -> Result<Vec<SearchResult>, GeocodeError> {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return Err(GeocodeError::Malformed);
+    }
+    let url = client.url_for(trimmed, near);
+    let bytes_result = net::fetch_bytes_async(&url)
+        .await
+        .map_err(GeocodeError::from);
+    match bytes_result {
+        Ok(bytes) => decode_for_backend(client.backend, &bytes),
+        Err(GeocodeError::Network(_)) | Err(GeocodeError::Unavailable(_))
+            if client.backend == Backend::Photon =>
+        {
+            client.backend = Backend::Nominatim;
+            let url = client.url_for(trimmed, near);
+            let bytes = net::fetch_bytes_async(&url)
+                .await
+                .map_err(GeocodeError::from)?;
+            decode_for_backend(client.backend, &bytes)
+        }
+        Err(other) => Err(other),
+    }
+}
+
+fn decode_for_backend(backend: Backend, bytes: &[u8]) -> Result<Vec<SearchResult>, GeocodeError> {
+    match backend {
+        Backend::Photon => {
+            let resp: PhotonResponse =
+                serde_json::from_slice(bytes).map_err(|e| GeocodeError::Decode(e.to_string()))?;
+            Ok(photon_features_to_results(resp.features))
+        }
+        Backend::Nominatim => {
+            let raw: Vec<NominatimResult> =
+                serde_json::from_slice(bytes).map_err(|e| GeocodeError::Decode(e.to_string()))?;
+            Ok(nominatim_results_to_results(raw))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -329,5 +739,137 @@ mod tests {
         for input in inputs {
             assert_lonlat(parse_coord(input), truth, 0.01);
         }
+    }
+
+    // ---------------- Geocoder client ----------------
+
+    #[test]
+    fn url_encode_handles_spaces_and_commas() {
+        assert_eq!(url_encode("Topeka, Kansas"), "Topeka%2C%20Kansas");
+        assert_eq!(url_encode("chicago"), "chicago");
+        assert_eq!(url_encode("São Paulo"), "S%C3%A3o%20Paulo");
+    }
+
+    #[test]
+    fn photon_url_includes_near_when_provided() {
+        let c = GeocoderClient::new();
+        let with = c.url_for("Chicago", Some((-87.6, 41.9)));
+        assert!(with.contains("lat=41.9"));
+        assert!(with.contains("lon=-87.6"));
+        let without = c.url_for("Chicago", None);
+        assert!(!without.contains("lat="));
+        assert!(!without.contains("lon="));
+    }
+
+    #[test]
+    fn photon_url_targets_photon_by_default() {
+        let c = GeocoderClient::new();
+        assert!(c
+            .url_for("X", None)
+            .starts_with("https://photon.komoot.io/"));
+        assert_eq!(c.active_backend(), "photon");
+    }
+
+    #[test]
+    fn result_kind_default_zoom_ordering() {
+        // The targets get progressively closer in.
+        assert!(ResultKind::Country.default_zoom() < ResultKind::Region.default_zoom());
+        assert!(ResultKind::Region.default_zoom() < ResultKind::City.default_zoom());
+        assert!(ResultKind::City.default_zoom() < ResultKind::Poi.default_zoom());
+    }
+
+    #[test]
+    fn result_kind_from_photon_recognises_common_osm_tags() {
+        assert_eq!(
+            ResultKind::from_photon("place", "country"),
+            ResultKind::Country
+        );
+        assert_eq!(ResultKind::from_photon("place", "city"), ResultKind::City);
+        assert_eq!(ResultKind::from_photon("place", "town"), ResultKind::City);
+        assert_eq!(
+            ResultKind::from_photon("tourism", "museum"),
+            ResultKind::Poi
+        );
+        assert_eq!(
+            ResultKind::from_photon("highway", "primary"),
+            ResultKind::Address
+        );
+        assert_eq!(ResultKind::from_photon("xyz", "qux"), ResultKind::Unknown);
+    }
+
+    #[test]
+    fn photon_decode_round_trips_a_real_response() {
+        // A minimal but realistic Photon response shape — one
+        // city feature with an extent. Pinning the decode here
+        // means a regression in serde-derives or the field rename
+        // game is caught without hitting the network.
+        let json = br#"{
+            "features": [{
+                "geometry": {"type": "Point", "coordinates": [-95.6, 39.05]},
+                "properties": {
+                    "osm_id": 12345,
+                    "osm_key": "place",
+                    "osm_value": "city",
+                    "name": "Topeka",
+                    "state": "Kansas",
+                    "country": "United States",
+                    "extent": [-95.95, 39.15, -95.5, 38.95]
+                }
+            }]
+        }"#;
+        let results = decode_for_backend(Backend::Photon, json).expect("decodes");
+        assert_eq!(results.len(), 1);
+        let r = &results[0];
+        assert_eq!(r.name, "Topeka");
+        assert_eq!(r.kind, ResultKind::City);
+        assert_eq!(r.context, "Kansas, United States");
+        assert!((r.lonlat.0 + 95.6).abs() < 1e-9);
+        assert!((r.lonlat.1 - 39.05).abs() < 1e-9);
+        // Photon's extent is [w, n, e, s]; SearchResult stores
+        // [lon_min, lat_min, lon_max, lat_max] so n/s swap.
+        let bbox = r.bbox.expect("has bbox");
+        assert!((bbox[1] - 38.95).abs() < 1e-9, "lat_min should be 38.95");
+        assert!((bbox[3] - 39.15).abs() < 1e-9, "lat_max should be 39.15");
+    }
+
+    #[test]
+    fn nominatim_decode_round_trips_a_real_response() {
+        let json = br#"[{
+            "lat": "39.05",
+            "lon": "-95.6",
+            "display_name": "Topeka, Shawnee County, Kansas, USA",
+            "class": "place",
+            "type": "city",
+            "boundingbox": ["38.95", "39.15", "-95.95", "-95.5"]
+        }]"#;
+        let results = decode_for_backend(Backend::Nominatim, json).expect("decodes");
+        assert_eq!(results.len(), 1);
+        let r = &results[0];
+        assert_eq!(r.name, "Topeka");
+        assert_eq!(r.kind, ResultKind::City);
+        assert_eq!(r.context, "Shawnee County, Kansas, USA");
+    }
+
+    // The live-network integration test is `#[ignore]` so it runs
+    // only with `cargo test -- --ignored`. Hitting the public
+    // Photon instance on every CI run would be a bad neighbour.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    #[ignore]
+    fn geocode_chicago_native_hits_photon() {
+        let mut client = GeocoderClient::new();
+        let results = geocode_blocking(&mut client, "Chicago", None).expect("photon up");
+        let first = results.first().expect("at least one result");
+        assert_eq!(first.name, "Chicago");
+        assert_eq!(first.kind, ResultKind::City);
+        let (lon, lat) = first.lonlat;
+        assert!(
+            (lon - -87.7).abs() < 0.5,
+            "lon: got {lon}, expected -87.7 ± 0.5"
+        );
+        assert!(
+            (lat - 41.9).abs() < 0.5,
+            "lat: got {lat}, expected 41.9 ± 0.5"
+        );
     }
 }

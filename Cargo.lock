@@ -40,6 +40,8 @@ dependencies = [
  "naga 26.0.0",
  "pollster",
  "regex",
+ "serde",
+ "serde_json",
  "thiserror 2.0.18",
  "wasm-bindgen",
  "wasm-bindgen-futures",

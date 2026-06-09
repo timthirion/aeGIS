@@ -120,6 +120,28 @@ responsible for honouring the chosen provider's terms. The defaults:
   unrestricted commercial-redistribution rights to the imagery
   itself, swap the provider before shipping.
 
+### Geocoder (search box)
+
+Search-bar queries hit the public **Photon** instance at
+`photon.komoot.io` (BSD-licensed server, OSM-derived index, CORS
+wildcard), falling back to the public **Nominatim** instance at
+`nominatim.openstreetmap.org` if Photon returns a 5xx or
+transport error. The underlying OSM data is ODbL. Required
+visible credit in the search-result UI: `Search by Photon` and
+`© OpenStreetMap contributors`.
+
+- Photon's hosted instance asks for *reasonable use*, not a hard
+  SLA. The client debounces typing to one request per 250 ms and
+  never queries before the user types a character, which keeps a
+  casual user well below any reasonable threshold.
+- Nominatim's posted usage policy caps the OSMF public instance
+  at 1 request per second; it's the fallback, not the primary.
+- For a high-traffic fork, both backends self-host cleanly:
+  Photon ships a Docker image; Nominatim provides PostgreSQL
+  import scripts. Swap the URL templates in `src/search.rs`.
+
+### Other map data
+
 Other map data carries the licenses of its sources. OSM-derived
 layers require `© OpenStreetMap contributors`; Protomaps adds
 itself; Natural Earth is public domain. The widget API surfaces
