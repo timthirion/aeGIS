@@ -93,6 +93,22 @@ pub fn run() {
                             },
                         ..
                     } => elwt.exit(),
+                    WindowEvent::KeyboardInput {
+                        event:
+                            KeyEvent {
+                                state: ElementState::Pressed,
+                                physical_key: PhysicalKey::Code(KeyCode::KeyB),
+                                ..
+                            },
+                        ..
+                    } => {
+                        // 'B' for basemap: Map ↔ Satellite.
+                        let next = match renderer.basemap_mode() {
+                            render::BasemapMode::Map => render::BasemapMode::Satellite,
+                            render::BasemapMode::Satellite => render::BasemapMode::Map,
+                        };
+                        renderer.set_basemap_mode(next);
+                    }
                     WindowEvent::Resized(s) => renderer.resize(s.width, s.height),
                     WindowEvent::MouseInput {
                         state: btn_state,

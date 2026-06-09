@@ -15,7 +15,7 @@ use std::rc::Rc;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 
-use crate::render::{make_instance, Renderer};
+use crate::render::{make_instance, BasemapMode, Renderer};
 
 #[wasm_bindgen(start)]
 pub fn on_module_load() {
@@ -140,11 +140,40 @@ fn attach(
 /// detaches the resize observer + pointer listeners.
 #[wasm_bindgen]
 pub struct AegisInstance {
-    _inner: Rc<RefCell<Inner>>,
+    inner: Rc<RefCell<Inner>>,
     _raf: Rc<RefCell<Option<Closure<dyn FnMut()>>>>,
     _resize_observer: web_sys::ResizeObserver,
     _resize_cb: Closure<dyn FnMut()>,
     _listeners: Vec<ListenerHandle>,
+}
+
+#[wasm_bindgen]
+impl AegisInstance {
+    /// Switch the basemap. Pass `"map"` for Carto Voyager or
+    /// `"satellite"` for NASA Blue Marble. Unknown values are
+    /// silently ignored — the toggle button in the host HTML drives
+    /// this, so a typo there should be visible as "click does nothing"
+    /// rather than a thrown error.
+    #[wasm_bindgen(js_name = setBasemap)]
+    pub fn set_basemap(&self, mode: &str) {
+        let parsed = match mode {
+            "map" => Some(BasemapMode::Map),
+            "satellite" => Some(BasemapMode::Satellite),
+            _ => None,
+        };
+        if let Some(m) = parsed {
+            self.inner.borrow_mut().renderer.set_basemap_mode(m);
+        }
+    }
+
+    /// Returns the current basemap as `"map"` or `"satellite"`.
+    #[wasm_bindgen(js_name = basemap)]
+    pub fn basemap(&self) -> String {
+        match self.inner.borrow().renderer.basemap_mode() {
+            BasemapMode::Map => "map".into(),
+            BasemapMode::Satellite => "satellite".into(),
+        }
+    }
 }
 
 /// Attach an aeGIS renderer to the element with the given id. The host
@@ -386,7 +415,7 @@ pub async fn start(host_id: String) -> Result<AegisInstance, JsValue> {
     )?;
 
     Ok(AegisInstance {
-        _inner: inner,
+        inner,
         _raf: raf,
         _resize_observer: resize_observer,
         _resize_cb: resize_cb,

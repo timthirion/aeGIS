@@ -128,6 +128,21 @@ struct EarthCameraUniform {
     _pad0: f32,
 }
 
+/// Which basemap the user is currently looking at. Mutually exclusive
+/// — the two are alternative views of the same Earth, not layers, so
+/// switching turns the other off both at draw time and at fetch time
+/// (a Satellite session shouldn't burn Carto requests on a hidden
+/// pyramid, and vice versa).
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+pub enum BasemapMode {
+    /// Carto Voyager street basemap (the historical default).
+    #[default]
+    Map,
+    /// NASA Blue Marble satellite imagery: bundled 4096×2048 base
+    /// plus dwell-streamed GIBS tiles.
+    Satellite,
+}
+
 /// Per-tile uniform consumed by `bm_tile.wgsl`. Same 96-byte layout
 /// as [`TileUniforms`] but the last `vec4` carries the tile's
 /// **geographic** bounds in degrees (lon_min, lat_min, lon_max,
@@ -270,6 +285,10 @@ pub struct Renderer {
     /// in the way mid-gesture.
     bm_dwell_snapshot: Option<BmDwellSnapshot>,
     bm_dwell_frames: u32,
+
+    /// Which basemap to draw + fetch. Toggled by the UI overlay
+    /// (web) or the `B` key (native); see [`Self::set_basemap_mode`].
+    basemap_mode: BasemapMode,
 
     /// Camera state. Public for direct mutation by input handlers
     /// (`renderer.camera.pan(...)`, `renderer.camera.zoom_at(...)`).
@@ -542,6 +561,7 @@ impl Renderer {
             bm_completed_rx,
             bm_dwell_snapshot: None,
             bm_dwell_frames: 0,
+            basemap_mode: BasemapMode::default(),
             // Default view: a partly-globey zoom centred between
             // the Americas so the headline globe view is the first
             // thing the user sees. They can scroll in to land at
@@ -698,6 +718,11 @@ impl Renderer {
     /// makes zoom-out instant: by the time you scroll to z-1, those
     /// tiles are already on the GPU.
     pub fn ensure_visible_tiles(&mut self) {
+        if self.basemap_mode != BasemapMode::Map {
+            // Carto pyramid is hidden; don't burn requests on tiles
+            // we won't draw. The cache stays warm for cheap toggle-back.
+            return;
+        }
         let canvas = self.size();
         let visible = self.camera.visible_tiles(canvas);
         for id in &visible {
@@ -871,6 +896,9 @@ impl Renderer {
     /// until they move again. Movement resets the counter so the
     /// streaming layer never gets in the way mid-gesture.
     pub fn ensure_visible_bm_tiles(&mut self) {
+        if self.basemap_mode != BasemapMode::Satellite {
+            return;
+        }
         let canvas = self.size();
         let snapshot = BmDwellSnapshot::from_camera(&self.camera, canvas);
         if Some(snapshot) != self.bm_dwell_snapshot {
@@ -889,11 +917,17 @@ impl Renderer {
             self.bm_dwell_frames += 1;
             return;
         }
-        // bm_dwell_frames == BM_DWELL_FRAMES — first frame past the
-        // threshold. Dispatch the visible-tile fetch.
+        // Past the threshold — fire the visible-tile fetch.
+        self.dispatch_visible_bm_tiles();
+    }
+
+    /// Unconditionally enqueue the visible BM tile set for fetch.
+    /// Used by both the dwell-gated path above and the immediate-fetch
+    /// branch in [`Self::set_basemap_mode`] (where the user just
+    /// clicked Satellite and we don't want the half-second dwell wait).
+    fn dispatch_visible_bm_tiles(&mut self) {
+        let canvas = self.size();
         let Some(gibs_z) = bm_tile::gibs_zoom_for(self.camera.zoom) else {
-            // Bundled base texture is already at-or-better resolution
-            // at this camera zoom — no point streaming.
             return;
         };
         let visible = bm_tile::visible_tiles(&self.camera, canvas, gibs_z);
@@ -906,6 +940,33 @@ impl Renderer {
             }
             self.bm_requested.insert(id);
             self.dispatch_bm_tile_fetch(id);
+        }
+    }
+
+    /// The basemap currently being shown.
+    pub fn basemap_mode(&self) -> BasemapMode {
+        self.basemap_mode
+    }
+
+    /// Switch the basemap. Calling with the current mode is a no-op.
+    /// When switching **to** Satellite we skip the dwell wait and
+    /// dispatch the visible-tile fetch immediately — the user just
+    /// asked for satellite imagery, so a half-second delay would feel
+    /// like the toggle didn't work.
+    pub fn set_basemap_mode(&mut self, mode: BasemapMode) {
+        if self.basemap_mode == mode {
+            return;
+        }
+        self.basemap_mode = mode;
+        if mode == BasemapMode::Satellite {
+            self.dispatch_visible_bm_tiles();
+            // Skip the next ensure_visible_bm_tiles dwell wait so a
+            // subsequent camera move re-triggers correctly. Snapshot
+            // matches the current camera; counter is "past threshold,
+            // already dispatched" — any movement resets cleanly.
+            let canvas = self.size();
+            self.bm_dwell_snapshot = Some(BmDwellSnapshot::from_camera(&self.camera, canvas));
+            self.bm_dwell_frames = BM_DWELL_FRAMES.saturating_add(1);
         }
     }
 
@@ -1140,7 +1201,7 @@ impl Renderer {
             pass.set_bind_group(0, &self.earth_bind_group, &[]);
             pass.draw(0..EARTH_DRAW_VERTS, 0..1);
 
-            if !draws.is_empty() {
+            if self.basemap_mode == BasemapMode::Map && !draws.is_empty() {
                 pass.set_pipeline(&self.tile_pipeline);
                 // 32×32 grid of quads × 6 verts/quad — matches `GRID`
                 // + `QUAD_VERTS` in tile.wgsl. The grid is what lets
@@ -1156,12 +1217,10 @@ impl Renderer {
                 }
             }
 
-            // Blue Marble streaming layer — drawn *after* the Carto
-            // basemap so a settled-region satellite imagery overlay
-            // wins where loaded. Same GRID constant as Carto: 32×32
-            // procedurally-tessellated quads per tile, equirectangular
-            // projection from the tile's lat/lon bounds.
-            if !bm_draws.is_empty() {
+            // Blue Marble streaming layer — Satellite-only. Drawn
+            // over the bundled Earth texture; tiles refine sharpness
+            // wherever loaded. Same 32×32 GRID as Carto.
+            if self.basemap_mode == BasemapMode::Satellite && !bm_draws.is_empty() {
                 pass.set_pipeline(&self.bm_tile_pipeline);
                 const BM_TILE_GRID_VERTS: u32 = 32 * 32 * 6;
                 for (_, _, binding) in &bm_draws {

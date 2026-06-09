@@ -57,6 +57,44 @@
       touch-action: none;
     }
     #aegis-host canvas:active { cursor: grabbing; }
+
+    /* Bottom-left basemap toggle. Two buttons act as a segmented
+       control: the active mode reads as a filled pill, the inactive
+       one as a ghost button. Sits inside the canvas's positioned
+       container so it floats over the render surface. */
+    #basemap-toggle {
+      position: absolute;
+      left: 16px;
+      bottom: 16px;
+      z-index: 10;
+      display: inline-flex;
+      padding: 3px;
+      background: rgba(11, 14, 18, 0.78);
+      border: 1px solid #1d232b;
+      border-radius: 999px;
+      backdrop-filter: blur(6px);
+      -webkit-backdrop-filter: blur(6px);
+      box-shadow: 0 2px 12px rgba(0, 0, 0, 0.35);
+      font: 12px/1 ui-sans-serif, system-ui, -apple-system, sans-serif;
+      user-select: none;
+    }
+    #basemap-toggle button {
+      appearance: none;
+      border: none;
+      background: transparent;
+      color: #8d97a3;
+      padding: 6px 12px;
+      border-radius: 999px;
+      cursor: pointer;
+      font: inherit;
+      letter-spacing: 0.02em;
+      transition: background-color 120ms, color 120ms;
+    }
+    #basemap-toggle button:hover { color: #e6e8eb; }
+    #basemap-toggle button[aria-pressed="true"] {
+      background: #2a3340;
+      color: #e6e8eb;
+    }
     footer {
       border-top: 1px solid #1d232b;
       font-size: 12px;
@@ -73,6 +111,10 @@
   </header>
   <main>
     <div id="aegis-host"></div>
+    <div id="basemap-toggle" role="group" aria-label="Basemap">
+      <button type="button" data-mode="map" aria-pressed="true">Map</button>
+      <button type="button" data-mode="satellite" aria-pressed="false">Satellite</button>
+    </div>
   </main>
   <footer>
     <span>aeGIS · M0 pixel pass · Open-source GIS in Rust + WebGPU</span>
@@ -96,6 +138,7 @@
       document.getElementById("version-tag").textContent = `v${version()}`;
       try {
         aegis = await start("aegis-host");
+        wireBasemapToggle(aegis);
       } catch (e) {
         console.error("aegis start failed", e);
         const host = document.getElementById("aegis-host");
@@ -105,6 +148,27 @@
         host.style.font = "13px ui-monospace, SFMono-Regular, monospace";
         host.textContent = `aeGIS failed to start: ${e}`;
       }
+    }
+
+    function wireBasemapToggle(instance) {
+      const toggle = document.getElementById("basemap-toggle");
+      const buttons = Array.from(toggle.querySelectorAll("button"));
+      // Sync the UI to whatever the renderer's actual mode is at
+      // startup (so the initial pressed state isn't a lie if the
+      // default changes Rust-side).
+      const current = instance.basemap();
+      buttons.forEach((b) =>
+        b.setAttribute("aria-pressed", b.dataset.mode === current ? "true" : "false"),
+      );
+      toggle.addEventListener("click", (e) => {
+        const btn = e.target.closest("button[data-mode]");
+        if (!btn) return;
+        const mode = btn.dataset.mode;
+        instance.setBasemap(mode);
+        buttons.forEach((b) =>
+          b.setAttribute("aria-pressed", b.dataset.mode === mode ? "true" : "false"),
+        );
+      });
     }
     main();
   </script>
