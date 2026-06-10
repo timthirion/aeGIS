@@ -41,3 +41,8 @@ fn caps_shader_validates() {
 fn earth_shader_validates() {
     validate_wgsl(include_str!("../src/shaders/earth.wgsl"), "earth.wgsl");
 }
+
+#[test]
+fn orbit_shader_validates() {
+    validate_wgsl(include_str!("../src/shaders/orbit.wgsl"), "orbit.wgsl");
+}
