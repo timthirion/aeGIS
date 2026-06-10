@@ -97,6 +97,28 @@ impl Satellite {
             1440.0 / revs_per_day
         }
     }
+
+    /// Sample positions along one orbital period centred on
+    /// `sim_unix_s`. Returns `n` render-space points the trail
+    /// shader can draw as a LineStrip. Points that fail SGP4
+    /// propagation are skipped (the caller gets fewer than `n`
+    /// vertices). Plan 0004 M3.
+    pub fn trail_points(&self, sim_unix_s: f64, n: usize) -> Vec<[f32; 3]> {
+        let period_s = self.orbital_period_minutes() * 60.0;
+        let mut out = Vec::with_capacity(n);
+        for i in 0..n {
+            // Sample from `t - period/2` to `t + period/2`, so the
+            // trail wraps around to itself (LEO orbits repeat each
+            // period, so the two endpoints land on the same lat/lon
+            // band — the visual trail closes).
+            let frac = i as f64 / (n - 1).max(1) as f64;
+            let t = sim_unix_s + (frac - 0.5) * period_s;
+            if let Some(pos) = propagate_render_space(self, t) {
+                out.push(pos);
+            }
+        }
+        out
+    }
 }
 
 /// Parse Celestrak-format TLE text into raw `Tle` records.
@@ -336,6 +358,45 @@ mod tests {
         assert!(
             (0.060..0.085).contains(&d_render_units),
             "ISS moves ~460 km in 60 s = ~0.072 render units; got {d_render_units}"
+        );
+    }
+
+    #[test]
+    fn trail_points_for_iss_form_a_ground_track_in_ecef() {
+        let tles = parse_tles(ISS_FIXTURE);
+        let sats = satellites_from_tles(&tles, Category::Stations);
+        let iss = &sats[0];
+        let points = iss.trail_points(iss.epoch_unix_s, 128);
+        assert_eq!(points.len(), 128, "all sample points propagate");
+        // Every point should be at roughly the same orbit radius
+        // (LEO eccentricity is tiny — 0.0007 for the ISS — so the
+        // orbit is nearly circular).
+        let radii: Vec<f64> = points
+            .iter()
+            .map(|p| ((p[0] as f64).powi(2) + (p[1] as f64).powi(2) + (p[2] as f64).powi(2)).sqrt())
+            .collect();
+        let r_min = radii.iter().cloned().fold(f64::INFINITY, f64::min);
+        let r_max = radii.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        assert!(
+            (r_max - r_min) / r_max < 0.02,
+            "ISS orbit should be ~circular in ECEF; radii spread {r_min} → {r_max}"
+        );
+        // In *body-fixed* coords the trail is a ground-track spiral,
+        // NOT a closed circle — Earth rotates ~23° during one ISS
+        // orbital period. The first and last sample points (one
+        // period apart in inertial time) sit on the same latitude
+        // band but at different longitudes, separated by roughly
+        // sin(23°)·orbit_radius ≈ 0.4 render units.
+        let first = points.first().unwrap();
+        let last = points.last().unwrap();
+        let d = (((first[0] - last[0]).powi(2)
+            + (first[1] - last[1]).powi(2)
+            + (first[2] - last[2]).powi(2)) as f64)
+            .sqrt();
+        assert!(
+            (0.2..0.7).contains(&d),
+            "ISS trail endpoints should be ~0.4 render units apart in ECEF \
+             (Earth rotates during the orbit); got {d:.3}"
         );
     }
 

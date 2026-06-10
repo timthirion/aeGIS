@@ -86,6 +86,9 @@ pub fn run() {
     // text themselves.
     const ISS_FIXTURE: &str = include_str!("../data/orbits/iss-fixture.txt");
     renderer.load_satellites(orbit::Category::Stations, ISS_FIXTURE);
+    // Auto-select the ISS so its orbit trail is visible on first paint.
+    // The user can change selection once plan 0004 M4 wires hover/click.
+    renderer.set_selected_satellite(Some(25544));
 
     let mut cursor_px: (f64, f64) = (0.0, 0.0);
     let mut dragging = false;

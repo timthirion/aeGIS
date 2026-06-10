@@ -46,3 +46,11 @@ fn earth_shader_validates() {
 fn orbit_shader_validates() {
     validate_wgsl(include_str!("../src/shaders/orbit.wgsl"), "orbit.wgsl");
 }
+
+#[test]
+fn orbit_trail_shader_validates() {
+    validate_wgsl(
+        include_str!("../src/shaders/orbit_trail.wgsl"),
+        "orbit_trail.wgsl",
+    );
+}

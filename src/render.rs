@@ -50,6 +50,7 @@ const VECTOR_SHADER: &str = include_str!("shaders/vector.wgsl");
 const CAPS_SHADER: &str = include_str!("shaders/caps.wgsl");
 const EARTH_SHADER: &str = include_str!("shaders/earth.wgsl");
 const ORBIT_SHADER: &str = include_str!("shaders/orbit.wgsl");
+const ORBIT_TRAIL_SHADER: &str = include_str!("shaders/orbit_trail.wgsl");
 
 /// Frames the camera state must stay unchanged before we consider it
 /// "settled" and trigger a satellite-tile fetch. At 60 fps this is
@@ -159,6 +160,17 @@ struct OrbitCameraUniform {
 struct OrbitInstance {
     world_pos: [f32; 3],
     color: [f32; 3],
+}
+
+/// Camera uniform for `orbit_trail.wgsl`. 96 bytes (matches the
+/// existing VectorCameraUniform shape; padded to 16-byte alignment).
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, Pod, Zeroable)]
+struct OrbitTrailUniform {
+    view_proj: [f32; 16],
+    camera_pos: [f32; 3],
+    _pad0: f32,
+    color: [f32; 4],
 }
 
 /// Per-frame camera uniform consumed by `earth.wgsl`. 80 bytes —
@@ -396,6 +408,20 @@ pub struct Renderer {
     orbit_instance_capacity: u32,
     /// Live instance count this frame.
     orbit_instance_count: u32,
+
+    /// Plan 0004 M3 trail pipeline + per-frame line-strip vertex
+    /// buffer. The trail follows whichever satellite is selected
+    /// (by NORAD id); `None` means no trail drawn this frame.
+    orbit_trail_pipeline: wgpu::RenderPipeline,
+    orbit_trail_uniform_buf: wgpu::Buffer,
+    orbit_trail_bind_group: wgpu::BindGroup,
+    orbit_trail_vertex_buf: wgpu::Buffer,
+    orbit_trail_vertex_capacity: u32,
+    orbit_trail_vertex_count: u32,
+    /// NORAD id of the currently-selected satellite (the one with
+    /// its trail drawn). Auto-populated to the ISS at startup;
+    /// plan 0004 M4 wires interactive selection.
+    selected_satellite: Option<u32>,
 }
 
 impl Renderer {
@@ -618,6 +644,15 @@ impl Renderer {
             build_orbit_pipeline(&device, format, 1);
         let _ = orbit_bgl; // kept implicit via the bind_group
 
+        // Orbit trail pipeline (plan 0004 M3). LineStrip topology.
+        let (
+            orbit_trail_pipeline,
+            _orbit_trail_bgl,
+            orbit_trail_uniform_buf,
+            orbit_trail_bind_group,
+            orbit_trail_vertex_buf,
+        ) = build_orbit_trail_pipeline(&device, format, 1);
+
         // Blue Marble streaming pipeline. Bind-group layout is the
         // same shape as the Carto tile pipeline (uniform + texture +
         // sampler), so we reuse `tile_bgl`. Separate pipeline because
@@ -722,6 +757,13 @@ impl Renderer {
             orbit_instance_buf,
             orbit_instance_capacity: 1,
             orbit_instance_count: 0,
+            orbit_trail_pipeline,
+            orbit_trail_uniform_buf,
+            orbit_trail_bind_group,
+            orbit_trail_vertex_buf,
+            orbit_trail_vertex_capacity: 1,
+            orbit_trail_vertex_count: 0,
+            selected_satellite: None,
         }
     }
 
@@ -1395,6 +1437,27 @@ impl Renderer {
         self.orbit_demoted_category
     }
 
+    /// Select a satellite by NORAD id (or `None` to clear). The
+    /// renderer will draw a trail polyline along its orbit at the
+    /// next `tick_orbit`. Plan 0004 M3.
+    pub fn set_selected_satellite(&mut self, norad: Option<u32>) {
+        self.selected_satellite = norad;
+        if norad.is_none() {
+            self.orbit_trail_vertex_count = 0;
+        }
+    }
+
+    /// NORAD id of the currently-selected satellite, if any.
+    pub fn selected_satellite(&self) -> Option<u32> {
+        self.selected_satellite
+    }
+
+    /// Look up a satellite by NORAD id. Used by the M4 hover/click
+    /// tooltip to surface name + altitude.
+    pub fn satellite_by_norad(&self, norad: u32) -> Option<&Satellite> {
+        self.satellites.iter().find(|s| s.norad_id == norad)
+    }
+
     /// Advance the simulation clock by the monotonic delta since
     /// the last call, propagate every enabled satellite to that
     /// time, apply the budget guard if the count exceeds the cap,
@@ -1473,6 +1536,38 @@ impl Renderer {
             bytemuck::cast_slice(&instances),
         );
         self.orbit_instance_count = needed;
+
+        // Update the orbit-trail vertex buffer for the selected
+        // satellite. Plan 0004 M3.
+        if let Some(norad) = self.selected_satellite {
+            if let Some(sat) = self.satellites.iter().find(|s| s.norad_id == norad) {
+                let points = sat.trail_points(sim_t, 128);
+                let n = points.len() as u32;
+                if n > self.orbit_trail_vertex_capacity {
+                    let new_cap = (n.next_power_of_two()).max(128);
+                    self.orbit_trail_vertex_buf =
+                        self.device.create_buffer(&wgpu::BufferDescriptor {
+                            label: Some("aegis-orbit-trail-verts"),
+                            size: (new_cap as u64) * 12,
+                            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                            mapped_at_creation: false,
+                        });
+                    self.orbit_trail_vertex_capacity = new_cap;
+                }
+                if n > 0 {
+                    self.queue.write_buffer(
+                        &self.orbit_trail_vertex_buf,
+                        0,
+                        bytemuck::cast_slice(&points),
+                    );
+                }
+                self.orbit_trail_vertex_count = n;
+            } else {
+                self.orbit_trail_vertex_count = 0;
+            }
+        } else {
+            self.orbit_trail_vertex_count = 0;
+        }
     }
 
     /// Current simulation time in UNIX seconds (UTC).
@@ -1731,6 +1826,36 @@ impl Renderer {
         self.queue
             .write_buffer(&self.orbit_camera_buf, 0, bytemuck::bytes_of(&orbit_camera));
 
+        // Orbit trail uniform (plan 0004 M3). Colour comes from the
+        // selected satellite's category; trail draws at moderate
+        // alpha so it reads against any basemap.
+        let trail_color = if let Some(norad) = self.selected_satellite {
+            self.satellite_by_norad(norad)
+                .map(|s| {
+                    let [r, g, b] = s.category.color_srgb8();
+                    [
+                        srgb8_to_linear(r),
+                        srgb8_to_linear(g),
+                        srgb8_to_linear(b),
+                        0.7,
+                    ]
+                })
+                .unwrap_or([1.0, 1.0, 1.0, 0.7])
+        } else {
+            [1.0, 1.0, 1.0, 0.7]
+        };
+        let orbit_trail_uniform = OrbitTrailUniform {
+            view_proj,
+            camera_pos,
+            _pad0: 0.0,
+            color: trail_color,
+        };
+        self.queue.write_buffer(
+            &self.orbit_trail_uniform_buf,
+            0,
+            bytemuck::bytes_of(&orbit_trail_uniform),
+        );
+
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(t)
             | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
@@ -1860,6 +1985,15 @@ impl Renderer {
                     pass.set_vertex_buffer(0, vector.vertex_buf.slice(..));
                     pass.draw(0..vector.vertex_count, 0..1);
                 }
+            }
+
+            // Orbit trail (plan 0004 M3) — drawn before the points
+            // so satellites render on top of their own trail.
+            if self.active_body == BodyId::Earth && self.orbit_trail_vertex_count >= 2 {
+                pass.set_pipeline(&self.orbit_trail_pipeline);
+                pass.set_bind_group(0, &self.orbit_trail_bind_group, &[]);
+                pass.set_vertex_buffer(0, self.orbit_trail_vertex_buf.slice(..));
+                pass.draw(0..self.orbit_trail_vertex_count, 0..1);
             }
 
             // Satellite-orbit overlay — only on Earth, only when
@@ -2431,6 +2565,105 @@ fn build_orbit_pipeline(
         mapped_at_creation: false,
     });
     (pipeline, bgl, camera_buf, bind_group, instance_buf)
+}
+
+/// Build the orbit-trail pipeline + initial vertex buffer.
+/// Returns `(pipeline, bgl, uniform_buf, bind_group, vertex_buf)`.
+/// Plan 0004 M3.
+fn build_orbit_trail_pipeline(
+    device: &wgpu::Device,
+    format: wgpu::TextureFormat,
+    initial_capacity: u32,
+) -> (
+    wgpu::RenderPipeline,
+    wgpu::BindGroupLayout,
+    wgpu::Buffer,
+    wgpu::BindGroup,
+    wgpu::Buffer,
+) {
+    let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("aegis-orbit-trail-bgl"),
+        entries: &[wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        }],
+    });
+    let uniform_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("aegis-orbit-trail-uniform"),
+        contents: bytemuck::bytes_of(&OrbitTrailUniform::default()),
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+    });
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("aegis-orbit-trail-bg"),
+        layout: &bgl,
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: uniform_buf.as_entire_binding(),
+        }],
+    });
+    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("aegis-orbit-trail-shader"),
+        source: wgpu::ShaderSource::Wgsl(ORBIT_TRAIL_SHADER.into()),
+    });
+    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("aegis-orbit-trail-layout"),
+        bind_group_layouts: &[Some(&bgl)],
+        immediate_size: 0,
+    });
+    let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("aegis-orbit-trail-pipeline"),
+        layout: Some(&layout),
+        vertex: wgpu::VertexState {
+            module: &module,
+            entry_point: Some("vs_main"),
+            buffers: &[wgpu::VertexBufferLayout {
+                array_stride: 12,
+                step_mode: wgpu::VertexStepMode::Vertex,
+                attributes: &[wgpu::VertexAttribute {
+                    format: wgpu::VertexFormat::Float32x3,
+                    offset: 0,
+                    shader_location: 0,
+                }],
+            }],
+            compilation_options: Default::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &module,
+            entry_point: Some("fs_main"),
+            targets: &[Some(wgpu::ColorTargetState {
+                format,
+                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            compilation_options: Default::default(),
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::LineStrip,
+            strip_index_format: None,
+            front_face: wgpu::FrontFace::Ccw,
+            cull_mode: None,
+            polygon_mode: wgpu::PolygonMode::Fill,
+            unclipped_depth: false,
+            conservative: false,
+        },
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        multiview_mask: None,
+        cache: None,
+    });
+    let vertex_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("aegis-orbit-trail-verts"),
+        size: (initial_capacity as u64) * 12,
+        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    (pipeline, bgl, uniform_buf, bind_group, vertex_buf)
 }
 
 fn srgb8_to_linear_rgba(r: u8, g: u8, b: u8, a: u8) -> [f32; 4] {

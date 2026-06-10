@@ -390,10 +390,13 @@ pub async fn start(host_id: String) -> Result<AegisInstance, JsValue> {
     // the same point, harmless).
     {
         const ISS_FIXTURE: &str = include_str!("../data/orbits/iss-fixture.txt");
-        inner
-            .borrow_mut()
+        let mut inner_mut = inner.borrow_mut();
+        inner_mut
             .renderer
             .load_satellites(crate::orbit::Category::Stations, ISS_FIXTURE);
+        // Auto-select the ISS so its orbit trail is visible on
+        // first paint. M4 will let the user pick a different one.
+        inner_mut.renderer.set_selected_satellite(Some(25544));
     }
     {
         let inner_for_orbit = inner.clone();
