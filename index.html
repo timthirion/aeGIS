@@ -62,19 +62,30 @@
       font-size: 16px;
       line-height: 1;
       padding: 0;
-      transition: background-color 120ms, transform 120ms;
+      transition: background-color 120ms, transform 120ms,
+                  filter 120ms, opacity 120ms;
       /* Force colour-emoji rendering on platforms whose default
          system font would otherwise replace these with monochrome
          glyphs. */
       font-family: "Apple Color Emoji", "Segoe UI Emoji",
                    "Noto Color Emoji", emoji, sans-serif;
+      /* The native colour emojis read as overwhelmingly saturated
+         next to the rest of the chrome (charcoal + cool greys).
+         Desaturate + dim by default; hover or active body restores
+         the full punch so the active selection still pops. */
+      filter: grayscale(0.65);
+      opacity: 0.55;
     }
     #aegis-body-switcher button:hover {
       background: #2a3340;
+      filter: grayscale(0);
+      opacity: 0.9;
     }
     #aegis-body-switcher button[aria-pressed="true"] {
       background: #2a3340;
       transform: scale(1.08);
+      filter: grayscale(0);
+      opacity: 1;
     }
     main {
       position: relative;
