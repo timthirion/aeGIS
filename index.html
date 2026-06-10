@@ -256,6 +256,11 @@
       height: 12px;
       accent-color: #6ea8ff;
     }
+    #aegis-sat-panel header input.master {
+      width: 14px;
+      height: 14px;
+      cursor: pointer;
+    }
     #aegis-sat-panel input.filter {
       appearance: none;
       width: 100%;
@@ -287,6 +292,22 @@
     #aegis-sat-list .row:hover,
     #aegis-sat-list .row[data-selected="true"] {
       background: #2a3340;
+    }
+    #aegis-sat-list .row .vis {
+      width: 14px;
+      height: 14px;
+      margin: 0;
+      accent-color: #6ea8ff;
+      flex-shrink: 0;
+      cursor: pointer;
+    }
+    /* Hidden satellites visually dim so the user knows they're
+       suppressed even when the checkbox is just outside the
+       hover area. */
+    #aegis-sat-list .row[data-visible="false"] .name,
+    #aegis-sat-list .row[data-visible="false"] .norad,
+    #aegis-sat-list .row[data-visible="false"] .swatch {
+      opacity: 0.35;
     }
     #aegis-sat-list .row .swatch {
       width: 8px;
@@ -420,6 +441,13 @@
     <div id="aegis-sat-tooltip" role="status" aria-live="polite"></div>
     <div id="aegis-sat-panel" role="region" aria-label="Satellites">
       <header>
+        <input
+          type="checkbox"
+          id="aegis-sat-master"
+          class="master"
+          title="Toggle all currently-displayed satellites"
+          checked
+        />
         <span class="title">Satellites</span>
         <span class="count" id="aegis-sat-count">0</span>
         <label title="Show orbital trails">
@@ -553,6 +581,34 @@
         return out;
       };
 
+      const masterBox = document.getElementById("aegis-sat-master");
+      // Currently-displayed rows' NORAD ids — used by the master
+      // checkbox to know which subset it acts on. Refreshed on
+      // every renderList().
+      let displayedNorads = [];
+
+      const updateMasterFromRows = () => {
+        if (displayedNorads.length === 0) {
+          masterBox.checked = false;
+          masterBox.indeterminate = false;
+          return;
+        }
+        let visCount = 0;
+        for (const n of displayedNorads) {
+          if (instance.satelliteVisible(n)) visCount++;
+        }
+        if (visCount === displayedNorads.length) {
+          masterBox.checked = true;
+          masterBox.indeterminate = false;
+        } else if (visCount === 0) {
+          masterBox.checked = false;
+          masterBox.indeterminate = false;
+        } else {
+          masterBox.checked = false;
+          masterBox.indeterminate = true;
+        }
+      };
+
       const renderList = () => {
         const enabled = enabledCategorySet();
         // No category enabled → hide the panel completely.
@@ -560,6 +616,8 @@
           panel.setAttribute("data-empty", "true");
           listEl.innerHTML = "";
           countEl.textContent = "0";
+          displayedNorads = [];
+          updateMasterFromRows();
           return;
         }
         const filtered = cachedSats.filter(
@@ -568,14 +626,10 @@
             (filterText === "" || s.name.toLowerCase().includes(filterText)),
         );
         countEl.textContent = String(filtered.length);
-        // Categories on but nothing loaded yet → still show the
-        // panel (empty list reads as "fetching" / "loading").
         panel.setAttribute("data-empty", "false");
-        // Cap at 500 visible rows so the DOM stays light at 6000
-        // Starlink. Filter narrows it further; users typing find
-        // by name.
         const cap = 500;
         const shown = filtered.slice(0, cap);
+        displayedNorads = shown.map((s) => s.norad);
 
         const frag = document.createDocumentFragment();
         for (const s of shown) {
@@ -583,7 +637,10 @@
           row.className = "row";
           row.setAttribute("role", "option");
           row.dataset.norad = s.norad;
+          const visible = instance.satelliteVisible(s.norad);
+          row.setAttribute("data-visible", visible ? "true" : "false");
           row.innerHTML =
+            `<input type="checkbox" class="vis" ${visible ? "checked" : ""} />` +
             `<span class="swatch" style="background:${swatchColor[s.category] || "#888"}"></span>` +
             `<span class="name">${s.name}</span>` +
             `<span class="norad">${s.norad}</span>`;
@@ -597,6 +654,7 @@
         }
         listEl.innerHTML = "";
         listEl.appendChild(frag);
+        updateMasterFromRows();
       };
 
       const refresh = () => {
@@ -627,7 +685,38 @@
         instance.setTrailsEnabled(e.target.checked);
       });
 
-      // Delegated row interactions.
+      // Per-row visibility checkbox — click anywhere in the
+      // checkbox toggles the matching satellite. `change` fires
+      // before any parent `click`, so we stop propagation to
+      // keep the row-click selection handler from also firing.
+      listEl.addEventListener("change", (e) => {
+        const box = e.target.closest("input.vis");
+        if (!box) return;
+        const row = box.closest(".row[data-norad]");
+        if (!row) return;
+        const norad = Number(row.dataset.norad);
+        instance.setSatelliteVisible(norad, box.checked);
+        row.setAttribute("data-visible", box.checked ? "true" : "false");
+        updateMasterFromRows();
+      });
+      // Make sure a click ON the checkbox doesn't bubble up to the
+      // row-click handler (which would re-select on every toggle).
+      listEl.addEventListener("click", (e) => {
+        if (e.target.classList.contains("vis")) {
+          e.stopPropagation();
+          return;
+        }
+        const row = e.target.closest(".row[data-norad]");
+        if (!row) return;
+        const norad = Number(row.dataset.norad);
+        instance.selectSatellite(norad);
+        listEl
+          .querySelectorAll(".row[data-selected='true']")
+          .forEach((r) => r.removeAttribute("data-selected"));
+        row.setAttribute("data-selected", "true");
+      });
+
+      // Hover tracking.
       let currentHover = 0;
       listEl.addEventListener("pointermove", (e) => {
         const row = e.target.closest(".row[data-norad]");
@@ -643,15 +732,21 @@
           instance.hoverSatellite(0);
         }
       });
-      listEl.addEventListener("click", (e) => {
-        const row = e.target.closest(".row[data-norad]");
-        if (!row) return;
-        const norad = Number(row.dataset.norad);
-        instance.selectSatellite(norad);
-        listEl
-          .querySelectorAll(".row[data-selected='true']")
-          .forEach((r) => r.removeAttribute("data-selected"));
-        row.setAttribute("data-selected", "true");
+
+      // Master visibility checkbox — applies to every currently-
+      // displayed row. Uses the comma-separated batch helper so
+      // 500 rows is one ffi call, not 500.
+      masterBox.addEventListener("change", () => {
+        if (displayedNorads.length === 0) return;
+        const next = masterBox.checked; // browser clears indeterminate on click
+        instance.setSatellitesVisible(displayedNorads.join(","), next);
+        // Sync per-row checkboxes + data-visible attribute.
+        listEl.querySelectorAll(".row[data-norad]").forEach((row) => {
+          const box = row.querySelector("input.vis");
+          if (box) box.checked = next;
+          row.setAttribute("data-visible", next ? "true" : "false");
+        });
+        masterBox.indeterminate = false;
       });
     }
 

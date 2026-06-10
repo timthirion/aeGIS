@@ -446,6 +446,13 @@ pub struct Renderer {
     /// panel header; default on. When off, no per-satellite trails
     /// or selected-satellite trail draws.
     trails_enabled: bool,
+    /// NORAD ids the user has explicitly hidden via the per-row
+    /// checkbox in the satellite-list panel. Hidden satellites
+    /// skip both the dot draw and any trail draw. The set is
+    /// session-scoped — empty on construction; persists across
+    /// category toggles so re-enabling Stations doesn't bring
+    /// back a satellite the user just hid.
+    hidden_satellites: HashSet<u32>,
     /// Cache of `(norad_id, render_space_position)` populated each
     /// frame by `tick_orbit`. `satellite_under_cursor` projects
     /// each cached position through the current `view_proj` for
@@ -793,6 +800,7 @@ impl Renderer {
             selected_satellite: None,
             hovered_satellite: None,
             trails_enabled: true,
+            hidden_satellites: HashSet::new(),
             orbit_frame_positions: Vec::new(),
         }
     }
@@ -1519,6 +1527,25 @@ impl Renderer {
         self.trails_enabled = enabled;
     }
 
+    /// Show or hide a single satellite by NORAD id. Hidden
+    /// satellites skip the dot draw and any trail draw — useful
+    /// when the user wants to focus on one or two satellites in a
+    /// busy category. Persists across category toggles within
+    /// the same session.
+    pub fn set_satellite_visible(&mut self, norad: u32, visible: bool) {
+        if visible {
+            self.hidden_satellites.remove(&norad);
+        } else {
+            self.hidden_satellites.insert(norad);
+        }
+    }
+
+    /// True iff the satellite is visible. Returns true for
+    /// unknown NORAD ids (no hide entry means "render normally").
+    pub fn satellite_visible(&self, norad: u32) -> bool {
+        !self.hidden_satellites.contains(&norad)
+    }
+
     /// Total number of loaded satellites across all categories.
     pub fn satellite_count(&self) -> usize {
         self.satellites.len()
@@ -1690,6 +1717,9 @@ impl Renderer {
             if !allowed.contains(&sat.category) {
                 continue;
             }
+            if self.hidden_satellites.contains(&sat.norad_id) {
+                continue;
+            }
             let Some(pos) = orbit::propagate_render_space(sat, sim_t) else {
                 continue;
             };
@@ -1756,6 +1786,9 @@ impl Renderer {
             if !allowed.contains(&sat.category) {
                 continue;
             }
+            if self.hidden_satellites.contains(&sat.norad_id) {
+                continue;
+            }
             if cat_counts.get(&sat.category).copied().unwrap_or(0) > TRAIL_CATEGORY_CAP {
                 continue;
             }
@@ -1783,9 +1816,14 @@ impl Renderer {
         }
 
         // Bright trail for the selected satellite (any category).
+        // Hidden satellites don't draw their trail even when
+        // selected — that would be visually confusing ("the trail
+        // is here but the dot isn't").
         if let Some(norad) = self.selected_satellite {
             if let Some(sat) = self.satellites.iter().find(|s| s.norad_id == norad) {
-                if allowed.contains(&sat.category) {
+                if allowed.contains(&sat.category)
+                    && !self.hidden_satellites.contains(&sat.norad_id)
+                {
                     let [r, g, b] = sat.category.color_srgb8();
                     let color = [
                         srgb8_to_linear(r),

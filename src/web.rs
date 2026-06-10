@@ -328,6 +328,35 @@ impl AegisInstance {
         self.inner.borrow().renderer.trails_enabled()
     }
 
+    /// Show or hide a single satellite by NORAD id. Per-row
+    /// visibility checkbox in the side-panel list drives this.
+    #[wasm_bindgen(js_name = setSatelliteVisible)]
+    pub fn set_satellite_visible(&self, norad: u32, visible: bool) {
+        self.inner
+            .borrow_mut()
+            .renderer
+            .set_satellite_visible(norad, visible);
+    }
+
+    #[wasm_bindgen(js_name = satelliteVisible)]
+    pub fn satellite_visible(&self, norad: u32) -> bool {
+        self.inner.borrow().renderer.satellite_visible(norad)
+    }
+
+    /// Batch helper used by the master visibility checkbox: pass a
+    /// comma-separated string of NORAD ids and a single bool to
+    /// toggle them all at once. Saves one ffi round-trip per row at
+    /// 500+ rows. Unknown ids are silently ignored.
+    #[wasm_bindgen(js_name = setSatellitesVisible)]
+    pub fn set_satellites_visible(&self, norad_csv: &str, visible: bool) {
+        let mut inner = self.inner.borrow_mut();
+        for tok in norad_csv.split(',') {
+            if let Ok(n) = tok.trim().parse::<u32>() {
+                inner.renderer.set_satellite_visible(n, visible);
+            }
+        }
+    }
+
     /// Total number of loaded satellites.
     #[wasm_bindgen(js_name = satelliteCount)]
     pub fn satellite_count(&self) -> u32 {
