@@ -152,14 +152,19 @@ struct OrbitCameraUniform {
 }
 
 /// Per-instance data for `orbit.wgsl`. 24 bytes — vec3 position +
-/// vec3 colour. Position lives in renderer body-fixed coords (Earth
-/// radii); colour is linear-light RGB (the CPU side converts sRGB8
-/// → linear via `srgb8_to_linear` before upload).
+/// vec3 colour + per-instance `highlight` factor. Position lives in
+/// renderer body-fixed coords (Earth radii); colour is linear-light
+/// RGB (the CPU side converts sRGB8 → linear via `srgb8_to_linear`
+/// before upload). `highlight` is 0.0 for normal satellites and 1.0
+/// for the satellite under the cursor in the list — the shader
+/// scales up + brightens it so the user sees which dot they're
+/// hovering.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default, Pod, Zeroable)]
 struct OrbitInstance {
     world_pos: [f32; 3],
     color: [f32; 3],
+    highlight: f32,
 }
 
 /// Camera uniform for `orbit_trail.wgsl`. 80 bytes. Per-trail
@@ -432,6 +437,15 @@ pub struct Renderer {
     /// its trail drawn). Auto-populated to the ISS at startup;
     /// plan 0004 M4 wires interactive selection.
     selected_satellite: Option<u32>,
+    /// NORAD id of the satellite the user is currently hovering in
+    /// the side-panel list — drawn with a bigger, brighter point so
+    /// list-row → globe-dot correspondence is visible. Distinct from
+    /// `selected_satellite`: hover is transient, selection is sticky.
+    hovered_satellite: Option<u32>,
+    /// Whether to draw orbital trails at all. Toggle in the side
+    /// panel header; default on. When off, no per-satellite trails
+    /// or selected-satellite trail draws.
+    trails_enabled: bool,
     /// Cache of `(norad_id, render_space_position)` populated each
     /// frame by `tick_orbit`. `satellite_under_cursor` projects
     /// each cached position through the current `view_proj` for
@@ -780,6 +794,8 @@ impl Renderer {
             orbit_trail_vertex_capacity: 1,
             orbit_trail_vertex_count: 0,
             selected_satellite: None,
+            hovered_satellite: None,
+            trails_enabled: true,
             orbit_frame_positions: Vec::new(),
         }
     }
@@ -1486,6 +1502,53 @@ impl Renderer {
         self.satellites.iter().find(|s| s.norad_id == norad)
     }
 
+    /// Set the hovered satellite — the one whose dot renders
+    /// bigger and brighter so list-row → globe-dot correspondence
+    /// is visible. Distinct from `set_selected_satellite`: hover
+    /// is transient (clears on pointer-leave); selection is sticky
+    /// (clicked row gets the bright orbit trail).
+    pub fn set_hovered_satellite(&mut self, norad: Option<u32>) {
+        self.hovered_satellite = norad;
+    }
+
+    /// Whether orbital trails are currently drawn. Toggled via the
+    /// satellite-list panel's "Show trails" checkbox.
+    pub fn trails_enabled(&self) -> bool {
+        self.trails_enabled
+    }
+
+    /// Turn orbital trails on or off.
+    pub fn set_trails_enabled(&mut self, enabled: bool) {
+        self.trails_enabled = enabled;
+    }
+
+    /// Total number of loaded satellites across all categories.
+    pub fn satellite_count(&self) -> usize {
+        self.satellites.len()
+    }
+
+    /// Iterate the loaded satellite catalog as `(norad, name,
+    /// category_slug)` triples. The web UI reads this to populate
+    /// the side-panel list. Caller may filter / paginate as
+    /// appropriate — at 6 000 Starlink the JS side should virtualise
+    /// (or truncate) rather than render every row.
+    pub fn satellites_iter(&self) -> impl Iterator<Item = (u32, &str, &'static str)> + '_ {
+        self.satellites.iter().map(|s| {
+            (
+                s.norad_id,
+                s.name.as_str(),
+                match s.category {
+                    Category::Stations => "stations",
+                    Category::Starlink => "starlink",
+                    Category::Gnss => "gnss",
+                    Category::Weather => "weather",
+                    Category::Debris => "debris",
+                    Category::Other => "other",
+                },
+            )
+        })
+    }
+
     /// CPU-side hit-test: returns the NORAD id of the satellite
     /// drawn nearest to the cursor (within a small pick radius),
     /// or `None`. Cursor coords are in **device pixels** (matching
@@ -1634,9 +1697,15 @@ impl Renderer {
                 continue;
             };
             let [r, g, b] = sat.category.color_srgb8();
+            let highlight = if Some(sat.norad_id) == self.hovered_satellite {
+                1.0
+            } else {
+                0.0
+            };
             instances.push(OrbitInstance {
                 world_pos: pos,
                 color: [srgb8_to_linear(r), srgb8_to_linear(g), srgb8_to_linear(b)],
+                highlight,
             });
             self.orbit_frame_positions.push((sat.norad_id, pos));
         }
@@ -1676,6 +1745,13 @@ impl Renderer {
         }
 
         let mut trail_verts: Vec<OrbitTrailVertex> = Vec::new();
+        // Toggle gate — when `trails_enabled` is off, skip the
+        // entire trail-build loop so we don't spend ~150 sgp4
+        // calls per frame for trails the user disabled.
+        if !self.trails_enabled {
+            self.orbit_trail_vertex_count = 0;
+            return;
+        }
 
         // Faint trails for every small-category, allowed,
         // not-selected satellite.
@@ -2706,6 +2782,11 @@ fn build_orbit_pipeline(
                         format: wgpu::VertexFormat::Float32x3,
                         offset: 12,
                         shader_location: 1,
+                    },
+                    wgpu::VertexAttribute {
+                        format: wgpu::VertexFormat::Float32,
+                        offset: 24,
+                        shader_location: 2,
                     },
                 ],
             }],

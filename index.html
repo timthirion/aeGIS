@@ -199,6 +199,115 @@
       color: #8d97a3; font-size: 11px; margin-top: 2px;
     }
 
+    /* Left-side satellite list panel — same chrome palette as the
+       search bar. Earth-only via the same data-body gate. */
+    #aegis-sat-panel {
+      position: absolute;
+      top: 80px;
+      left: 16px;
+      width: 280px;
+      max-height: calc(100% - 160px);
+      z-index: 10;
+      display: flex;
+      flex-direction: column;
+      background: rgba(11, 14, 18, 0.78);
+      border: 1px solid #1d232b;
+      border-radius: 8px;
+      backdrop-filter: blur(6px);
+      -webkit-backdrop-filter: blur(6px);
+      box-shadow: 0 2px 12px rgba(0, 0, 0, 0.35);
+      font: 12px/1.3 ui-sans-serif, system-ui, -apple-system, sans-serif;
+      color: #e6e8eb;
+      overflow: hidden;
+    }
+    #aegis-sat-panel header {
+      padding: 10px 12px 8px 12px;
+      border-bottom: 1px solid #1d232b;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    #aegis-sat-panel header .title {
+      font-weight: 500;
+      flex: 1;
+    }
+    #aegis-sat-panel header .count {
+      color: #8d97a3;
+      font-size: 11px;
+      font-variant-numeric: tabular-nums;
+    }
+    #aegis-sat-panel header label {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      cursor: pointer;
+      color: #8d97a3;
+      font-size: 11px;
+    }
+    #aegis-sat-panel header input[type="checkbox"] {
+      margin: 0;
+      width: 12px;
+      height: 12px;
+      accent-color: #6ea8ff;
+    }
+    #aegis-sat-panel input.filter {
+      appearance: none;
+      width: 100%;
+      box-sizing: border-box;
+      border: none;
+      background: transparent;
+      color: #e6e8eb;
+      padding: 8px 12px;
+      font: inherit;
+      letter-spacing: 0.01em;
+      outline: none;
+      border-bottom: 1px solid #1d232b;
+    }
+    #aegis-sat-panel input.filter::placeholder { color: #6a7480; }
+    #aegis-sat-list {
+      overflow-y: auto;
+      flex: 1;
+      min-height: 0;
+    }
+    #aegis-sat-list .row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 12px;
+      cursor: pointer;
+      border-bottom: 1px solid #14181d;
+    }
+    #aegis-sat-list .row:last-child { border-bottom: none; }
+    #aegis-sat-list .row:hover,
+    #aegis-sat-list .row[data-selected="true"] {
+      background: #2a3340;
+    }
+    #aegis-sat-list .row .swatch {
+      width: 8px;
+      height: 8px;
+      border-radius: 999px;
+      flex-shrink: 0;
+    }
+    #aegis-sat-list .row .name {
+      flex: 1;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    #aegis-sat-list .row .norad {
+      color: #8d97a3;
+      font-size: 11px;
+      font-variant-numeric: tabular-nums;
+    }
+    #aegis-sat-list .truncated {
+      padding: 8px 12px;
+      color: #8d97a3;
+      font-size: 11px;
+      font-style: italic;
+    }
+    /* Earth-only — same gate as search + categories. */
+    body:not([data-body="earth"]) #aegis-sat-panel { display: none; }
+
     /* Top-centre search bar. Same chrome palette as the basemap
        toggle (panel background, border, blur). The input has no
        native border so it reads as a continuation of the chrome
@@ -303,6 +412,24 @@
       <button type="button" data-mode="satellite" aria-pressed="true">Satellite</button>
     </div>
     <div id="aegis-sat-tooltip" role="status" aria-live="polite"></div>
+    <div id="aegis-sat-panel" role="region" aria-label="Satellites">
+      <header>
+        <span class="title">Satellites</span>
+        <span class="count" id="aegis-sat-count">0</span>
+        <label title="Show orbital trails">
+          <input type="checkbox" id="aegis-sat-trails" checked />
+          Trails
+        </label>
+      </header>
+      <input
+        type="text"
+        class="filter"
+        id="aegis-sat-filter"
+        placeholder="Filter by name…"
+        autocomplete="off"
+      />
+      <div id="aegis-sat-list" role="listbox"></div>
+    </div>
     <div id="aegis-orbit-categories" role="group" aria-label="Satellite categories">
       <button type="button" data-cat="stations" aria-pressed="true" title="Stations (ISS, Tiangong)">Stations</button>
       <button type="button" data-cat="starlink" aria-pressed="false" title="Starlink (~6000 sats)">Starlink</button>
@@ -343,6 +470,7 @@
         wireBodySwitcher(aegis);
         wireOrbitCategories(aegis);
         wireSatTooltip(aegis);
+        wireSatPanel(aegis);
       } catch (e) {
         console.error("aegis start failed", e);
         const host = document.getElementById("aegis-host");
@@ -385,6 +513,120 @@
             b.setAttribute("aria-pressed", b.dataset.mode === current ? "true" : "false"),
           );
         }
+      });
+    }
+
+    function wireSatPanel(instance) {
+      const panel = document.getElementById("aegis-sat-panel");
+      const listEl = document.getElementById("aegis-sat-list");
+      const countEl = document.getElementById("aegis-sat-count");
+      const trailsBox = document.getElementById("aegis-sat-trails");
+      const filterEl = document.getElementById("aegis-sat-filter");
+      if (!panel || !listEl) return;
+
+      // Category swatch colours match Category::color_srgb8 in Rust.
+      const swatchColor = {
+        stations: "rgb(255, 244, 100)",
+        starlink: "rgb(120, 200, 255)",
+        gnss: "rgb(255, 160, 120)",
+        weather: "rgb(180, 240, 180)",
+        debris: "rgb(200, 200, 200)",
+        other: "rgb(220, 220, 220)",
+      };
+
+      let lastCount = -1;
+      let cachedSats = [];
+      let filterText = "";
+
+      const renderList = () => {
+        const filtered = filterText
+          ? cachedSats.filter((s) =>
+              s.name.toLowerCase().includes(filterText),
+            )
+          : cachedSats;
+        // Cap at 500 visible rows so the DOM stays light at 6000
+        // Starlink. Filter narrows it further; users typing find
+        // by name.
+        const cap = 500;
+        const shown = filtered.slice(0, cap);
+
+        // Rebuild the list — at 500 rows × ~3 elements this is
+        // <1 ms in modern browsers. We could diff but it's
+        // overkill at this scale.
+        const frag = document.createDocumentFragment();
+        for (const s of shown) {
+          const row = document.createElement("div");
+          row.className = "row";
+          row.setAttribute("role", "option");
+          row.dataset.norad = s.norad;
+          row.innerHTML =
+            `<span class="swatch" style="background:${swatchColor[s.category] || "#888"}"></span>` +
+            `<span class="name">${s.name}</span>` +
+            `<span class="norad">${s.norad}</span>`;
+          frag.appendChild(row);
+        }
+        if (filtered.length > cap) {
+          const note = document.createElement("div");
+          note.className = "truncated";
+          note.textContent = `+${filtered.length - cap} more — refine the filter`;
+          frag.appendChild(note);
+        }
+        listEl.innerHTML = "";
+        listEl.appendChild(frag);
+      };
+
+      const refresh = () => {
+        const total = instance.satelliteCount();
+        countEl.textContent = String(total);
+        if (total !== lastCount) {
+          lastCount = total;
+          cachedSats = JSON.parse(instance.satellitesJson(0));
+          renderList();
+        }
+      };
+
+      // Initial paint + poll for catalog growth as TLE fetches land.
+      refresh();
+      setInterval(refresh, 1500);
+
+      filterEl.addEventListener("input", (e) => {
+        filterText = e.target.value.trim().toLowerCase();
+        renderList();
+      });
+
+      trailsBox.checked = instance.trailsEnabled();
+      trailsBox.addEventListener("change", (e) => {
+        instance.setTrailsEnabled(e.target.checked);
+      });
+
+      // Delegated row interactions — pointermove tracks hover
+      // (we only call hoverSatellite when the target row changes,
+      // not on every move).
+      let currentHover = 0;
+      listEl.addEventListener("pointermove", (e) => {
+        const row = e.target.closest(".row[data-norad]");
+        const next = row ? Number(row.dataset.norad) : 0;
+        if (next !== currentHover) {
+          currentHover = next;
+          instance.hoverSatellite(next);
+        }
+      });
+      listEl.addEventListener("pointerleave", () => {
+        if (currentHover !== 0) {
+          currentHover = 0;
+          instance.hoverSatellite(0);
+        }
+      });
+      listEl.addEventListener("click", (e) => {
+        const row = e.target.closest(".row[data-norad]");
+        if (!row) return;
+        const norad = Number(row.dataset.norad);
+        instance.selectSatellite(norad);
+        // Mark selected row visually.
+        listEl
+          .querySelectorAll(".row[data-selected='true']")
+          .forEach((r) => r.removeAttribute("data-selected"));
+        row.setAttribute("data-selected", "true");
       });
     }
 

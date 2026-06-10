@@ -26,6 +26,10 @@ struct Instance {
     // Per-instance sRGB colour (already converted to linear
     // CPU-side via the existing srgb8_to_linear helper).
     @location(1) color: vec3<f32>,
+    // 0.0 = normal point, 1.0 = the hovered satellite — scaled up
+    // and brightened so the user can see which point matches the
+    // list row under the cursor.
+    @location(2) highlight: f32,
 };
 
 struct VsOut {
@@ -36,9 +40,12 @@ struct VsOut {
 
 @group(0) @binding(0) var<uniform> u: Camera;
 
-// Point footprint in device pixels. 5 px reads as a clear dot
-// without dominating the globe.
+// Normal point footprint in device pixels. 5 px reads as a clear
+// dot without dominating the globe. Hovered points scale up to
+// `HIGHLIGHT_SIZE_PX` so the user can see which dot they're
+// hovering in the satellite-list panel.
 const POINT_SIZE_PX: f32 = 5.0;
+const HIGHLIGHT_SIZE_PX: f32 = 14.0;
 
 @vertex
 fn vs_main(@builtin(vertex_index) vi: u32, inst: Instance) -> VsOut {
@@ -82,14 +89,19 @@ fn vs_main(@builtin(vertex_index) vi: u32, inst: Instance) -> VsOut {
     // by `clip.w` so the point stays the same device-pixel size
     // regardless of perspective depth — standard billboard trick.
     let px_to_clip = vec2<f32>(2.0 / u.viewport_px.x, 2.0 / u.viewport_px.y);
-    let offset_clip = corner * POINT_SIZE_PX * px_to_clip * center_clip.w;
+    let size_px = mix(POINT_SIZE_PX, HIGHLIGHT_SIZE_PX, inst.highlight);
+    let offset_clip = corner * size_px * px_to_clip * center_clip.w;
+
+    // Highlighted dot also brightens toward white so it stands out
+    // against the surrounding category colour.
+    let color = mix(inst.color, vec3<f32>(1.0, 1.0, 1.0), inst.highlight * 0.4);
 
     var out: VsOut;
     out.clip = vec4<f32>(
         center_clip.xy + offset_clip,
         center_clip.zw,
     );
-    out.color = inst.color;
+    out.color = color;
     out.discard_flag = select(0.0, 1.0, occluded);
     return out;
 }

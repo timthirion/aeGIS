@@ -305,6 +305,71 @@ impl AegisInstance {
             .renderer
             .set_selected_satellite(if norad == 0 { None } else { Some(norad) });
     }
+
+    /// Set the hovered satellite (transient highlight, 0 = clear).
+    /// The hovered dot renders larger + brighter so it's visible
+    /// from the side-panel list under the cursor.
+    #[wasm_bindgen(js_name = hoverSatellite)]
+    pub fn hover_satellite(&self, norad: u32) {
+        self.inner
+            .borrow_mut()
+            .renderer
+            .set_hovered_satellite(if norad == 0 { None } else { Some(norad) });
+    }
+
+    /// Toggle orbital trails on or off.
+    #[wasm_bindgen(js_name = setTrailsEnabled)]
+    pub fn set_trails_enabled(&self, enabled: bool) {
+        self.inner.borrow_mut().renderer.set_trails_enabled(enabled);
+    }
+
+    #[wasm_bindgen(js_name = trailsEnabled)]
+    pub fn trails_enabled(&self) -> bool {
+        self.inner.borrow().renderer.trails_enabled()
+    }
+
+    /// Total number of loaded satellites.
+    #[wasm_bindgen(js_name = satelliteCount)]
+    pub fn satellite_count(&self) -> u32 {
+        self.inner.borrow().renderer.satellite_count() as u32
+    }
+
+    /// Serialise the satellite catalog to JSON (array of
+    /// `{ norad, name, category }`) for the side-panel list. Cap
+    /// at `limit` to keep the JSON small + the JS side fast — at
+    /// 6 000 Starlink entries you do not want every row in the
+    /// DOM at once. Pass 0 for "no cap".
+    #[wasm_bindgen(js_name = satellitesJson)]
+    pub fn satellites_json(&self, limit: u32) -> String {
+        let inner = self.inner.borrow();
+        let cap = if limit == 0 {
+            usize::MAX
+        } else {
+            limit as usize
+        };
+        let mut out = String::with_capacity(64 * cap.min(inner.renderer.satellite_count()));
+        out.push('[');
+        let mut first = true;
+        for (i, (norad, name, cat)) in inner.renderer.satellites_iter().enumerate() {
+            if i >= cap {
+                break;
+            }
+            if !first {
+                out.push(',');
+            }
+            first = false;
+            // Hand-roll the JSON to avoid pulling serde into the
+            // wasm surface. Names are TLE-derived ASCII; no escape
+            // pass needed beyond quotes.
+            let safe_name = name.replace('\\', "\\\\").replace('"', "\\\"");
+            out.push_str(&format!(
+                r#"{{"norad":{},"name":"{}","category":"{}"}}"#,
+                norad, safe_name, cat
+            ));
+        }
+        out.push(']');
+        out
+    }
 }
 
 fn category_from_slug(slug: &str) -> Option<crate::orbit::Category> {
