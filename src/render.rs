@@ -2090,8 +2090,15 @@ impl Renderer {
             }
 
             // Orbit trail (plan 0004 M3) — drawn before the points
-            // so satellites render on top of their own trail.
-            if self.active_body == BodyId::Earth && self.orbit_trail_vertex_count >= 2 {
+            // so satellites render on top of their own trail. Only
+            // shown when any curvature is in view (`globeness > 0`);
+            // at flat-Mercator zoom the trail reads as a stray
+            // yellow line crossing city imagery rather than an
+            // orbital path, so we suppress it there.
+            if self.active_body == BodyId::Earth
+                && self.orbit_trail_vertex_count >= 2
+                && self.camera.globeness() > 0.0
+            {
                 pass.set_pipeline(&self.orbit_trail_pipeline);
                 pass.set_bind_group(0, &self.orbit_trail_bind_group, &[]);
                 pass.set_vertex_buffer(0, self.orbit_trail_vertex_buf.slice(..));
