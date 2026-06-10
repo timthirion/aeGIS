@@ -207,6 +207,10 @@
     }
     #aegis-sat-tooltip[data-visible="true"] { display: block; }
     #aegis-sat-tooltip .sat-name { color: #e6e8eb; font-weight: 500; }
+    #aegis-sat-tooltip .sat-flavor {
+      color: #c0c8d4; font-size: 11.5px; margin-top: 3px;
+      max-width: 280px;
+    }
     #aegis-sat-tooltip .sat-meta {
       color: #8d97a3; font-size: 11px; margin-top: 2px;
     }
@@ -846,12 +850,103 @@
       });
     }
 
+    // One-line descriptive blurb derived from the TLE name + the
+    // satellite's category. Pattern-matched in order: specific
+    // named families first, then debris breakup sources, then GNSS
+    // / weather / Earth-obs families, then category fallbacks.
+    // No network calls — everything resolves from the data we
+    // already have client-side.
+    function flavorFor(name, category) {
+      const n = (name || "").toUpperCase();
+      // Crewed stations.
+      if (n.startsWith("ISS") || n.includes("ZARYA"))
+        return "International Space Station — crewed laboratory in LEO.";
+      if (n.startsWith("CSS") || n.startsWith("TIANGONG") || n.startsWith("TIANHE"))
+        return "Tiangong — China's modular crewed space station.";
+      // Notable observatories.
+      if (n.startsWith("HST") || n.includes("HUBBLE"))
+        return "Hubble Space Telescope — UV/visible space observatory.";
+      // LEO mega-constellations.
+      if (n.startsWith("STARLINK"))
+        return "SpaceX Starlink — broadband internet constellation.";
+      if (n.includes("ONEWEB"))
+        return "OneWeb — broadband internet constellation.";
+      // Debris breakup sources (checked before generic DEB fallback).
+      if (n.includes("FENGYUN 1C") && n.includes("DEB"))
+        return "Fragment from China's 2007 Fengyun-1C ASAT test.";
+      if (n.includes("COSMOS 2251") && n.includes("DEB"))
+        return "Fragment from the 2009 Cosmos 2251 / Iridium 33 collision.";
+      if (n.includes("IRIDIUM 33") && n.includes("DEB"))
+        return "Fragment from the 2009 Cosmos 2251 / Iridium 33 collision.";
+      if (n.includes("COSMOS 1408") && n.includes("DEB"))
+        return "Fragment from Russia's 2021 ASAT test on Cosmos 1408.";
+      if (n.endsWith(" DEB") || n.includes(" DEB ") || n.includes("DEBRIS"))
+        return "Tracked orbital debris fragment.";
+      // GNSS family.
+      if (n.startsWith("GPS") || n.startsWith("NAVSTAR"))
+        return "US GPS / NAVSTAR navigation satellite.";
+      if (n.includes("GLONASS"))
+        return "Russian GLONASS navigation satellite.";
+      if (n.startsWith("GALILEO") || n.startsWith("GSAT"))
+        return "European Galileo navigation satellite.";
+      if (n.includes("BEIDOU") || n.startsWith("BDS"))
+        return "Chinese BeiDou navigation satellite.";
+      if (n.startsWith("QZS"))
+        return "Japanese QZSS regional navigation satellite.";
+      if (n.startsWith("IRNSS") || n.startsWith("NVS"))
+        return "Indian NavIC (IRNSS) regional navigation satellite.";
+      // Weather + Earth-obs.
+      if (n.startsWith("NOAA") || n.startsWith("GOES") || n.startsWith("JPSS"))
+        return "US NOAA weather satellite.";
+      if (n.startsWith("METEOSAT") || n.startsWith("METOP"))
+        return "EUMETSAT Meteosat / MetOp weather satellite.";
+      if (n.startsWith("HIMAWARI"))
+        return "JMA Himawari weather satellite.";
+      if (n.startsWith("FY-") || n.startsWith("FENGYUN"))
+        return "China Fengyun weather satellite.";
+      if (n.startsWith("LANDSAT"))
+        return "USGS Landsat Earth-observation satellite.";
+      if (n.startsWith("SENTINEL"))
+        return "ESA Sentinel (Copernicus) Earth-observation satellite.";
+      if (n.startsWith("AQUA") || n.startsWith("TERRA") || n.startsWith("AURA"))
+        return "NASA EOS Earth-observation satellite.";
+      if (n.startsWith("ICESAT") || n.startsWith("JASON"))
+        return "NASA / NOAA altimetry satellite.";
+      if (n.startsWith("WORLDVIEW") || n.startsWith("GEOEYE"))
+        return "Maxar commercial high-resolution imagery satellite.";
+      if (n.includes("FLOCK") || n.includes("DOVE-"))
+        return "Planet Labs Dove imagery satellite.";
+      // Generic family fallbacks before category.
+      if (n.startsWith("COSMOS") || n.startsWith("KOSMOS"))
+        return "Russian Cosmos series satellite (military designation).";
+      if (n.startsWith("USA "))
+        return "US military satellite (USA designation).";
+      if (n.startsWith("MOLNIYA"))
+        return "Russian Molniya communications satellite (HEO).";
+      // Category fallback.
+      const byCat = {
+        stations: "Crewed space station.",
+        starlink: "SpaceX Starlink internet constellation satellite.",
+        gnss: "Navigation satellite.",
+        weather: "Earth-observation / weather satellite.",
+        debris: "Tracked orbital debris fragment.",
+        other: "Tracked Earth-orbital object.",
+      };
+      return byCat[category] || "Tracked Earth-orbital object.";
+    }
+
     function wireSatTooltip(instance) {
       const tooltip = document.getElementById("aegis-sat-tooltip");
       const host = document.getElementById("aegis-host");
+      const listEl = document.getElementById("aegis-sat-list");
       if (!tooltip || !host) return;
 
       const fmt = (n) => Number(n).toFixed(2);
+      const escapeHtml = (s) =>
+        String(s)
+          .replace(/&/g, "&amp;")
+          .replace(/</g, "&lt;")
+          .replace(/>/g, "&gt;");
       const setTooltip = (info, evt) => {
         if (!info) {
           tooltip.setAttribute("data-visible", "false");
@@ -859,11 +954,14 @@
         }
         const ns = info.lat >= 0 ? "N" : "S";
         const ew = info.lon >= 0 ? "E" : "W";
+        const flavor = flavorFor(info.name, info.category);
         tooltip.innerHTML =
-          `<div class="sat-name">${info.name} · ${info.norad}</div>` +
+          `<div class="sat-name">${escapeHtml(info.name)} · ${info.norad}</div>` +
+          `<div class="sat-flavor">${escapeHtml(flavor)}</div>` +
           `<div class="sat-meta">${info.category} · ${fmt(info.altitudeKm)} km · ` +
           `${fmt(Math.abs(info.lat))}°${ns}, ${fmt(Math.abs(info.lon))}°${ew}</div>`;
-        // Position relative to host element.
+        // Position relative to host element (= main, since host is
+        // inset:0 inside the position:relative <main>).
         const rect = host.getBoundingClientRect();
         tooltip.style.left = `${evt.clientX - rect.left}px`;
         tooltip.style.top = `${evt.clientY - rect.top}px`;
@@ -893,6 +991,22 @@
           instance.selectSatellite(info.norad);
         }
       });
+
+      // List-row hover: same tooltip content as canvas hover, so
+      // users can browse the panel and see what each line *is*.
+      if (listEl) {
+        listEl.addEventListener("pointermove", (e) => {
+          const row = e.target.closest(".row[data-norad]");
+          if (!row) {
+            setTooltip(null, e);
+            return;
+          }
+          const norad = Number(row.dataset.norad);
+          const info = instance.satelliteInfo(norad);
+          setTooltip(info, e);
+        });
+        listEl.addEventListener("pointerleave", (e) => setTooltip(null, e));
+      }
     }
 
     function wireOrbitCategories(instance) {

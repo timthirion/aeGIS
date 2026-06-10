@@ -273,27 +273,17 @@ impl AegisInstance {
         let Some(norad) = inner.renderer.satellite_under_cursor(cursor) else {
             return JsValue::NULL;
         };
-        let Some(sat) = inner.renderer.satellite_by_norad(norad) else {
-            return JsValue::NULL;
-        };
-        // Resolve current position to get altitude + lonlat.
-        let sim_t = inner.renderer.sim_unix_s();
-        let Some(pos) = crate::orbit::propagate_render_space(sat, sim_t) else {
-            return JsValue::NULL;
-        };
-        let (lon, lat, alt_km) = crate::orbit::render_space_to_geodetic(pos);
-        let obj = js_sys::Object::new();
-        let _ = js_sys::Reflect::set(&obj, &"norad".into(), &(norad as f64).into());
-        let _ = js_sys::Reflect::set(&obj, &"name".into(), &sat.name.clone().into());
-        let _ = js_sys::Reflect::set(
-            &obj,
-            &"category".into(),
-            &category_to_slug(sat.category).into(),
-        );
-        let _ = js_sys::Reflect::set(&obj, &"altitudeKm".into(), &alt_km.into());
-        let _ = js_sys::Reflect::set(&obj, &"lon".into(), &lon.into());
-        let _ = js_sys::Reflect::set(&obj, &"lat".into(), &lat.into());
-        obj.into()
+        build_satellite_info(&inner, norad)
+    }
+
+    /// Look up the same JS-side info struct as `satelliteUnderCursor`
+    /// but keyed by NORAD id rather than cursor position. Used by
+    /// the list-panel hover handler so mousing over a row shows
+    /// the same tooltip the canvas dot would.
+    #[wasm_bindgen(js_name = satelliteInfo)]
+    pub fn satellite_info(&self, norad: u32) -> JsValue {
+        let inner = self.inner.borrow();
+        build_satellite_info(&inner, norad)
     }
 
     /// Set the selected satellite by NORAD id (or pass 0 to
@@ -399,6 +389,34 @@ impl AegisInstance {
         out.push(']');
         out
     }
+}
+
+/// Build the `{ norad, name, category, altitudeKm, lon, lat }` JS
+/// object for a given NORAD id, propagating the satellite to the
+/// current sim time. Returns `JsValue::NULL` if the id isn't in
+/// the catalog or propagation fails. Shared between the cursor
+/// hit-test path and the list-row hover path.
+fn build_satellite_info(inner: &Inner, norad: u32) -> JsValue {
+    let Some(sat) = inner.renderer.satellite_by_norad(norad) else {
+        return JsValue::NULL;
+    };
+    let sim_t = inner.renderer.sim_unix_s();
+    let Some(pos) = crate::orbit::propagate_render_space(sat, sim_t) else {
+        return JsValue::NULL;
+    };
+    let (lon, lat, alt_km) = crate::orbit::render_space_to_geodetic(pos);
+    let obj = js_sys::Object::new();
+    let _ = js_sys::Reflect::set(&obj, &"norad".into(), &(norad as f64).into());
+    let _ = js_sys::Reflect::set(&obj, &"name".into(), &sat.name.clone().into());
+    let _ = js_sys::Reflect::set(
+        &obj,
+        &"category".into(),
+        &category_to_slug(sat.category).into(),
+    );
+    let _ = js_sys::Reflect::set(&obj, &"altitudeKm".into(), &alt_km.into());
+    let _ = js_sys::Reflect::set(&obj, &"lon".into(), &lon.into());
+    let _ = js_sys::Reflect::set(&obj, &"lat".into(), &lat.into());
+    obj.into()
 }
 
 fn category_from_slug(slug: &str) -> Option<crate::orbit::Category> {
