@@ -30,6 +30,7 @@ pub mod web;
 /// (or presses Escape).
 #[cfg(not(target_arch = "wasm32"))]
 pub fn run() {
+    use crate::{orbit, render, vector};
     use std::sync::Arc;
     use winit::{
         event::{ElementState, Event, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent},
@@ -77,6 +78,14 @@ pub fn run() {
         },
         Err(e) => log::warn!("read {geojson_path}: {e} — running without vector overlay"),
     }
+
+    // Load the bundled ISS TLE fixture (plan 0004 M0 / M1). The
+    // native build doesn't reach out to Celestrak on startup — the
+    // fixture is the only satellite shown on `cargo run` unless the
+    // caller invokes `Renderer::load_satellites` with fresher TLE
+    // text themselves.
+    const ISS_FIXTURE: &str = include_str!("../data/orbits/iss-fixture.txt");
+    renderer.load_satellites(orbit::Category::Stations, ISS_FIXTURE);
 
     let mut cursor_px: (f64, f64) = (0.0, 0.0);
     let mut dragging = false;
@@ -154,6 +163,7 @@ pub fn run() {
                         renderer.drain_sat_completed_fetches();
                         let now = startup.elapsed().as_secs_f64();
                         renderer.tick_fly_to(now);
+                        renderer.tick_orbit(now);
                         renderer.ensure_visible_tiles();
                         renderer.ensure_visible_sat_tiles();
                         renderer.render();

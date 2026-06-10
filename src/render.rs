@@ -30,6 +30,8 @@ use wgpu::util::DeviceExt;
 
 use crate::body::{self, Basemap, BasemapId, Body, BodyId};
 use crate::camera::Camera;
+use crate::clock::SimClock;
+use crate::orbit::{self, Category, Satellite};
 use crate::tile::{self, DecodedTile, TileId, TileProjection};
 
 /// Map a `TileProjection` to the integer encoding the tile shader's
@@ -47,6 +49,7 @@ const TILE_SHADER: &str = include_str!("shaders/tile.wgsl");
 const VECTOR_SHADER: &str = include_str!("shaders/vector.wgsl");
 const CAPS_SHADER: &str = include_str!("shaders/caps.wgsl");
 const EARTH_SHADER: &str = include_str!("shaders/earth.wgsl");
+const ORBIT_SHADER: &str = include_str!("shaders/orbit.wgsl");
 
 /// Frames the camera state must stay unchanged before we consider it
 /// "settled" and trigger a satellite-tile fetch. At 60 fps this is
@@ -133,6 +136,29 @@ struct CapUniform {
     camera_pos: [f32; 3],
     pole_sign: f32,
     color: [f32; 4],
+}
+
+/// Per-frame camera uniform consumed by `orbit.wgsl`. 96 bytes
+/// (64 view_proj + 12 cam_pos + 4 pad + 8 viewport + 8 pad).
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, Pod, Zeroable)]
+struct OrbitCameraUniform {
+    view_proj: [f32; 16],
+    camera_pos: [f32; 3],
+    _pad0: f32,
+    viewport_px: [f32; 2],
+    _pad1: [f32; 2],
+}
+
+/// Per-instance data for `orbit.wgsl`. 24 bytes — vec3 position +
+/// vec3 colour. Position lives in renderer body-fixed coords (Earth
+/// radii); colour is linear-light RGB (the CPU side converts sRGB8
+/// → linear via `srgb8_to_linear` before upload).
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, Pod, Zeroable)]
+struct OrbitInstance {
+    world_pos: [f32; 3],
+    color: [f32; 3],
 }
 
 /// Per-frame camera uniform consumed by `earth.wgsl`. 80 bytes —
@@ -335,6 +361,27 @@ pub struct Renderer {
     /// User input (pan / zoom / basemap toggle) clears it so the
     /// animation never fights the user. Plan 0002 M3.
     flyto: Option<crate::flyto::FlyTo>,
+
+    /// Simulation clock — drives satellite-orbit propagation
+    /// (plan 0004) and, when plan 0010 ships, the day/night
+    /// terminator (plan 0009). Constructed at startup at
+    /// real-time rate. Plan 0010's full UI is not yet wired.
+    sim_clock: SimClock,
+    /// Satellite catalog. Repopulated by `load_satellites`; the
+    /// per-frame propagation rewrites the instance buffer from
+    /// this list.
+    satellites: Vec<Satellite>,
+    /// Plan 0004 M1 GPU resources: one shared pipeline + instance
+    /// buffer + camera-uniform buffer for the orbit overlay.
+    orbit_pipeline: wgpu::RenderPipeline,
+    orbit_camera_buf: wgpu::Buffer,
+    orbit_bind_group: wgpu::BindGroup,
+    /// Current instance buffer capacity (number of instances it
+    /// can hold). Grows on demand inside `tick_orbit`.
+    orbit_instance_buf: wgpu::Buffer,
+    orbit_instance_capacity: u32,
+    /// Live instance count this frame.
+    orbit_instance_count: u32,
 }
 
 impl Renderer {
@@ -549,6 +596,14 @@ impl Renderer {
             );
         }
 
+        // Orbit pipeline (plan 0004 M1). Uses its own bgl + shader;
+        // an instance buffer carries per-satellite world position +
+        // colour. Initial instance capacity is one — grows on
+        // demand inside `tick_orbit` as satellites are loaded.
+        let (orbit_pipeline, orbit_bgl, orbit_camera_buf, orbit_bind_group, orbit_instance_buf) =
+            build_orbit_pipeline(&device, format, 1);
+        let _ = orbit_bgl; // kept implicit via the bind_group
+
         // Blue Marble streaming pipeline. Bind-group layout is the
         // same shape as the Carto tile pipeline (uniform + texture +
         // sampler), so we reuse `tile_bgl`. Separate pipeline because
@@ -556,6 +611,35 @@ impl Renderer {
         // projection, not inverse Mercator.
         let (sat_completed_tx, sat_completed_rx) = mpsc::channel();
         let (completed_tx, completed_rx) = mpsc::channel();
+
+        // Initial sim clock at wall-clock now, real-time rate.
+        let now_mono_s = {
+            #[cfg(target_arch = "wasm32")]
+            {
+                web_sys::window()
+                    .and_then(|w| w.performance())
+                    .map_or(0.0, |p| p.now() / 1000.0)
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                // Native: `Instant::now()` is monotonic; we just need
+                // a starting reference, not a wall-clock value.
+                0.0
+            }
+        };
+        let now_unix_s = {
+            #[cfg(target_arch = "wasm32")]
+            {
+                js_sys::Date::now() / 1000.0
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0.0, |d| d.as_secs_f64())
+            }
+        };
+        let sim_clock = SimClock::new(now_unix_s, now_mono_s, 1.0);
 
         Renderer {
             surface,
@@ -603,6 +687,14 @@ impl Renderer {
                 Camera::new(h.lon, h.lat, h.zoom)
             },
             flyto: None,
+            sim_clock,
+            satellites: Vec::new(),
+            orbit_pipeline,
+            orbit_camera_buf,
+            orbit_bind_group,
+            orbit_instance_buf,
+            orbit_instance_capacity: 1,
+            orbit_instance_count: 0,
         }
     }
 
@@ -1213,6 +1305,81 @@ impl Renderer {
         }
     }
 
+    // ---------------------------------------------------------------------
+    // Plan 0004 — Live satellite-orbit overlay
+    // ---------------------------------------------------------------------
+
+    /// Append satellites parsed from a TLE blob in `category`. Idempotent
+    /// across re-calls of the same TLE — the underlying SGP4 elements get
+    /// re-parsed but the renderer's `satellites` list grows monotonically.
+    /// Plan 0004 M2 adds deduplication by NORAD id.
+    pub fn load_satellites(&mut self, category: Category, tle_text: &str) {
+        let tles = orbit::parse_tles(tle_text);
+        let mut sats = orbit::satellites_from_tles(&tles, category);
+        log::info!(
+            "orbit: loaded {} satellites in category {:?} ({} TLEs parsed)",
+            sats.len(),
+            category,
+            tles.len()
+        );
+        self.satellites.append(&mut sats);
+    }
+
+    /// Advance the simulation clock by the monotonic delta since the
+    /// last call, propagate every satellite to that time, and upload
+    /// the resulting instance buffer to the GPU. Cheap when the
+    /// satellite list is empty.
+    pub fn tick_orbit(&mut self, mono_now_s: f64) {
+        self.sim_clock.step(mono_now_s);
+        if self.satellites.is_empty() || self.active_body != BodyId::Earth {
+            self.orbit_instance_count = 0;
+            return;
+        }
+        let sim_t = self.sim_clock.sim_unix_s();
+        // Propagate into a local Vec, then upload.
+        let mut instances: Vec<OrbitInstance> = Vec::with_capacity(self.satellites.len());
+        for sat in &self.satellites {
+            let Some(pos) = orbit::propagate_render_space(sat, sim_t) else {
+                continue;
+            };
+            let [r, g, b] = sat.category.color_srgb8();
+            instances.push(OrbitInstance {
+                world_pos: pos,
+                color: [srgb8_to_linear(r), srgb8_to_linear(g), srgb8_to_linear(b)],
+            });
+        }
+        let needed = instances.len() as u32;
+        if needed > self.orbit_instance_capacity {
+            // Grow with headroom so we don't reallocate on every
+            // single new TLE.
+            let new_cap = (needed.next_power_of_two()).max(64);
+            self.orbit_instance_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("aegis-orbit-instances"),
+                size: (new_cap as u64) * (std::mem::size_of::<OrbitInstance>() as u64),
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            self.orbit_instance_capacity = new_cap;
+        }
+        self.queue.write_buffer(
+            &self.orbit_instance_buf,
+            0,
+            bytemuck::cast_slice(&instances),
+        );
+        self.orbit_instance_count = needed;
+    }
+
+    /// Current simulation time in UNIX seconds (UTC).
+    pub fn sim_unix_s(&self) -> f64 {
+        self.sim_clock.sim_unix_s()
+    }
+
+    /// Set the simulation playback rate. `1.0` = real time;
+    /// future plan 0010 time-slider UI drives this.
+    pub fn set_sim_rate(&mut self, rate: f64) {
+        self.sim_clock.set_rate(rate);
+    }
+
     /// Headless "search and go" — parses `query` as either a
     /// coordinate expression or a geocoder query, picks the first
     /// result, and kicks off a fly-to to it. Native only;
@@ -1445,6 +1612,19 @@ impl Renderer {
                 .write_buffer(&res.camera_buf, 0, bytemuck::bytes_of(&body_camera));
         }
 
+        // Orbit overlay camera (plan 0004 M1). Same view_proj +
+        // camera_pos as the other passes, plus viewport pixels for
+        // the billboard pixel-size math in the shader.
+        let orbit_camera = OrbitCameraUniform {
+            view_proj,
+            camera_pos,
+            _pad0: 0.0,
+            viewport_px: [canvas.0 as f32, canvas.1 as f32],
+            _pad1: [0.0, 0.0],
+        };
+        self.queue
+            .write_buffer(&self.orbit_camera_buf, 0, bytemuck::bytes_of(&orbit_camera));
+
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(t)
             | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
@@ -1574,6 +1754,17 @@ impl Renderer {
                     pass.set_vertex_buffer(0, vector.vertex_buf.slice(..));
                     pass.draw(0..vector.vertex_count, 0..1);
                 }
+            }
+
+            // Satellite-orbit overlay — only on Earth, only when
+            // any satellites are loaded. Each instance draws 6
+            // verts (two triangles) for the billboarded point.
+            // Plan 0004 M1.
+            if self.active_body == BodyId::Earth && self.orbit_instance_count > 0 {
+                pass.set_pipeline(&self.orbit_pipeline);
+                pass.set_bind_group(0, &self.orbit_bind_group, &[]);
+                pass.set_vertex_buffer(0, self.orbit_instance_buf.slice(..));
+                pass.draw(0..6, 0..self.orbit_instance_count);
             }
         }
         self.queue.submit(std::iter::once(encoder.finish()));
@@ -2028,6 +2219,112 @@ fn srgb8_to_linear(c: u8) -> f32 {
     } else {
         ((s + 0.055) / 1.055).powf(2.4)
     }
+}
+
+/// Build the satellite-orbit pipeline + initial instance buffer.
+/// Returns `(pipeline, bgl, camera_buf, bind_group, instance_buf)`.
+/// Plan 0004 M1.
+fn build_orbit_pipeline(
+    device: &wgpu::Device,
+    format: wgpu::TextureFormat,
+    initial_capacity: u32,
+) -> (
+    wgpu::RenderPipeline,
+    wgpu::BindGroupLayout,
+    wgpu::Buffer,
+    wgpu::BindGroup,
+    wgpu::Buffer,
+) {
+    let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("aegis-orbit-bgl"),
+        entries: &[wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        }],
+    });
+    let camera_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("aegis-orbit-camera"),
+        contents: bytemuck::bytes_of(&OrbitCameraUniform::default()),
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+    });
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("aegis-orbit-bg"),
+        layout: &bgl,
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: camera_buf.as_entire_binding(),
+        }],
+    });
+    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("aegis-orbit-shader"),
+        source: wgpu::ShaderSource::Wgsl(ORBIT_SHADER.into()),
+    });
+    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("aegis-orbit-layout"),
+        bind_group_layouts: &[Some(&bgl)],
+        immediate_size: 0,
+    });
+    let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("aegis-orbit-pipeline"),
+        layout: Some(&layout),
+        vertex: wgpu::VertexState {
+            module: &module,
+            entry_point: Some("vs_main"),
+            buffers: &[wgpu::VertexBufferLayout {
+                array_stride: std::mem::size_of::<OrbitInstance>() as u64,
+                step_mode: wgpu::VertexStepMode::Instance,
+                attributes: &[
+                    wgpu::VertexAttribute {
+                        format: wgpu::VertexFormat::Float32x3,
+                        offset: 0,
+                        shader_location: 0,
+                    },
+                    wgpu::VertexAttribute {
+                        format: wgpu::VertexFormat::Float32x3,
+                        offset: 12,
+                        shader_location: 1,
+                    },
+                ],
+            }],
+            compilation_options: Default::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &module,
+            entry_point: Some("fs_main"),
+            targets: &[Some(wgpu::ColorTargetState {
+                format,
+                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            compilation_options: Default::default(),
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            strip_index_format: None,
+            front_face: wgpu::FrontFace::Ccw,
+            cull_mode: None,
+            polygon_mode: wgpu::PolygonMode::Fill,
+            unclipped_depth: false,
+            conservative: false,
+        },
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        multiview_mask: None,
+        cache: None,
+    });
+    let instance_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("aegis-orbit-instances"),
+        size: (initial_capacity as u64) * (std::mem::size_of::<OrbitInstance>() as u64),
+        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    (pipeline, bgl, camera_buf, bind_group, instance_buf)
 }
 
 fn srgb8_to_linear_rgba(r: u8, g: u8, b: u8, a: u8) -> [f32; 4] {

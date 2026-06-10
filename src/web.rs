@@ -120,6 +120,7 @@ impl Inner {
         // returns ms — divide for the seconds the fly-to sampler wants.
         let now = web_window().performance().map_or(0.0, |p| p.now() / 1000.0);
         self.renderer.tick_fly_to(now);
+        self.renderer.tick_orbit(now);
         self.renderer.ensure_visible_tiles();
         self.renderer.ensure_visible_sat_tiles();
         self.renderer.render();
@@ -287,6 +288,35 @@ pub async fn start(host_id: String) -> Result<AegisInstance, JsValue> {
                     Err(e) => log::warn!("parse countries.geojson: {e}"),
                 },
                 Err(e) => log::warn!("fetch countries.geojson: {e}"),
+            }
+        });
+    }
+
+    // Load the bundled ISS TLE fixture so even an offline first-paint
+    // shows one moving dot. Then kick off the Celestrak fetch for the
+    // full Stations group — when it lands, append to the satellite
+    // list (the bundled ISS dedupes via NORAD id in plan 0004 M2;
+    // for M1 it's an additive extra ISS entry that propagates to
+    // the same point, harmless).
+    {
+        const ISS_FIXTURE: &str = include_str!("../data/orbits/iss-fixture.txt");
+        inner
+            .borrow_mut()
+            .renderer
+            .load_satellites(crate::orbit::Category::Stations, ISS_FIXTURE);
+    }
+    {
+        let inner_for_orbit = inner.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            let url = "https://celestrak.org/NORAD/elements/gp.php?GROUP=stations&FORMAT=tle";
+            match fetch_text(url).await {
+                Ok(tle_text) => {
+                    inner_for_orbit
+                        .borrow_mut()
+                        .renderer
+                        .load_satellites(crate::orbit::Category::Stations, &tle_text);
+                }
+                Err(e) => log::warn!("fetch Celestrak stations: {e}"),
             }
         });
     }
