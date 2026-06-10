@@ -219,6 +219,96 @@ impl AegisInstance {
             BasemapMode::Satellite => "satellite".into(),
         }
     }
+
+    /// Toggle a satellite category on/off. Recognised slugs:
+    /// `"stations"`, `"starlink"`, `"gnss"`, `"weather"`,
+    /// `"debris"`. Unknown slugs are silently ignored. Plan 0004 M2.
+    #[wasm_bindgen(js_name = setOrbitCategory)]
+    pub fn set_orbit_category(&self, slug: &str, enabled: bool) {
+        let Some(cat) = category_from_slug(slug) else {
+            return;
+        };
+        let already_enabled = self.inner.borrow().renderer.category_enabled(cat);
+        self.inner
+            .borrow_mut()
+            .renderer
+            .set_category_enabled(cat, enabled);
+        if enabled && !already_enabled {
+            // First toggle-on for a category — kick off the fetch.
+            kickoff_category_fetch(self.inner.clone(), cat);
+        }
+    }
+
+    /// Is a category currently rendering?
+    #[wasm_bindgen(js_name = orbitCategoryEnabled)]
+    pub fn orbit_category_enabled(&self, slug: &str) -> bool {
+        let Some(cat) = category_from_slug(slug) else {
+            return false;
+        };
+        self.inner.borrow().renderer.category_enabled(cat)
+    }
+
+    /// If the budget guard is suppressing a category right now,
+    /// returns its slug; otherwise `""`. UI greys out the matching
+    /// pill.
+    #[wasm_bindgen(js_name = orbitDemoted)]
+    pub fn orbit_demoted(&self) -> String {
+        match self.inner.borrow().renderer.demoted_category() {
+            Some(cat) => category_to_slug(cat).into(),
+            None => String::new(),
+        }
+    }
+}
+
+fn category_from_slug(slug: &str) -> Option<crate::orbit::Category> {
+    use crate::orbit::Category;
+    match slug {
+        "stations" => Some(Category::Stations),
+        "starlink" => Some(Category::Starlink),
+        "gnss" => Some(Category::Gnss),
+        "weather" => Some(Category::Weather),
+        "debris" => Some(Category::Debris),
+        _ => None,
+    }
+}
+
+fn category_to_slug(cat: crate::orbit::Category) -> &'static str {
+    use crate::orbit::Category;
+    match cat {
+        Category::Stations => "stations",
+        Category::Starlink => "starlink",
+        Category::Gnss => "gnss",
+        Category::Weather => "weather",
+        Category::Debris => "debris",
+        Category::Other => "other",
+    }
+}
+
+/// Spawn an async fetch for `category`'s Celestrak TLE group; on
+/// success, call `Renderer::load_satellites`. Idempotent under
+/// re-toggling — the renderer's dedup-by-NORAD-id ensures a second
+/// fetch doesn't double the catalog.
+fn kickoff_category_fetch(inner: Rc<RefCell<Inner>>, category: crate::orbit::Category) {
+    let group = match category {
+        crate::orbit::Category::Stations => "stations",
+        crate::orbit::Category::Starlink => "starlink",
+        crate::orbit::Category::Gnss => "gnss",
+        crate::orbit::Category::Weather => "weather",
+        crate::orbit::Category::Debris => "active-debris",
+        crate::orbit::Category::Other => return,
+    };
+    let url = format!("https://celestrak.org/NORAD/elements/gp.php?GROUP={group}&FORMAT=tle");
+    wasm_bindgen_futures::spawn_local(async move {
+        match fetch_text(&url).await {
+            Ok(tle_text) => {
+                inner
+                    .borrow_mut()
+                    .renderer
+                    .load_satellites(category, &tle_text);
+            }
+            Err(e) => log::warn!("fetch Celestrak {group}: {e}"),
+        }
+    });
 }
 
 /// Attach an aeGIS renderer to the element with the given id. The host

@@ -133,6 +133,49 @@
       color: #e6e8eb;
     }
 
+    /* Satellite-category pills (plan 0004 M2). Same chrome palette
+       as the basemap toggle. Earth-only — hidden on other bodies
+       via the same data-body gate the search bar uses. */
+    #aegis-orbit-categories {
+      position: absolute;
+      right: 16px;
+      bottom: 16px;
+      z-index: 10;
+      display: inline-flex;
+      padding: 3px;
+      background: rgba(11, 14, 18, 0.78);
+      border: 1px solid #1d232b;
+      border-radius: 999px;
+      backdrop-filter: blur(6px);
+      -webkit-backdrop-filter: blur(6px);
+      box-shadow: 0 2px 12px rgba(0, 0, 0, 0.35);
+      font: 12px/1 ui-sans-serif, system-ui, -apple-system, sans-serif;
+      user-select: none;
+    }
+    #aegis-orbit-categories button {
+      appearance: none;
+      border: none;
+      background: transparent;
+      color: #8d97a3;
+      padding: 6px 10px;
+      border-radius: 999px;
+      cursor: pointer;
+      font: inherit;
+      letter-spacing: 0.02em;
+      transition: background-color 120ms, color 120ms, opacity 120ms;
+    }
+    #aegis-orbit-categories button:hover { color: #e6e8eb; }
+    #aegis-orbit-categories button[aria-pressed="true"] {
+      background: #2a3340;
+      color: #e6e8eb;
+    }
+    #aegis-orbit-categories button[data-demoted="true"] {
+      opacity: 0.45;
+      cursor: not-allowed;
+    }
+    /* Hidden when not on Earth — same data-body gate the search uses. */
+    body:not([data-body="earth"]) #aegis-orbit-categories { display: none; }
+
     /* Top-centre search bar. Same chrome palette as the basemap
        toggle (panel background, border, blur). The input has no
        native border so it reads as a continuation of the chrome
@@ -236,6 +279,12 @@
       <button type="button" data-mode="map" aria-pressed="false">Map</button>
       <button type="button" data-mode="satellite" aria-pressed="true">Satellite</button>
     </div>
+    <div id="aegis-orbit-categories" role="group" aria-label="Satellite categories">
+      <button type="button" data-cat="stations" aria-pressed="true" title="Stations (ISS, Tiangong)">Stations</button>
+      <button type="button" data-cat="starlink" aria-pressed="false" title="Starlink (~6000 sats)">Starlink</button>
+      <button type="button" data-cat="gnss" aria-pressed="false" title="GPS / GLONASS / Galileo / BeiDou">GNSS</button>
+      <button type="button" data-cat="weather" aria-pressed="false" title="Weather + Earth-observation">Weather</button>
+    </div>
   </main>
   <footer>
     <span>aeGIS · Open-source GIS in Rust + WebGPU</span>
@@ -268,6 +317,7 @@
         aegis = await start("aegis-host");
         wireBasemapToggle(aegis);
         wireBodySwitcher(aegis);
+        wireOrbitCategories(aegis);
       } catch (e) {
         console.error("aegis start failed", e);
         const host = document.getElementById("aegis-host");
@@ -311,6 +361,34 @@
           );
         }
       });
+    }
+
+    function wireOrbitCategories(instance) {
+      const root = document.getElementById("aegis-orbit-categories");
+      if (!root) return;
+      const buttons = Array.from(root.querySelectorAll("button[data-cat]"));
+      const syncState = () => {
+        const demoted = instance.orbitDemoted();
+        buttons.forEach((b) => {
+          const cat = b.dataset.cat;
+          const enabled = instance.orbitCategoryEnabled(cat);
+          b.setAttribute("aria-pressed", enabled ? "true" : "false");
+          b.setAttribute("data-demoted", cat === demoted ? "true" : "false");
+        });
+      };
+      // Sync initial state — Stations is on by default Rust-side.
+      syncState();
+      root.addEventListener("click", (e) => {
+        const btn = e.target.closest("button[data-cat]");
+        if (!btn) return;
+        const cat = btn.dataset.cat;
+        const next = btn.getAttribute("aria-pressed") !== "true";
+        instance.setOrbitCategory(cat, next);
+        syncState();
+      });
+      // Demoted-state can change as TLEs stream in; poll a bit
+      // after each click for the budget guard to settle.
+      setInterval(syncState, 2000);
     }
 
     function wireBasemapToggle(instance) {

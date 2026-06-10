@@ -367,10 +367,24 @@ pub struct Renderer {
     /// terminator (plan 0009). Constructed at startup at
     /// real-time rate. Plan 0010's full UI is not yet wired.
     sim_clock: SimClock,
-    /// Satellite catalog. Repopulated by `load_satellites`; the
-    /// per-frame propagation rewrites the instance buffer from
-    /// this list.
+    /// Satellite catalog. `load_satellites` appends here, deduping
+    /// against `satellite_norad_ids` so two loads of the same TLE
+    /// group don't double-count. The per-frame propagation filters
+    /// to `enabled_categories` and rewrites the instance buffer.
     satellites: Vec<Satellite>,
+    /// NORAD ids already in `satellites`. Used to dedupe `load_satellites`.
+    satellite_norad_ids: HashSet<u32>,
+    /// Categories the user has toggled on. Stations is on by
+    /// default; the others toggle via `set_category_enabled`.
+    enabled_categories: HashSet<Category>,
+    /// Render-budget cap. If the total number of enabled satellites
+    /// would exceed this, the lowest-priority enabled category is
+    /// suppressed at draw time + flagged via
+    /// `category_demoted(cat)`. Plan 0004 M2.
+    orbit_budget_cap: u32,
+    /// Category that's currently being suppressed by the budget
+    /// guard, if any. The UI reads this to grey out the pill.
+    orbit_demoted_category: Option<Category>,
     /// Plan 0004 M1 GPU resources: one shared pipeline + instance
     /// buffer + camera-uniform buffer for the orbit overlay.
     orbit_pipeline: wgpu::RenderPipeline,
@@ -689,6 +703,19 @@ impl Renderer {
             flyto: None,
             sim_clock,
             satellites: Vec::new(),
+            satellite_norad_ids: HashSet::new(),
+            enabled_categories: {
+                // Stations is on by default — that's the ISS-visible
+                // first-paint experience plan 0004 leads with.
+                let mut s = HashSet::new();
+                s.insert(Category::Stations);
+                s
+            },
+            // Budget: 12 000 satellites of mixed categories at
+            // ~500 ns per sgp4::propagate ≈ 6 ms of CPU per frame.
+            // Leaves room for the rest of the render budget.
+            orbit_budget_cap: 12_000,
+            orbit_demoted_category: None,
             orbit_pipeline,
             orbit_camera_buf,
             orbit_bind_group,
@@ -1309,36 +1336,115 @@ impl Renderer {
     // Plan 0004 — Live satellite-orbit overlay
     // ---------------------------------------------------------------------
 
-    /// Append satellites parsed from a TLE blob in `category`. Idempotent
-    /// across re-calls of the same TLE — the underlying SGP4 elements get
-    /// re-parsed but the renderer's `satellites` list grows monotonically.
-    /// Plan 0004 M2 adds deduplication by NORAD id.
+    /// Append satellites parsed from a TLE blob in `category`,
+    /// deduped against the existing catalog by NORAD id. The same
+    /// TLE loaded twice produces one entry. The second load updates
+    /// the existing entry's category if it changed.
     pub fn load_satellites(&mut self, category: Category, tle_text: &str) {
         let tles = orbit::parse_tles(tle_text);
-        let mut sats = orbit::satellites_from_tles(&tles, category);
+        let prepared = orbit::satellites_from_tles(&tles, category);
+        let mut added = 0;
+        let mut updated = 0;
+        for sat in prepared {
+            if self.satellite_norad_ids.contains(&sat.norad_id) {
+                // Already loaded under another category. Update the
+                // category in-place so an "is this Starlink" lookup
+                // reflects the most recent fetch.
+                if let Some(existing) = self
+                    .satellites
+                    .iter_mut()
+                    .find(|s| s.norad_id == sat.norad_id)
+                {
+                    existing.category = sat.category;
+                    updated += 1;
+                }
+            } else {
+                self.satellite_norad_ids.insert(sat.norad_id);
+                self.satellites.push(sat);
+                added += 1;
+            }
+        }
         log::info!(
-            "orbit: loaded {} satellites in category {:?} ({} TLEs parsed)",
-            sats.len(),
+            "orbit: category {:?} → {} added, {} updated; catalog now {}",
             category,
-            tles.len()
+            added,
+            updated,
+            self.satellites.len()
         );
-        self.satellites.append(&mut sats);
     }
 
-    /// Advance the simulation clock by the monotonic delta since the
-    /// last call, propagate every satellite to that time, and upload
-    /// the resulting instance buffer to the GPU. Cheap when the
-    /// satellite list is empty.
+    /// Toggle a category on or off. Off-categories stop propagating
+    /// and drawing immediately; the next `tick_orbit` reflects the
+    /// change.
+    pub fn set_category_enabled(&mut self, category: Category, enabled: bool) {
+        if enabled {
+            self.enabled_categories.insert(category);
+        } else {
+            self.enabled_categories.remove(&category);
+        }
+    }
+
+    /// Is this category currently rendering?
+    pub fn category_enabled(&self, category: Category) -> bool {
+        self.enabled_categories.contains(&category)
+    }
+
+    /// If the budget guard is currently suppressing a category,
+    /// returns it. UI uses this to grey out the demoted pill.
+    pub fn demoted_category(&self) -> Option<Category> {
+        self.orbit_demoted_category
+    }
+
+    /// Advance the simulation clock by the monotonic delta since
+    /// the last call, propagate every enabled satellite to that
+    /// time, apply the budget guard if the count exceeds the cap,
+    /// and upload the resulting instance buffer to the GPU.
     pub fn tick_orbit(&mut self, mono_now_s: f64) {
         self.sim_clock.step(mono_now_s);
         if self.satellites.is_empty() || self.active_body != BodyId::Earth {
             self.orbit_instance_count = 0;
+            self.orbit_demoted_category = None;
             return;
         }
         let sim_t = self.sim_clock.sim_unix_s();
+
+        // Apply the budget guard. Priority order (highest to lowest):
+        // Stations → GNSS → Weather → Starlink → Debris → Other.
+        // If the user enables more than the cap allows, suppress
+        // categories from the bottom of that list.
+        let priority: [Category; 6] = [
+            Category::Stations,
+            Category::Gnss,
+            Category::Weather,
+            Category::Starlink,
+            Category::Debris,
+            Category::Other,
+        ];
+        let mut allowed: HashSet<Category> = HashSet::new();
+        let mut running_count = 0u32;
+        let mut demoted: Option<Category> = None;
+        for cat in priority {
+            if !self.enabled_categories.contains(&cat) {
+                continue;
+            }
+            let cat_count = self.satellites.iter().filter(|s| s.category == cat).count() as u32;
+            if running_count + cat_count > self.orbit_budget_cap {
+                if demoted.is_none() {
+                    demoted = Some(cat);
+                }
+                continue;
+            }
+            allowed.insert(cat);
+            running_count += cat_count;
+        }
+        self.orbit_demoted_category = demoted;
+
         // Propagate into a local Vec, then upload.
-        let mut instances: Vec<OrbitInstance> = Vec::with_capacity(self.satellites.len());
+        let mut instances: Vec<OrbitInstance> = Vec::with_capacity(running_count as usize);
         for sat in &self.satellites {
+            if !allowed.contains(&sat.category) {
+                continue;
+            }
             let Some(pos) = orbit::propagate_render_space(sat, sim_t) else {
                 continue;
             };
