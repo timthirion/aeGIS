@@ -155,6 +155,11 @@
       user-select: none;
       color: #e6e8eb;
     }
+    /* Search is Earth-only for now (Photon/Nominatim only know
+       Earth places); the bar hides itself on the other bodies.
+       Toggled via the `data-body` attribute on <body> from
+       wireBodySwitcher. */
+    body:not([data-body="earth"]) #aegis-search { display: none; }
     #aegis-search input {
       appearance: none;
       width: 100%;
@@ -279,19 +284,24 @@
       const switcher = document.getElementById("aegis-body-switcher");
       if (!switcher) return;
       const buttons = Array.from(switcher.querySelectorAll("button"));
-      const syncPressed = (active) => {
+      const syncToBody = (active) => {
         buttons.forEach((b) =>
           b.setAttribute("aria-pressed", b.dataset.body === active ? "true" : "false"),
         );
+        // The CSS keys "hide the search bar on non-Earth bodies" off
+        // this attribute. Setting it on <body> lets a single
+        // selector govern the search bar's visibility without
+        // adding per-component show/hide JS.
+        document.body.setAttribute("data-body", active);
       };
       // Sync initial state from the renderer.
-      syncPressed(instance.body());
+      syncToBody(instance.body());
       switcher.addEventListener("click", (e) => {
         const btn = e.target.closest("button[data-body]");
         if (!btn) return;
         const body = btn.dataset.body;
         instance.setBody(body);
-        syncPressed(body);
+        syncToBody(body);
         // Body switch resets the basemap to the new body's default;
         // re-sync the basemap toggle so its pressed state matches.
         const basemapToggle = document.getElementById("basemap-toggle");

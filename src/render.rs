@@ -1558,12 +1558,17 @@ impl Renderer {
             pass.set_bind_group(0, &self.south_cap_bind_group, &[]);
             pass.draw(0..CAP_DRAW_VERTS, 0..1);
 
-            // Vector overlay on top of the basemap.
-            if let Some(vector) = &self.vector {
-                pass.set_pipeline(&self.vector_pipeline);
-                pass.set_bind_group(0, &self.vector_bind_group, &[]);
-                pass.set_vertex_buffer(0, vector.vertex_buf.slice(..));
-                pass.draw(0..vector.vertex_count, 0..1);
+            // Vector overlay (Natural Earth country outlines) — only
+            // makes sense on Earth. Mars / Moon / Middle-earth have
+            // no countries, and rendering the Earth-shaped outline
+            // over them would look wrong.
+            if self.active_body_ref().show_political_overlays {
+                if let Some(vector) = &self.vector {
+                    pass.set_pipeline(&self.vector_pipeline);
+                    pass.set_bind_group(0, &self.vector_bind_group, &[]);
+                    pass.set_vertex_buffer(0, vector.vertex_buf.slice(..));
+                    pass.draw(0..vector.vertex_count, 0..1);
+                }
             }
         }
         self.queue.submit(std::iter::once(encoder.finish()));
