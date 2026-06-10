@@ -162,14 +162,24 @@ struct OrbitInstance {
     color: [f32; 3],
 }
 
-/// Camera uniform for `orbit_trail.wgsl`. 96 bytes (matches the
-/// existing VectorCameraUniform shape; padded to 16-byte alignment).
+/// Camera uniform for `orbit_trail.wgsl`. 80 bytes. Per-trail
+/// colour now lives in the vertex attributes (one bright trail
+/// for the selected satellite, faint trails for other satellites
+/// in small categories — see `tick_orbit`).
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default, Pod, Zeroable)]
 struct OrbitTrailUniform {
     view_proj: [f32; 16],
     camera_pos: [f32; 3],
     _pad0: f32,
+}
+
+/// Per-vertex data for `orbit_trail.wgsl`. Position in render-space
+/// + linear-light RGBA. LineList pairs of these form one segment.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, Pod, Zeroable)]
+struct OrbitTrailVertex {
+    position: [f32; 3],
     color: [f32; 4],
 }
 
@@ -1438,6 +1448,17 @@ impl Renderer {
         self.enabled_categories.contains(&category)
     }
 
+    /// How many satellites in the catalog belong to this category.
+    /// Used by the web fallback path to detect when a category
+    /// fetch returned nothing and an `active`-group fallback is
+    /// warranted.
+    pub fn satellite_count_in(&self, category: Category) -> usize {
+        self.satellites
+            .iter()
+            .filter(|s| s.category == category)
+            .count()
+    }
+
     /// If the budget guard is currently suppressing a category,
     /// returns it. UI uses this to grey out the demoted pill.
     pub fn demoted_category(&self) -> Option<Category> {
@@ -1639,37 +1660,100 @@ impl Renderer {
         );
         self.orbit_instance_count = needed;
 
-        // Update the orbit-trail vertex buffer for the selected
-        // satellite. Plan 0004 M3.
+        // Update the orbit-trail vertex buffer (plan 0004 M3,
+        // refined): a faint trail for every satellite in a
+        // "small" enabled category (≤ TRAIL_CATEGORY_CAP — i.e.
+        // Stations, Weather, GNSS but not Starlink/Debris), plus
+        // a brighter trail for the selected satellite even if its
+        // category is large. LineList topology: each segment is
+        // a pair of consecutive samples → (N-1) × 2 vertices per
+        // trail.
+        const TRAIL_SAMPLES: usize = 128;
+        const TRAIL_CATEGORY_CAP: usize = 200;
+        let mut cat_counts: HashMap<Category, usize> = HashMap::new();
+        for sat in &self.satellites {
+            *cat_counts.entry(sat.category).or_insert(0) += 1;
+        }
+
+        let mut trail_verts: Vec<OrbitTrailVertex> = Vec::new();
+
+        // Faint trails for every small-category, allowed,
+        // not-selected satellite.
+        for sat in &self.satellites {
+            if !allowed.contains(&sat.category) {
+                continue;
+            }
+            if cat_counts.get(&sat.category).copied().unwrap_or(0) > TRAIL_CATEGORY_CAP {
+                continue;
+            }
+            if Some(sat.norad_id) == self.selected_satellite {
+                continue; // bright trail handled below
+            }
+            let [r, g, b] = sat.category.color_srgb8();
+            let color = [
+                srgb8_to_linear(r),
+                srgb8_to_linear(g),
+                srgb8_to_linear(b),
+                0.25,
+            ];
+            let points = sat.trail_points(sim_t, TRAIL_SAMPLES);
+            for window in points.windows(2) {
+                trail_verts.push(OrbitTrailVertex {
+                    position: window[0],
+                    color,
+                });
+                trail_verts.push(OrbitTrailVertex {
+                    position: window[1],
+                    color,
+                });
+            }
+        }
+
+        // Bright trail for the selected satellite (any category).
         if let Some(norad) = self.selected_satellite {
             if let Some(sat) = self.satellites.iter().find(|s| s.norad_id == norad) {
-                let points = sat.trail_points(sim_t, 128);
-                let n = points.len() as u32;
-                if n > self.orbit_trail_vertex_capacity {
-                    let new_cap = (n.next_power_of_two()).max(128);
-                    self.orbit_trail_vertex_buf =
-                        self.device.create_buffer(&wgpu::BufferDescriptor {
-                            label: Some("aegis-orbit-trail-verts"),
-                            size: (new_cap as u64) * 12,
-                            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                            mapped_at_creation: false,
+                if allowed.contains(&sat.category) {
+                    let [r, g, b] = sat.category.color_srgb8();
+                    let color = [
+                        srgb8_to_linear(r),
+                        srgb8_to_linear(g),
+                        srgb8_to_linear(b),
+                        0.85,
+                    ];
+                    let points = sat.trail_points(sim_t, TRAIL_SAMPLES);
+                    for window in points.windows(2) {
+                        trail_verts.push(OrbitTrailVertex {
+                            position: window[0],
+                            color,
                         });
-                    self.orbit_trail_vertex_capacity = new_cap;
+                        trail_verts.push(OrbitTrailVertex {
+                            position: window[1],
+                            color,
+                        });
+                    }
                 }
-                if n > 0 {
-                    self.queue.write_buffer(
-                        &self.orbit_trail_vertex_buf,
-                        0,
-                        bytemuck::cast_slice(&points),
-                    );
-                }
-                self.orbit_trail_vertex_count = n;
-            } else {
-                self.orbit_trail_vertex_count = 0;
             }
-        } else {
-            self.orbit_trail_vertex_count = 0;
         }
+
+        let n = trail_verts.len() as u32;
+        if n > self.orbit_trail_vertex_capacity {
+            let new_cap = (n.next_power_of_two()).max(256);
+            self.orbit_trail_vertex_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("aegis-orbit-trail-verts"),
+                size: (new_cap as u64) * (std::mem::size_of::<OrbitTrailVertex>() as u64),
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            self.orbit_trail_vertex_capacity = new_cap;
+        }
+        if n > 0 {
+            self.queue.write_buffer(
+                &self.orbit_trail_vertex_buf,
+                0,
+                bytemuck::cast_slice(&trail_verts),
+            );
+        }
+        self.orbit_trail_vertex_count = n;
     }
 
     /// Current simulation time in UNIX seconds (UTC).
@@ -1928,29 +2012,13 @@ impl Renderer {
         self.queue
             .write_buffer(&self.orbit_camera_buf, 0, bytemuck::bytes_of(&orbit_camera));
 
-        // Orbit trail uniform (plan 0004 M3). Colour comes from the
-        // selected satellite's category; trail draws at moderate
-        // alpha so it reads against any basemap.
-        let trail_color = if let Some(norad) = self.selected_satellite {
-            self.satellite_by_norad(norad)
-                .map(|s| {
-                    let [r, g, b] = s.category.color_srgb8();
-                    [
-                        srgb8_to_linear(r),
-                        srgb8_to_linear(g),
-                        srgb8_to_linear(b),
-                        0.7,
-                    ]
-                })
-                .unwrap_or([1.0, 1.0, 1.0, 0.7])
-        } else {
-            [1.0, 1.0, 1.0, 0.7]
-        };
+        // Orbit trail uniform (plan 0004 M3, refined). Trail
+        // colour now lives in per-vertex attributes, so the
+        // uniform is just view + camera position.
         let orbit_trail_uniform = OrbitTrailUniform {
             view_proj,
             camera_pos,
             _pad0: 0.0,
-            color: trail_color,
         };
         self.queue.write_buffer(
             &self.orbit_trail_uniform_buf,
@@ -2732,13 +2800,20 @@ fn build_orbit_trail_pipeline(
             module: &module,
             entry_point: Some("vs_main"),
             buffers: &[wgpu::VertexBufferLayout {
-                array_stride: 12,
+                array_stride: std::mem::size_of::<OrbitTrailVertex>() as u64,
                 step_mode: wgpu::VertexStepMode::Vertex,
-                attributes: &[wgpu::VertexAttribute {
-                    format: wgpu::VertexFormat::Float32x3,
-                    offset: 0,
-                    shader_location: 0,
-                }],
+                attributes: &[
+                    wgpu::VertexAttribute {
+                        format: wgpu::VertexFormat::Float32x3,
+                        offset: 0,
+                        shader_location: 0,
+                    },
+                    wgpu::VertexAttribute {
+                        format: wgpu::VertexFormat::Float32x4,
+                        offset: 12,
+                        shader_location: 1,
+                    },
+                ],
             }],
             compilation_options: Default::default(),
         },
@@ -2753,7 +2828,10 @@ fn build_orbit_trail_pipeline(
             compilation_options: Default::default(),
         }),
         primitive: wgpu::PrimitiveState {
-            topology: wgpu::PrimitiveTopology::LineStrip,
+            // LineList: pairs of consecutive vertices form a segment.
+            // Switched from LineStrip so we can pack multiple
+            // satellite trails into one buffer + one draw call.
+            topology: wgpu::PrimitiveTopology::LineList,
             strip_index_format: None,
             front_face: wgpu::FrontFace::Ccw,
             cull_mode: None,
@@ -2768,7 +2846,7 @@ fn build_orbit_trail_pipeline(
     });
     let vertex_buf = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("aegis-orbit-trail-verts"),
-        size: (initial_capacity as u64) * 12,
+        size: (initial_capacity as u64) * (std::mem::size_of::<OrbitTrailVertex>() as u64),
         usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });

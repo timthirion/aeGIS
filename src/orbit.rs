@@ -126,6 +126,17 @@ impl Satellite {
 /// blocks; missing names get a synthetic `"NORAD <id>"` label so
 /// no satellite ever loses its identity.
 pub fn parse_tles(text: &str) -> Vec<Tle> {
+    // Celestrak's `gp.php` rate-limits per-IP by GROUP: a repeat
+    // fetch within 2 hours gets a polite plain-text "GP data has
+    // not updated since your last successful download" body
+    // instead of TLE data. Detect this and return an empty Vec
+    // so the renderer's `load_satellites` no-ops gracefully
+    // (existing catalog stays intact; the toggle isn't broken,
+    // just the fresh data didn't arrive). Plan 0004 M2 follow-up.
+    if text.contains("GP data has not updated") {
+        log::info!("orbit: Celestrak rate-limited the TLE fetch; keeping existing catalog");
+        return Vec::new();
+    }
     // Collect once, walk by index — lets us peek at line1/line2
     // without consuming them when validation fails on a stray
     // "garbage" name line.

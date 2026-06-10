@@ -332,9 +332,18 @@ fn category_to_slug(cat: crate::orbit::Category) -> &'static str {
 }
 
 /// Spawn an async fetch for `category`'s Celestrak TLE group; on
-/// success, call `Renderer::load_satellites`. Idempotent under
-/// re-toggling — the renderer's dedup-by-NORAD-id ensures a second
-/// fetch doesn't double the catalog.
+/// success, call `Renderer::load_satellites`. The renderer's
+/// dedup-by-NORAD-id ensures a second fetch doesn't double-count.
+///
+/// Celestrak rate-limits per IP × GROUP with a 2-hour window: a
+/// repeat fetch returns a polite "GP data has not updated" body
+/// instead of TLEs. The parser handles that as a no-op, but the
+/// catalog would still be empty if this is the first toggle in
+/// the session. To stay useful, we fall back to the `active`
+/// group (a *different* cache entry, ~2 MB) and filter by name
+/// prefix — slower but reliable. v1 only does this for Starlink
+/// since that's the visible-payoff category that most users
+/// toggle.
 fn kickoff_category_fetch(inner: Rc<RefCell<Inner>>, category: crate::orbit::Category) {
     let group = match category {
         crate::orbit::Category::Stations => "stations",
@@ -345,17 +354,72 @@ fn kickoff_category_fetch(inner: Rc<RefCell<Inner>>, category: crate::orbit::Cat
         crate::orbit::Category::Other => return,
     };
     let url = format!("https://celestrak.org/NORAD/elements/gp.php?GROUP={group}&FORMAT=tle");
+    let name_prefix = match category {
+        crate::orbit::Category::Starlink => Some("STARLINK"),
+        _ => None,
+    };
     wasm_bindgen_futures::spawn_local(async move {
         match fetch_text(&url).await {
             Ok(tle_text) => {
+                let before = inner.borrow().renderer.satellite_count_in(category);
                 inner
                     .borrow_mut()
                     .renderer
                     .load_satellites(category, &tle_text);
+                let after = inner.borrow().renderer.satellite_count_in(category);
+                // No-op fetch + empty catalog → try `active` fallback.
+                if before == 0 && after == 0 {
+                    if let Some(prefix) = name_prefix {
+                        let active_url =
+                            "https://celestrak.org/NORAD/elements/gp.php?GROUP=active&FORMAT=tle";
+                        match fetch_text(active_url).await {
+                            Ok(active_text) => {
+                                let filtered = filter_tles_by_name_prefix(&active_text, prefix);
+                                log::info!(
+                                    "orbit: {} cache-locked, filtered {} chars from `active`",
+                                    group,
+                                    filtered.len()
+                                );
+                                inner
+                                    .borrow_mut()
+                                    .renderer
+                                    .load_satellites(category, &filtered);
+                            }
+                            Err(e) => log::warn!("fetch Celestrak active fallback: {e}"),
+                        }
+                    }
+                }
             }
             Err(e) => log::warn!("fetch Celestrak {group}: {e}"),
         }
     });
+}
+
+/// Filter a TLE text blob to 3-line records whose name (line 1)
+/// starts with `prefix` (case-sensitive). Used by the Starlink
+/// fallback path to extract STARLINK-named TLEs from the
+/// catch-all `active` group response.
+fn filter_tles_by_name_prefix(text: &str, prefix: &str) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut out = String::with_capacity(text.len() / 8);
+    let mut i = 0;
+    while i + 2 < lines.len() {
+        if lines[i].trim_start().starts_with(prefix)
+            && lines[i + 1].starts_with("1 ")
+            && lines[i + 2].starts_with("2 ")
+        {
+            out.push_str(lines[i]);
+            out.push('\n');
+            out.push_str(lines[i + 1]);
+            out.push('\n');
+            out.push_str(lines[i + 2]);
+            out.push('\n');
+            i += 3;
+        } else {
+            i += 1;
+        }
+    }
+    out
 }
 
 /// Attach an aeGIS renderer to the element with the given id. The host
