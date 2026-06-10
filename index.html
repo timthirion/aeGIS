@@ -261,6 +261,26 @@
       color: #8d97a3;
       font-size: 11px;
     }
+    /* Collapse / expand chevron. ▾ when expanded, ▸ when collapsed. */
+    #aegis-sat-panel header .collapse {
+      appearance: none;
+      border: none;
+      background: transparent;
+      color: #8d97a3;
+      cursor: pointer;
+      padding: 2px 4px;
+      font: 12px ui-monospace, SFMono-Regular, monospace;
+      line-height: 1;
+      transition: color 120ms;
+    }
+    #aegis-sat-panel header .collapse:hover { color: #e6e8eb; }
+    /* When collapsed, hide the filter input + the list. Header
+       stays visible so the user can still see the count, toggle
+       master visibility, and toggle trails without expanding. */
+    #aegis-sat-panel[data-collapsed="true"] input.filter,
+    #aegis-sat-panel[data-collapsed="true"] #aegis-sat-list {
+      display: none;
+    }
     #aegis-sat-panel header input[type="checkbox"] {
       margin: 0;
       width: 12px;
@@ -465,6 +485,13 @@
           <input type="checkbox" id="aegis-sat-trails" checked />
           Trails
         </label>
+        <button
+          type="button"
+          class="collapse"
+          id="aegis-sat-collapse"
+          title="Collapse / expand the list"
+          aria-label="Collapse / expand the list"
+        >▾</button>
       </header>
       <input
         type="text"
@@ -698,6 +725,32 @@
       trailsBox.checked = instance.trailsEnabled();
       trailsBox.addEventListener("change", (e) => {
         instance.setTrailsEnabled(e.target.checked);
+      });
+
+      // Collapse / expand chevron. State persists via sessionStorage
+      // so toggling categories doesn't auto-expand a panel the user
+      // collapsed to get the orbit view clean.
+      const collapseBtn = document.getElementById("aegis-sat-collapse");
+      const COLLAPSE_KEY = "aegis-sat-panel-collapsed";
+      const setCollapsed = (collapsed) => {
+        panel.setAttribute("data-collapsed", collapsed ? "true" : "false");
+        collapseBtn.textContent = collapsed ? "▸" : "▾";
+        try {
+          sessionStorage.setItem(COLLAPSE_KEY, collapsed ? "1" : "0");
+        } catch (_) {
+          /* sessionStorage can throw in privacy mode; ignore. */
+        }
+      };
+      let initialCollapsed = false;
+      try {
+        initialCollapsed = sessionStorage.getItem(COLLAPSE_KEY) === "1";
+      } catch (_) {
+        /* same */
+      }
+      setCollapsed(initialCollapsed);
+      collapseBtn.addEventListener("click", () => {
+        const next = panel.getAttribute("data-collapsed") !== "true";
+        setCollapsed(next);
       });
 
       // Per-row visibility checkbox — click anywhere in the
