@@ -54,8 +54,8 @@ globe view).
 
 See [`plans/README.md`](README.md) for the full convention. One
 `plans/NNNN-*.md` per concrete piece of work, zero-padded and
-globally incrementing (next free number: `0004`). Milestones use
-track prefixes (`MAP-`, `CRS-`, `FMT-`, `IDX-`, `UI-`) +
+globally incrementing (next free number: `0014`). Milestones use
+track prefixes (`MAP-`, `CRS-`, `FMT-`, `IDX-`, `UI-`, `RES-`) +
 semantic slugs.
 
 ## Phases
@@ -232,6 +232,42 @@ class concept — DEM-draped terrain (Phase 11+) would extend it.
   Mars + Moon basemaps from NASA Trek public-domain pyramids.
   Middle-earth slot ships as a procedural placeholder; canonical
   Tolkien-estate maps stay licensing-blocked. **Shipped 2026-06-09.**
+- [`0004-satellite-orbit-overlay.md`](0004-satellite-orbit-overlay.md) —
+  Live satellite-orbit overlay (Phase 10): Celestrak TLEs +
+  sgp4 propagation + instanced point cloud, orbit trails, hover-
+  to-identify by NORAD id.
+- [`0005-pmtiles-mvt.md`](0005-pmtiles-mvt.md) — PMTiles + MVT
+  vector basemap (Phase 4): single-file PMTiles range-request
+  reader, MVT decode + tessellation, Protomaps schema rendering.
+- [`0006-cog-raster.md`](0006-cog-raster.md) — Cloud-Optimized
+  GeoTIFF raster layer (Phase 5): COG range-request reader,
+  Sentinel-2 RGB composite over an AOI, CPU reprojection
+  (UTM → Mercator).
+- [`0007-spatial-index-identify.md`](0007-spatial-index-identify.md) —
+  Spatial index + click-to-identify (Phase 6): rstar R-tree,
+  ray-cast click → world coord, hit-test + bbox + nearest
+  queries through the widget API.
+- [`0008-atmospheric-scattering.md`](0008-atmospheric-scattering.md) —
+  Atmospheric scattering for the globe: O'Neil-style single-
+  scattering shell around Earth (+ thin Mars atmosphere) with
+  per-body parameters.
+- [`0009-solar-terminator.md`](0009-solar-terminator.md) —
+  Solar terminator + dawn/dusk gradient + Black Marble city
+  lights on Earth's night side.
+- [`0010-time-slider.md`](0010-time-slider.md) — Time slider +
+  animatable layers: global `SimClock` + `LayerTick` trait
+  consumed by 0004 (satellites) and 0009 (sun position).
+- [`0011-planetary-nomenclature.md`](0011-planetary-nomenclature.md) —
+  IAU planetary nomenclature search: bundled USGS gazetteer
+  for Mars + Moon; re-enables the search bar on non-Earth bodies.
+- [`0012-wgs84-ellipsoid.md`](0012-wgs84-ellipsoid.md) — WGS84
+  ellipsoidal upgrade: per-body ellipsoid parameters, vertex
+  projection lift from unit-sphere to ellipsoid, third-party
+  reference round-trips.
+- [`0013-webgpu-compute-spatial-joins.md`](0013-webgpu-compute-spatial-joins.md) —
+  WebGPU compute spatial joins (research spike): CPU rstar vs
+  GPU compute benchmark + findings doc with pre-committed ship
+  threshold. Will move to `research/R0001-*` on next touch.
 
 ## Done
 
