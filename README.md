@@ -127,13 +127,14 @@ responsible for honouring the chosen provider's terms. The defaults:
 - **Moon Mosaic** basemap → NASA Moon Trek LRO LROC WAC global
   mosaic. Public domain worldwide. Required credit:
   `Imagery: NASA / LRO LROC WAC`.
-- **Middle-earth** is a placeholder: the architectural slot
-  exists, but no tile imagery is bundled because canonical
-  Tolkien-estate maps are not under any open licence. The fallback
-  texture is a procedurally-generated stand-in (Apache-2.0 with
-  the rest of the repo); see [`data/middle-earth/README.md`](data/middle-earth/README.md).
-  Drop in CC-licensed Middle-earth-style tiles via the `Basemap`
-  shape in `src/body.rs` to wire a real basemap.
+A Middle-earth body was prototyped and removed. Canonical
+Tolkien-estate maps aren't under any open licence (fan-made
+derivatives are tolerated, not licensed), and the procedural
+placeholder we tried wasn't actually Middle-earth in any
+meaningful sense — see the module-level "Fictional worlds" note
+in [`src/body.rs`](src/body.rs). The `Body` architecture cleanly
+supports a fourth body once a genuinely open-licensed fictional-
+world basemap exists.
 
 ### Geocoder (search box)
 

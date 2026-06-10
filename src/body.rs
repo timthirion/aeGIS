@@ -17,15 +17,18 @@
 //! renderer reads through it. Adding a fifth body becomes "add a
 //! static" rather than "thread a new enum variant through six files."
 //!
-//! ### Middle-earth
+//! ### Fictional worlds (Middle-earth, etc.)
 //!
-//! Tolkien's estate aggressively enforces copyright on derivative
-//! Middle-earth maps; the published canonical maps are not under
-//! any open license. Plan 0003 reserves an architectural slot for
-//! Middle-earth but does not bundle tile imagery. A
-//! community-supplied Middle-earth basemap can be dropped in via
-//! the same `Basemap` shape the real bodies use; the README
-//! documents the contributor path.
+//! The `Body` shape supports a fictional world cleanly — drop a new
+//! static into this module and add it to `ALL_BODIES`. We considered
+//! shipping Middle-earth and removed it: the canonical Tolkien-estate
+//! maps aren't under any open licence (and fan-made derivatives are
+//! tolerated, not licensed), so any bundled imagery would violate
+//! the data-source policy in
+//! [memory `project-data-sources`](../../.claude/projects/-Users-tt-src-aegis/memory/project_data_sources.md).
+//! A genuinely CC-licensed fictional-world basemap (or a community
+//! self-hosted tile source) would slot in via the same `Basemap`
+//! definition Mars / Moon use.
 
 use crate::tile::CHICAGO_LONLAT;
 
@@ -36,11 +39,6 @@ pub enum BodyId {
     Earth,
     Mars,
     Moon,
-    /// Architectural slot for a fictional world. v1 ships a
-    /// placeholder fallback texture and a "drop your tiles here"
-    /// pointer; community tile sources can be wired in via the
-    /// same `Basemap` shape as the real bodies.
-    MiddleEarth,
 }
 
 /// Stable identifier for a basemap *within* a body. The string is
@@ -302,56 +300,15 @@ pub static MOON: Body = Body {
     show_political_overlays: false,
 };
 
-// --- Middle-earth (placeholder) -----------------------------------------
+// A Middle-earth body was prototyped in plan 0003 M4 as a procedural
+// placeholder and then removed: shipping it amounted to either (a) a
+// made-up texture that wasn't actually Middle-earth (dishonest), or
+// (b) bundling Tolkien-derived imagery without a real licence
+// (against the data-source policy). The architecture supports a
+// fourth body cleanly — see the module-level "Fictional worlds"
+// note for how to wire one in once an open-licensed source exists.
 
-const MIDDLE_EARTH_FALLBACK_BYTES: &[u8] =
-    include_bytes!("../data/middle-earth/middle_earth_2048x1024.jpg");
-
-const MIDDLE_EARTH_BASEMAPS: &[Basemap] = &[
-    Basemap {
-        id: BasemapId("placeholder"),
-        display_name: "Placeholder",
-        projection: TileProjection::Equirectangular,
-        // No real tile pyramid — the URL template points at a
-        // local pseudo-source. Tile fetches will 404 and fall
-        // through to retry-then-fail; the fallback texture is the
-        // only thing the user actually sees.
-        url_template: "/middle-earth-placeholder/{z}/{y}/{x}.jpg",
-        max_z: 0,
-        attribution_html: "Procedural placeholder. Not derived from Tolkien's canonical maps; see <code>data/middle-earth/README.md</code>.",
-        cap_colors: CapColors {
-            // Match the fallback's polar-ice tone so caps blend
-            // cleanly into the unprojected texture.
-            north: [220, 220, 230, 255],
-            south: [200, 200, 210, 255],
-        },
-    },
-];
-
-pub static MIDDLE_EARTH: Body = Body {
-    id: BodyId::MiddleEarth,
-    display_name: "Middle-earth",
-    icon: "🧙",
-    // Approximating from the Arda map scaling — Middle-earth is
-    // ~5400 km wide. Treating that as the equatorial radius gives
-    // the camera reasonable scale relative to Earth / Mars / Moon.
-    // The number doesn't influence rendering (we always treat the
-    // body as a unit sphere); kept here so future precision work
-    // has something honest to hand.
-    equatorial_radius_m: 5_400_000.0 / std::f64::consts::PI,
-    basemaps: MIDDLE_EARTH_BASEMAPS,
-    home: HomeView {
-        // Roughly centred on the placeholder's east continent — no
-        // canonical Middle-earth coordinate is honoured here.
-        lon: 60.0,
-        lat: 30.0,
-        zoom: 2.0,
-    },
-    fallback_texture: MIDDLE_EARTH_FALLBACK_BYTES,
-    show_political_overlays: false,
-};
-
-static ALL_BODIES: &[&Body] = &[&EARTH, &MARS, &MOON, &MIDDLE_EARTH];
+static ALL_BODIES: &[&Body] = &[&EARTH, &MARS, &MOON];
 
 /// All bodies the renderer can currently render. Used by the body-
 /// switcher UI to enumerate options.

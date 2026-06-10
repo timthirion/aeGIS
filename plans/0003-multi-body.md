@@ -332,18 +332,15 @@ re-renders the attribution panel.
 
 ## Open questions
 
-- **Middle-earth tile licensing.** Most fan-made Middle-earth
-  maps online are derivative works of Tolkien's estate IP,
-  operating under tolerance rather than a license you can rely
-  on. Realistic options: (a) ship the architecture in M4,
-  document the contributor path, but don't bundle a default
-  Middle-earth body; (b) commission or contribute a CC-licensed
-  Middle-earth-style map (large scope, separate plan); (c) point
-  at a non-Tolkien fictional world that does have clean
-  licensing (LotR-adjacent but not Tolkien, or one of the
-  CC-BY-SA worlds on r/imaginarymaps). **Recommended resolution:**
-  (a) for v1; revisit (b)/(c) as separate plans if there's
-  appetite.
+- **Middle-earth tile licensing — resolved 2026-06-09.** Prototyped
+  in M4 as a procedural placeholder (two PIL ellipses + blur, ~37
+  KB), shipped, and then **removed**: the placeholder was clearly
+  not actually Middle-earth, and bundling Tolkien-derived imagery
+  would violate the data-source policy. The `Body` architecture
+  still cleanly supports a fourth body — the module-level
+  "Fictional worlds" note in `src/body.rs` describes how to wire
+  one in once a genuinely CC-licensed fictional-world basemap
+  exists.
 - **Cache partitioning vs eviction on body switch.** Keying the
   cache by `(BodyId, BasemapId, TileId)` keeps Mars + Earth tiles
   resident across switches at the cost of GPU memory. Eviction

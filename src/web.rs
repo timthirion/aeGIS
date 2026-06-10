@@ -24,7 +24,6 @@ fn body_id_from_slug(slug: &str) -> Option<BodyId> {
         "earth" => Some(BodyId::Earth),
         "mars" => Some(BodyId::Mars),
         "moon" => Some(BodyId::Moon),
-        "middle-earth" => Some(BodyId::MiddleEarth),
         _ => None,
     }
 }
@@ -34,7 +33,6 @@ fn body_id_to_slug(id: BodyId) -> &'static str {
         BodyId::Earth => "earth",
         BodyId::Mars => "mars",
         BodyId::Moon => "moon",
-        BodyId::MiddleEarth => "middle-earth",
     }
 }
 
@@ -196,10 +194,8 @@ impl AegisInstance {
         }
     }
 
-    /// Switch the active body. Pass `"earth"`, `"mars"`, `"moon"`,
-    /// or `"middle-earth"`. Unknown values are silently ignored.
-    /// The page chrome listens for the basemap-toggle update event
-    /// after this fires (see the host page script).
+    /// Switch the active body. Pass `"earth"`, `"mars"`, or `"moon"`.
+    /// Unknown values are silently ignored.
     #[wasm_bindgen(js_name = setBody)]
     pub fn set_body(&self, slug: &str) {
         let Some(id) = body_id_from_slug(slug) else {
@@ -208,8 +204,7 @@ impl AegisInstance {
         self.inner.borrow_mut().renderer.set_body(id);
     }
 
-    /// Returns the active body as `"earth"` / `"mars"` / `"moon"` /
-    /// `"middle-earth"`.
+    /// Returns the active body as `"earth"` / `"mars"` / `"moon"`.
     #[wasm_bindgen(js_name = body)]
     pub fn body(&self) -> String {
         body_id_to_slug(self.inner.borrow().renderer.active_body_id()).into()
