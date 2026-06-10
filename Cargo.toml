@@ -39,6 +39,16 @@ regex = { version = "1", default-features = false, features = ["std", "perf", "u
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
+# SGP4 orbital propagation for the satellite overlay (plan 0004 M0).
+# Pure-Rust; works on wasm32. The de-facto reference Rust port of
+# the Vallado SGP4/SDP4 model.
+sgp4 = "2.4"
+
+# Date/time math for the TLE epoch → UNIX-seconds conversion in
+# `src/orbit.rs`. sgp4 already brings chrono in transitively; we
+# declare it here so the explicit use is honest.
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 winit = "0.29"
 pollster = "0.3"
