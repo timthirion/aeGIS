@@ -425,9 +425,16 @@ fn category_to_slug(cat: crate::orbit::Category) -> &'static str {
     }
 }
 
-/// Spawn an async fetch for `category`'s Celestrak TLE group; on
-/// success, call `Renderer::load_satellites`. The renderer's
-/// dedup-by-NORAD-id ensures a second fetch doesn't double-count.
+/// Spawn async fetches for `category`'s Celestrak TLE group(s);
+/// each success calls `Renderer::load_satellites`. The renderer
+/// dedups by NORAD id so the same object showing up in two groups
+/// doesn't get double-counted.
+///
+/// Most categories map to a single group, but `Debris` fans out
+/// across `active-debris` plus the four big breakup catalogs
+/// (Fengyun-1C ASAT 2007, Cosmos 2251 / Iridium 33 collision
+/// 2009, Russian ASAT 2021) to reach ~6500 tracked objects rather
+/// than the ~200 in `active-debris` alone.
 ///
 /// Celestrak rate-limits per IP × GROUP with a 2-hour window: a
 /// repeat fetch returns a polite "GP data has not updated" body
@@ -439,19 +446,39 @@ fn category_to_slug(cat: crate::orbit::Category) -> &'static str {
 /// since that's the visible-payoff category that most users
 /// toggle.
 fn kickoff_category_fetch(inner: Rc<RefCell<Inner>>, category: crate::orbit::Category) {
-    let group = match category {
-        crate::orbit::Category::Stations => "stations",
-        crate::orbit::Category::Starlink => "starlink",
-        crate::orbit::Category::Gnss => "gnss",
-        crate::orbit::Category::Weather => "weather",
-        crate::orbit::Category::Debris => "active-debris",
+    let groups: &[&'static str] = match category {
+        crate::orbit::Category::Stations => &["stations"],
+        crate::orbit::Category::Starlink => &["starlink"],
+        crate::orbit::Category::Gnss => &["gnss"],
+        crate::orbit::Category::Weather => &["weather"],
+        crate::orbit::Category::Debris => &[
+            "active-debris",
+            "fengyun-1c-debris",
+            "cosmos-2251-debris",
+            "iridium-33-debris",
+            "russian-asat-debris",
+        ],
         crate::orbit::Category::Other => return,
     };
-    let url = format!("https://celestrak.org/NORAD/elements/gp.php?GROUP={group}&FORMAT=tle");
     let name_prefix = match category {
         crate::orbit::Category::Starlink => Some("STARLINK"),
         _ => None,
     };
+    for group in groups {
+        kickoff_single_group(inner.clone(), category, group, name_prefix);
+    }
+}
+
+/// One spawn_local per Celestrak group. Factored out so the
+/// Debris category's five-group fanout reuses the same fetch +
+/// fallback logic without duplicating it.
+fn kickoff_single_group(
+    inner: Rc<RefCell<Inner>>,
+    category: crate::orbit::Category,
+    group: &'static str,
+    name_prefix: Option<&'static str>,
+) {
+    let url = format!("https://celestrak.org/NORAD/elements/gp.php?GROUP={group}&FORMAT=tle");
     wasm_bindgen_futures::spawn_local(async move {
         match fetch_text(&url).await {
             Ok(tle_text) => {

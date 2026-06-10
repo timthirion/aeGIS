@@ -363,6 +363,20 @@
       font-size: 11px;
       font-style: italic;
     }
+    /* Catalog-floor footnote that appears only when Debris is in
+       the active category set. Sits under the list, dim italic. */
+    #aegis-sat-panel .footnote {
+      display: none;
+      padding: 8px 12px;
+      border-top: 1px solid rgba(255, 255, 255, 0.05);
+      color: #8d97a3;
+      font-size: 10.5px;
+      font-style: italic;
+      line-height: 1.4;
+    }
+    #aegis-sat-panel[data-debris-active="true"]:not([data-collapsed="true"]) .footnote {
+      display: block;
+    }
     /* Earth-only — same gate as search + categories. */
     body:not([data-body="earth"]) #aegis-sat-panel { display: none; }
 
@@ -501,13 +515,17 @@
         autocomplete="off"
       />
       <div id="aegis-sat-list" role="listbox"></div>
+      <div class="footnote" id="aegis-sat-debris-note">
+        Tracked debris ≥10&nbsp;cm in LEO. Smaller pieces exist in
+        large numbers but aren't catalogued.
+      </div>
     </div>
     <div id="aegis-orbit-categories" role="group" aria-label="Satellite categories">
       <button type="button" data-cat="stations" aria-pressed="false" title="Stations (ISS, Tiangong)">Stations</button>
       <button type="button" data-cat="starlink" aria-pressed="false" title="Starlink (~6000 sats)">Starlink</button>
       <button type="button" data-cat="gnss" aria-pressed="false" title="GPS / GLONASS / Galileo / BeiDou">GNSS</button>
       <button type="button" data-cat="weather" aria-pressed="false" title="Weather + Earth-observation">Weather</button>
-      <button type="button" data-cat="debris" aria-pressed="false" title="Tracked orbital debris">Debris</button>
+      <button type="button" data-cat="debris" aria-pressed="false" title="Tracked orbital debris (active-debris + 4 big breakup catalogs, ~6500 objects ≥10 cm)">Debris</button>
     </div>
   </main>
   <footer>
@@ -652,6 +670,12 @@
 
       const renderList = () => {
         const enabled = enabledCategorySet();
+        // Footnote about the ~10 cm catalog floor — only when
+        // Debris is in the active category set.
+        panel.setAttribute(
+          "data-debris-active",
+          enabled.has("debris") ? "true" : "false",
+        );
         // No category enabled → hide the panel completely.
         if (enabled.size === 0) {
           panel.setAttribute("data-empty", "true");
