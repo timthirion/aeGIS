@@ -593,22 +593,24 @@
       };
 
       const masterBox = document.getElementById("aegis-sat-master");
-      // Currently-displayed rows' NORAD ids — used by the master
-      // checkbox to know which subset it acts on. Refreshed on
-      // every renderList().
-      let displayedNorads = [];
+      // Every NORAD id matching the active categories + name filter,
+      // *not* limited by the 500-row visual cap. Master visibility
+      // toggle acts on this full set so a user toggling Starlink
+      // off catches all 6000 dots, not just the first 500 rendered
+      // in the panel.
+      let filteredNorads = [];
 
       const updateMasterFromRows = () => {
-        if (displayedNorads.length === 0) {
+        if (filteredNorads.length === 0) {
           masterBox.checked = false;
           masterBox.indeterminate = false;
           return;
         }
         let visCount = 0;
-        for (const n of displayedNorads) {
+        for (const n of filteredNorads) {
           if (instance.satelliteVisible(n)) visCount++;
         }
-        if (visCount === displayedNorads.length) {
+        if (visCount === filteredNorads.length) {
           masterBox.checked = true;
           masterBox.indeterminate = false;
         } else if (visCount === 0) {
@@ -627,7 +629,7 @@
           panel.setAttribute("data-empty", "true");
           listEl.innerHTML = "";
           countEl.textContent = "0";
-          displayedNorads = [];
+          filteredNorads = [];
           updateMasterFromRows();
           return;
         }
@@ -638,9 +640,11 @@
         );
         countEl.textContent = String(filtered.length);
         panel.setAttribute("data-empty", "false");
+        // Track the *full* filtered set — master toggle acts on
+        // all of them, not just the rows currently rendered.
+        filteredNorads = filtered.map((s) => s.norad);
         const cap = 500;
         const shown = filtered.slice(0, cap);
-        displayedNorads = shown.map((s) => s.norad);
 
         const frag = document.createDocumentFragment();
         for (const s of shown) {
@@ -744,14 +748,17 @@
         }
       });
 
-      // Master visibility checkbox — applies to every currently-
-      // displayed row. Uses the comma-separated batch helper so
-      // 500 rows is one ffi call, not 500.
+      // Master visibility checkbox — applies to every satellite
+      // matching the active categories + filter, including the
+      // ones past the 500-row visual cap. One ffi call regardless
+      // of count (the CSV path on the Rust side handles 6000+).
       masterBox.addEventListener("change", () => {
-        if (displayedNorads.length === 0) return;
+        if (filteredNorads.length === 0) return;
         const next = masterBox.checked; // browser clears indeterminate on click
-        instance.setSatellitesVisible(displayedNorads.join(","), next);
-        // Sync per-row checkboxes + data-visible attribute.
+        instance.setSatellitesVisible(filteredNorads.join(","), next);
+        // Sync per-row checkboxes + data-visible attribute on the
+        // rendered (capped) rows — the rest aren't on screen so
+        // their DOM doesn't need updating.
         listEl.querySelectorAll(".row[data-norad]").forEach((row) => {
           const box = row.querySelector("input.vis");
           if (box) box.checked = next;

@@ -1756,6 +1756,30 @@ impl Renderer {
         );
         self.orbit_instance_count = needed;
 
+        // Extend the camera's zoom-out range when at least one
+        // satellite is visible — high-altitude orbits (GNSS ~3.2
+        // Earth radii, geostationary ~5.6) need a wider view than
+        // the default `MIN_ZOOM = 0.0` cap allows. When nothing
+        // satellite-related is on screen the cap reverts so the
+        // extra range isn't visible UX noise. -3.0 lets the camera
+        // pull back to D = 9 (geostationary visible with margin).
+        let extend_floor = self.orbit_instance_count > 0;
+        let target_floor = if extend_floor {
+            -3.0
+        } else {
+            crate::camera::MIN_ZOOM
+        };
+        if (self.camera.min_zoom - target_floor).abs() > 1e-9 {
+            self.camera.min_zoom = target_floor;
+            // Clamp the live zoom so re-hiding all satellites snaps
+            // us back inside the normal range instead of leaving
+            // the camera floating past z = 0 with no way to recover.
+            self.camera.zoom = self
+                .camera
+                .zoom
+                .clamp(target_floor, crate::camera::MAX_ZOOM);
+        }
+
         // Update the orbit-trail vertex buffer (plan 0004 M3,
         // refined): a faint trail for every satellite in a
         // "small" enabled category (≤ TRAIL_CATEGORY_CAP — i.e.

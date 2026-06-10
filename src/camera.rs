@@ -52,6 +52,14 @@ pub struct Camera {
     pub center_lonlat: (f64, f64),
     /// Fractional zoom — `pixels_per_world = TILE_PIXELS * 2^zoom`.
     pub zoom: f64,
+    /// Override of the default lower zoom bound. Defaults to
+    /// [`MIN_ZOOM`] (`0.0`); the renderer drops this to a negative
+    /// value when satellites are currently being rendered, so the
+    /// user can pull back far enough to see GNSS (~3.2 Earth radii
+    /// above surface) and geostationary (~5.6 Earth radii) orbits.
+    /// When all satellites are hidden / no category is enabled, it
+    /// resets to [`MIN_ZOOM`].
+    pub min_zoom: f64,
 }
 
 impl Camera {
@@ -60,6 +68,7 @@ impl Camera {
         Camera {
             center_lonlat: (lon, lat),
             zoom: zoom.clamp(MIN_ZOOM, MAX_ZOOM),
+            min_zoom: MIN_ZOOM,
         }
     }
 
@@ -125,6 +134,17 @@ impl Camera {
     pub fn altitude(&self, canvas: (u32, u32)) -> f64 {
         const FOV_Y_RAD: f64 = std::f64::consts::FRAC_PI_3; // 60°
         const ALTITUDE_CEIL: f64 = 2.0; // D ≤ 3 → globe subtends ~38°
+                                        // Below z=0 the camera pulls back linearly so the user
+                                        // can frame high-altitude orbits (GNSS, geostationary)
+                                        // when satellites are visible. 2 extra Earth radii per
+                                        // zoom step → z = −1 gives D = 5, z = −2 gives D = 7
+                                        // (GNSS visible), z = −3 gives D = 9 (geostationary).
+                                        // The default `min_zoom = 0.0` keeps this branch
+                                        // unreachable unless the renderer has explicitly lowered
+                                        // the bound.
+        if self.zoom < 0.0 {
+            return ALTITUDE_CEIL + (-self.zoom) * 2.0;
+        }
         let slippy = canvas.1 as f64 * std::f64::consts::PI
             / (256.0 * 2.0_f64.powf(self.zoom) * (FOV_Y_RAD * 0.5).tan());
         slippy.min(ALTITUDE_CEIL)
@@ -219,7 +239,7 @@ impl Camera {
     /// band as the slippy-map regime takes over.
     pub fn zoom_at(&mut self, delta: f64, cursor_px: (f64, f64), canvas_size_px: (u32, u32)) {
         let world_before = self.screen_to_world(cursor_px, canvas_size_px);
-        self.zoom = (self.zoom + delta).clamp(MIN_ZOOM, MAX_ZOOM);
+        self.zoom = (self.zoom + delta).clamp(self.min_zoom, MAX_ZOOM);
         let world_after = self.screen_to_world(cursor_px, canvas_size_px);
         // Shift the centre so `world_after` == `world_before`, scaled
         // by `(1 - globeness)` so the pinning fades out as the camera
