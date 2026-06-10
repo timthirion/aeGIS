@@ -564,30 +564,20 @@ pub async fn start(host_id: String) -> Result<AegisInstance, JsValue> {
     // list (the bundled ISS dedupes via NORAD id in plan 0004 M2;
     // for M1 it's an additive extra ISS entry that propagates to
     // the same point, harmless).
+    // Pre-load the bundled ISS TLE fixture so the Stations category
+    // has data immediately when the user toggles it on. No category
+    // is enabled by default — the satellite-list panel surfaces only
+    // when the user opts into at least one category. The live
+    // Celestrak fetch is deferred to the user's first toggle-on of
+    // Stations (handled by `kickoff_category_fetch`) — that way we
+    // don't burn Celestrak's per-IP rate limit on a fetch the user
+    // may never see.
     {
         const ISS_FIXTURE: &str = include_str!("../data/orbits/iss-fixture.txt");
-        let mut inner_mut = inner.borrow_mut();
-        inner_mut
+        inner
+            .borrow_mut()
             .renderer
             .load_satellites(crate::orbit::Category::Stations, ISS_FIXTURE);
-        // Auto-select the ISS so its orbit trail is visible on
-        // first paint. M4 will let the user pick a different one.
-        inner_mut.renderer.set_selected_satellite(Some(25544));
-    }
-    {
-        let inner_for_orbit = inner.clone();
-        wasm_bindgen_futures::spawn_local(async move {
-            let url = "https://celestrak.org/NORAD/elements/gp.php?GROUP=stations&FORMAT=tle";
-            match fetch_text(url).await {
-                Ok(tle_text) => {
-                    inner_for_orbit
-                        .borrow_mut()
-                        .renderer
-                        .load_satellites(crate::orbit::Category::Stations, &tle_text);
-                }
-                Err(e) => log::warn!("fetch Celestrak stations: {e}"),
-            }
-        });
     }
 
     // rAF loop — self-rescheduling closure.

@@ -769,13 +769,10 @@ impl Renderer {
             sim_clock,
             satellites: Vec::new(),
             satellite_norad_ids: HashSet::new(),
-            enabled_categories: {
-                // Stations is on by default — that's the ISS-visible
-                // first-paint experience plan 0004 leads with.
-                let mut s = HashSet::new();
-                s.insert(Category::Stations);
-                s
-            },
+            // Nothing enabled by default — the UI starts with an
+            // empty satellite-list panel hidden, just the category
+            // pill bar in the top-left. The user opts in.
+            enabled_categories: HashSet::new(),
             // Budget: 12 000 satellites of mixed categories at
             // ~500 ns per sgp4::propagate ≈ 6 ms of CPU per frame.
             // Leaves room for the rest of the render budget.
