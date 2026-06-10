@@ -1394,18 +1394,23 @@ impl Renderer {
         // other passes; the per-cap `pole_sign` and `color` are baked
         // into each buffer.
         //
-        // Cap colours come from the active basemap. Earth's Map
-        // basemap uses a stylised palette (Arctic blue + Antarctic
-        // cream); its Satellite basemap uses a realistic ice white
-        // because the Blue Marble equirectangular texture has
-        // degenerate UVs at the actual pole (every lat=±π/2 vertex
-        // collapses to one sphere point with varying lon-uv → the
-        // sampler interpolates over a degenerate triangle) and the
-        // cap covers that region. Mars / Moon basemaps pick their
-        // own colours via the same path.
+        // Cap colours: in Carto Map mode we keep the hand-picked
+        // stylised palette (Arctic blue + Antarctic cream) because
+        // there's no underlying imagery to match. Everywhere else
+        // we use the polar-row average of the body's fallback
+        // texture — that way the cap blends into the imagery
+        // instead of sitting on top as a distinct disc. The colour
+        // is computed once at body-load (`build_body_resources`).
         let basemap = self.active_basemap_ref();
-        let [nr, ng, nb, na] = basemap.cap_colors.north;
-        let [sr, sg, sb, sa] = basemap.cap_colors.south;
+        let (north_rgb8, south_rgb8) = if self.is_carto_map_mode() {
+            (basemap.cap_colors.north, basemap.cap_colors.south)
+        } else if let Some(res) = self.body_resources.get(&self.active_body) {
+            (res.north_polar_color, res.south_polar_color)
+        } else {
+            (basemap.cap_colors.north, basemap.cap_colors.south)
+        };
+        let [nr, ng, nb, na] = north_rgb8;
+        let [sr, sg, sb, sa] = south_rgb8;
         let north_cap_color = srgb8_to_linear_rgba(nr, ng, nb, na);
         let south_cap_color = srgb8_to_linear_rgba(sr, sg, sb, sa);
         let north_cap = CapUniform {
@@ -1780,6 +1785,38 @@ struct BodyResources {
     _sampler: wgpu::Sampler,
     camera_buf: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
+    /// Average sRGB8 colour across the fallback texture's top row
+    /// (lat = +90° in the equirectangular projection). The polar
+    /// cap reads this so its colour matches the imagery it covers
+    /// instead of a hand-picked guess.
+    north_polar_color: [u8; 4],
+    /// Same shape, bottom row (lat = -90°).
+    south_polar_color: [u8; 4],
+}
+
+/// Channel-wise average of one row of an RGBA8 texture. Used to
+/// derive cap colours from the fallback texture's polar rows so the
+/// cap blends into the surrounding imagery instead of standing out
+/// as a flat disc. Averaging in sRGB space slightly biases the
+/// result toward darker tones, but the cap region's brightness is
+/// already fairly uniform per body so the bias is invisible.
+fn average_row_rgba8(rgba: &[u8], width: u32, row_y: u32) -> [u8; 4] {
+    let stride = (width as usize) * 4;
+    let start = row_y as usize * stride;
+    let row = &rgba[start..start + stride];
+    let n = width as u64;
+    let mut sum = [0u64; 4];
+    for px in row.chunks_exact(4) {
+        for c in 0..4 {
+            sum[c] += px[c] as u64;
+        }
+    }
+    [
+        (sum[0] / n) as u8,
+        (sum[1] / n) as u8,
+        (sum[2] / n) as u8,
+        (sum[3] / n) as u8,
+    ]
 }
 
 fn build_body_resources(
@@ -1799,6 +1836,17 @@ fn build_body_resources(
         body.display_name,
         decoded.width,
         decoded.height
+    );
+
+    // Sample the polar rows for cap-colour derivation. Done before
+    // the GPU upload so we don't have to ferry the bytes back later.
+    let north_polar_color = average_row_rgba8(&decoded.rgba, decoded.width, 0);
+    let south_polar_color = average_row_rgba8(&decoded.rgba, decoded.width, decoded.height - 1);
+    log::info!(
+        "body fallback: {} polar averages — N {:?}, S {:?}",
+        body.display_name,
+        north_polar_color,
+        south_polar_color
     );
 
     let texture = device.create_texture(&wgpu::TextureDescriptor {
@@ -1878,6 +1926,8 @@ fn build_body_resources(
         _sampler: sampler,
         camera_buf,
         bind_group,
+        north_polar_color,
+        south_polar_color,
     }
 }
 
