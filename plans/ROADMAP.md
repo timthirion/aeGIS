@@ -235,7 +235,7 @@ class concept — DEM-draped terrain (Phase 11+) would extend it.
 - [`0004-satellite-orbit-overlay.md`](0004-satellite-orbit-overlay.md) —
   Live satellite-orbit overlay (Phase 10): Celestrak TLEs +
   sgp4 propagation + instanced point cloud, orbit trails, hover-
-  to-identify by NORAD id.
+  to-identify by NORAD id. **Shipped 2026-06-10.**
 - [`0005-pmtiles-mvt.md`](0005-pmtiles-mvt.md) — PMTiles + MVT
   vector basemap (Phase 4): single-file PMTiles range-request
   reader, MVT decode + tessellation, Protomaps schema rendering.

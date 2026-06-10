@@ -1,9 +1,10 @@
 # Live satellite-orbit overlay
 
-- **Status:** proposed
+- **Status:** done
 - **Last updated:** 2026-06-10
-- **Last touched on:** drafted during the post-multi-body planning
-  sweep; first item in the 0004–0013 batch
+- **Last touched on:** all five milestones (M0–M4) shipped in a
+  single focused session: `30b9bad` (M0), `ae7f73e` + `62d8c5e`
+  (M1), `99ee550` (M2), `58f73d7` (M3), `877bef4` (M4).
 
 ## Goal
 
@@ -162,66 +163,66 @@ Hover surfaces a tooltip; click selects + draws the trail.
 
 ### M0 — Math (MAP-orbit-math)
 
-- [ ] `src/orbit.rs` with `Tle`, `Satellite`, `Category`,
+- [x] `src/orbit.rs` with `Tle`, `Satellite`, `Category`,
       `parse_tles`, `satellites_from_tles`, `propagate`,
       `teme_to_ecef`, `gmst_from_unix`.
-- [ ] Unit test: a known ISS TLE propagates to the published
+- [x] Unit test: a known ISS TLE propagates to the published
       position (`{lat, lon, alt}` from celestrak.org's lookup
       page) within 1 km at the TLE epoch + 1 hour.
-- [ ] Unit test: `gmst_from_unix(2000-01-01T12:00:00Z)` matches
+- [x] Unit test: `gmst_from_unix(2000-01-01T12:00:00Z)` matches
       the IAU reference value within 1e-6 radians.
-- [ ] Unit test: round-trip `teme → ecef → lonlat` for the same
+- [x] Unit test: round-trip `teme → ecef → lonlat` for the same
       ISS position lands within 0.001° of the Celestrak lookup.
 
 ### M1 — Headless render (MAP-orbit-render)
 
-- [ ] `orbit.wgsl` shader + pipeline; instance buffer + per-frame
+- [x] `orbit.wgsl` shader + pipeline; instance buffer + per-frame
       rewrite.
-- [ ] `Renderer::load_satellites(category, tle_text)`: parse,
+- [x] `Renderer::load_satellites(category, tle_text)`: parse,
       prep, store. Called from the web fetcher.
-- [ ] Web entry point downloads `celestrak.org/NORAD/elements/
+- [x] Web entry point downloads `celestrak.org/NORAD/elements/
       gp.php?GROUP=stations&FORMAT=tle` (the ISS group, ~25 sats)
       at startup and feeds into `load_satellites`.
-- [ ] Camera at z=2 with the time-slider stopped: at least one
+- [x] Camera at z=2 with the time-slider stopped: at least one
       visible orbiting dot (the ISS). On native + web.
 
 ### M2 — Categories + filtering (UI-orbit-categories)
 
-- [ ] Categories tab in the bottom-left chrome (sibling of the
+- [x] Categories tab in the bottom-left chrome (sibling of the
       basemap toggle) — Stations / Starlink / GNSS / Weather /
       Debris pills.
-- [ ] Each category fetches its TLE group on first toggle-on,
+- [x] Each category fetches its TLE group on first toggle-on,
       caches in memory.
-- [ ] Render budget guard: if total visible satellites > 12 000,
+- [x] Render budget guard: if total visible satellites > 12 000,
       log a warning and skip propagation of the lowest-priority
       category until the count drops below 8 000.
-- [ ] Done-when: turning Starlink on drops ~6 000 dots into the
+- [x] Done-when: turning Starlink on drops ~6 000 dots into the
       view, all moving, total frame time stays under 16 ms on a
       M1 MacBook.
 
 ### M3 — Orbit trails (MAP-orbit-trails)
 
-- [ ] `Satellite::orbital_period_minutes()` from the TLE's mean
+- [x] `Satellite::orbital_period_minutes()` from the TLE's mean
       motion.
-- [ ] `Satellite::trail_points(now_unix, n=128)` returns a
+- [x] `Satellite::trail_points(now_unix, n=128)` returns a
       polyline of TEME positions sampled across one period.
-- [ ] Vector-pipeline draw call for the trail using a
+- [x] Vector-pipeline draw call for the trail using a
       satellite-specific colour. Trail follows the selected
       satellite (M4).
-- [ ] Done-when: selecting the ISS draws a sinusoidal ground
+- [x] Done-when: selecting the ISS draws a sinusoidal ground
       track visible from the globe view.
 
 ### M4 — Hover + click + identify (UI-orbit-identify)
 
-- [ ] Second colour attachment in the orbit pass: instance
+- [x] Second colour attachment in the orbit pass: instance
       index encoded as u32.
-- [ ] Native + web pointer handler reads the pick texture at the
+- [x] Native + web pointer handler reads the pick texture at the
       cursor position; debounced to one read per ~50 ms.
-- [ ] Hover tooltip surfaces `name + category + altitude (km)`
+- [x] Hover tooltip surfaces `name + category + altitude (km)`
       via a small DOM overlay (web) / logged (native).
-- [ ] Click: select satellite, kick off trail draw, surface
+- [x] Click: select satellite, kick off trail draw, surface
       details panel. Click on empty space: deselect.
-- [ ] Done-when: a user can hover any visible satellite and read
+- [x] Done-when: a user can hover any visible satellite and read
       its NORAD name in under one frame.
 
 ## Open questions
