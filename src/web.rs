@@ -258,6 +258,53 @@ impl AegisInstance {
             None => String::new(),
         }
     }
+
+    /// CPU-side hover/click hit-test against the satellite overlay.
+    /// `cursor_x` and `cursor_y` are in CSS pixels relative to the
+    /// canvas's top-left; this method converts to device pixels
+    /// internally using `devicePixelRatio`. Returns a JS object
+    /// `{ norad, name, category, altitudeKm, lon, lat }` for the
+    /// satellite under the cursor, or `null`. Plan 0004 M4.
+    #[wasm_bindgen(js_name = satelliteUnderCursor)]
+    pub fn satellite_under_cursor(&self, cursor_x: f64, cursor_y: f64) -> JsValue {
+        let dpr = web_window().device_pixel_ratio().max(1.0);
+        let cursor = (cursor_x * dpr, cursor_y * dpr);
+        let inner = self.inner.borrow();
+        let Some(norad) = inner.renderer.satellite_under_cursor(cursor) else {
+            return JsValue::NULL;
+        };
+        let Some(sat) = inner.renderer.satellite_by_norad(norad) else {
+            return JsValue::NULL;
+        };
+        // Resolve current position to get altitude + lonlat.
+        let sim_t = inner.renderer.sim_unix_s();
+        let Some(pos) = crate::orbit::propagate_render_space(sat, sim_t) else {
+            return JsValue::NULL;
+        };
+        let (lon, lat, alt_km) = crate::orbit::render_space_to_geodetic(pos);
+        let obj = js_sys::Object::new();
+        let _ = js_sys::Reflect::set(&obj, &"norad".into(), &(norad as f64).into());
+        let _ = js_sys::Reflect::set(&obj, &"name".into(), &sat.name.clone().into());
+        let _ = js_sys::Reflect::set(
+            &obj,
+            &"category".into(),
+            &category_to_slug(sat.category).into(),
+        );
+        let _ = js_sys::Reflect::set(&obj, &"altitudeKm".into(), &alt_km.into());
+        let _ = js_sys::Reflect::set(&obj, &"lon".into(), &lon.into());
+        let _ = js_sys::Reflect::set(&obj, &"lat".into(), &lat.into());
+        obj.into()
+    }
+
+    /// Set the selected satellite by NORAD id (or pass 0 to
+    /// clear). The renderer draws a trail for the selection.
+    #[wasm_bindgen(js_name = selectSatellite)]
+    pub fn select_satellite(&self, norad: u32) {
+        self.inner
+            .borrow_mut()
+            .renderer
+            .set_selected_satellite(if norad == 0 { None } else { Some(norad) });
+    }
 }
 
 fn category_from_slug(slug: &str) -> Option<crate::orbit::Category> {

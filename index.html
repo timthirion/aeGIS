@@ -176,6 +176,29 @@
     /* Hidden when not on Earth — same data-body gate the search uses. */
     body:not([data-body="earth"]) #aegis-orbit-categories { display: none; }
 
+    /* Satellite hover tooltip (plan 0004 M4). Floats near the
+       cursor, shows the hit satellite's name + altitude. Hidden
+       when there's nothing under the cursor. */
+    #aegis-sat-tooltip {
+      position: absolute;
+      pointer-events: none;
+      z-index: 11;
+      padding: 6px 10px;
+      background: rgba(11, 14, 18, 0.92);
+      border: 1px solid #2a3340;
+      border-radius: 6px;
+      color: #e6e8eb;
+      font: 12px/1.3 ui-sans-serif, system-ui, -apple-system, sans-serif;
+      box-shadow: 0 2px 12px rgba(0, 0, 0, 0.45);
+      transform: translate(12px, 12px);
+      display: none;
+    }
+    #aegis-sat-tooltip[data-visible="true"] { display: block; }
+    #aegis-sat-tooltip .sat-name { color: #e6e8eb; font-weight: 500; }
+    #aegis-sat-tooltip .sat-meta {
+      color: #8d97a3; font-size: 11px; margin-top: 2px;
+    }
+
     /* Top-centre search bar. Same chrome palette as the basemap
        toggle (panel background, border, blur). The input has no
        native border so it reads as a continuation of the chrome
@@ -279,6 +302,7 @@
       <button type="button" data-mode="map" aria-pressed="false">Map</button>
       <button type="button" data-mode="satellite" aria-pressed="true">Satellite</button>
     </div>
+    <div id="aegis-sat-tooltip" role="status" aria-live="polite"></div>
     <div id="aegis-orbit-categories" role="group" aria-label="Satellite categories">
       <button type="button" data-cat="stations" aria-pressed="true" title="Stations (ISS, Tiangong)">Stations</button>
       <button type="button" data-cat="starlink" aria-pressed="false" title="Starlink (~6000 sats)">Starlink</button>
@@ -318,6 +342,7 @@
         wireBasemapToggle(aegis);
         wireBodySwitcher(aegis);
         wireOrbitCategories(aegis);
+        wireSatTooltip(aegis);
       } catch (e) {
         console.error("aegis start failed", e);
         const host = document.getElementById("aegis-host");
@@ -359,6 +384,55 @@
           basemapToggle.querySelectorAll("button").forEach((b) =>
             b.setAttribute("aria-pressed", b.dataset.mode === current ? "true" : "false"),
           );
+        }
+      });
+    }
+
+    function wireSatTooltip(instance) {
+      const tooltip = document.getElementById("aegis-sat-tooltip");
+      const host = document.getElementById("aegis-host");
+      if (!tooltip || !host) return;
+
+      const fmt = (n) => Number(n).toFixed(2);
+      const setTooltip = (info, evt) => {
+        if (!info) {
+          tooltip.setAttribute("data-visible", "false");
+          return;
+        }
+        const ns = info.lat >= 0 ? "N" : "S";
+        const ew = info.lon >= 0 ? "E" : "W";
+        tooltip.innerHTML =
+          `<div class="sat-name">${info.name} · ${info.norad}</div>` +
+          `<div class="sat-meta">${info.category} · ${fmt(info.altitudeKm)} km · ` +
+          `${fmt(Math.abs(info.lat))}°${ns}, ${fmt(Math.abs(info.lon))}°${ew}</div>`;
+        // Position relative to host element.
+        const rect = host.getBoundingClientRect();
+        tooltip.style.left = `${evt.clientX - rect.left}px`;
+        tooltip.style.top = `${evt.clientY - rect.top}px`;
+        tooltip.setAttribute("data-visible", "true");
+      };
+
+      host.addEventListener("pointermove", (e) => {
+        // Body-body gate: only Earth has satellites.
+        if (instance.body() !== "earth") {
+          setTooltip(null, e);
+          return;
+        }
+        const rect = host.getBoundingClientRect();
+        const cx = e.clientX - rect.left;
+        const cy = e.clientY - rect.top;
+        const info = instance.satelliteUnderCursor(cx, cy);
+        setTooltip(info, e);
+      });
+      host.addEventListener("pointerleave", (e) => setTooltip(null, e));
+      host.addEventListener("click", (e) => {
+        if (instance.body() !== "earth") return;
+        const rect = host.getBoundingClientRect();
+        const cx = e.clientX - rect.left;
+        const cy = e.clientY - rect.top;
+        const info = instance.satelliteUnderCursor(cx, cy);
+        if (info) {
+          instance.selectSatellite(info.norad);
         }
       });
     }

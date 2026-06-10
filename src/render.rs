@@ -422,6 +422,12 @@ pub struct Renderer {
     /// its trail drawn). Auto-populated to the ISS at startup;
     /// plan 0004 M4 wires interactive selection.
     selected_satellite: Option<u32>,
+    /// Cache of `(norad_id, render_space_position)` populated each
+    /// frame by `tick_orbit`. `satellite_under_cursor` projects
+    /// each cached position through the current `view_proj` for
+    /// CPU-side hit-testing — simpler than GPU pick-texture
+    /// readback, and at <1 ms for 10k satellites it's fast enough.
+    orbit_frame_positions: Vec<(u32, [f32; 3])>,
 }
 
 impl Renderer {
@@ -764,6 +770,7 @@ impl Renderer {
             orbit_trail_vertex_capacity: 1,
             orbit_trail_vertex_count: 0,
             selected_satellite: None,
+            orbit_frame_positions: Vec::new(),
         }
     }
 
@@ -1458,6 +1465,96 @@ impl Renderer {
         self.satellites.iter().find(|s| s.norad_id == norad)
     }
 
+    /// CPU-side hit-test: returns the NORAD id of the satellite
+    /// drawn nearest to the cursor (within a small pick radius),
+    /// or `None`. Cursor coords are in **device pixels** (matching
+    /// the canvas backing size). Plan 0004 M4.
+    ///
+    /// Implementation: project each frame-cached satellite position
+    /// through `view_proj`, convert clip → screen pixels, and
+    /// pick the closest within a tolerance. Skip satellites
+    /// occluded by Earth (same camera-ray test the shader does).
+    pub fn satellite_under_cursor(&self, cursor_px: (f64, f64)) -> Option<u32> {
+        if self.orbit_frame_positions.is_empty() {
+            return None;
+        }
+        let canvas = self.size();
+        let view_proj = self.camera.view_projection_matrix(canvas);
+        let camera_pos_3d = self.camera.camera_3d_position(canvas);
+        let cam = [
+            camera_pos_3d[0] as f64,
+            camera_pos_3d[1] as f64,
+            camera_pos_3d[2] as f64,
+        ];
+
+        // Pick radius in device pixels. Matches the orbit shader's
+        // POINT_SIZE_PX (5) with a touch of slack so the user
+        // doesn't have to land the cursor pixel-perfectly.
+        const PICK_RADIUS_PX: f64 = 10.0;
+        let pick_r2 = PICK_RADIUS_PX * PICK_RADIUS_PX;
+
+        let canvas_w = canvas.0 as f64;
+        let canvas_h = canvas.1 as f64;
+
+        let mut best: Option<(u32, f64)> = None;
+        for &(norad, pos) in &self.orbit_frame_positions {
+            // Earth-occlusion test (same logic as orbit.wgsl).
+            let p = [pos[0] as f64, pos[1] as f64, pos[2] as f64];
+            let seg = [p[0] - cam[0], p[1] - cam[1], p[2] - cam[2]];
+            let seg_len2 = seg[0] * seg[0] + seg[1] * seg[1] + seg[2] * seg[2];
+            let seg_len = seg_len2.sqrt();
+            if seg_len < 1e-9 {
+                continue;
+            }
+            let d = [seg[0] / seg_len, seg[1] / seg_len, seg[2] / seg_len];
+            let t_star = -(cam[0] * d[0] + cam[1] * d[1] + cam[2] * d[2]);
+            let min_dist2 = if t_star < 0.0 {
+                cam[0] * cam[0] + cam[1] * cam[1] + cam[2] * cam[2]
+            } else if t_star > seg_len {
+                p[0] * p[0] + p[1] * p[1] + p[2] * p[2]
+            } else {
+                cam[0] * cam[0] + cam[1] * cam[1] + cam[2] * cam[2] - t_star * t_star
+            };
+            if min_dist2 < 1.0 {
+                continue; // occluded by Earth
+            }
+
+            // Project through view_proj (column-major mat4 ×
+            // vec4(pos, 1.0)).
+            let m = &view_proj;
+            let x =
+                (m[0] as f64) * p[0] + (m[4] as f64) * p[1] + (m[8] as f64) * p[2] + (m[12] as f64);
+            let y =
+                (m[1] as f64) * p[0] + (m[5] as f64) * p[1] + (m[9] as f64) * p[2] + (m[13] as f64);
+            let _z = (m[2] as f64) * p[0]
+                + (m[6] as f64) * p[1]
+                + (m[10] as f64) * p[2]
+                + (m[14] as f64);
+            let w = (m[3] as f64) * p[0]
+                + (m[7] as f64) * p[1]
+                + (m[11] as f64) * p[2]
+                + (m[15] as f64);
+            if w <= 1e-9 {
+                continue; // behind / on the camera plane
+            }
+            let ndc_x = x / w;
+            let ndc_y = y / w;
+            // NDC → screen pixels. NDC y is up; screen y is down.
+            let sx = (ndc_x * 0.5 + 0.5) * canvas_w;
+            let sy = (1.0 - (ndc_y * 0.5 + 0.5)) * canvas_h;
+            let dx = sx - cursor_px.0;
+            let dy = sy - cursor_px.1;
+            let r2 = dx * dx + dy * dy;
+            if r2 > pick_r2 {
+                continue;
+            }
+            if best.is_none_or(|(_, b)| r2 < b) {
+                best = Some((norad, r2));
+            }
+        }
+        best.map(|(n, _)| n)
+    }
+
     /// Advance the simulation clock by the monotonic delta since
     /// the last call, propagate every enabled satellite to that
     /// time, apply the budget guard if the count exceeds the cap,
@@ -1502,8 +1599,12 @@ impl Renderer {
         }
         self.orbit_demoted_category = demoted;
 
-        // Propagate into a local Vec, then upload.
+        // Propagate into a local Vec, then upload. Also record
+        // (norad, position) into `orbit_frame_positions` for
+        // CPU-side hit-testing in `satellite_under_cursor`.
         let mut instances: Vec<OrbitInstance> = Vec::with_capacity(running_count as usize);
+        self.orbit_frame_positions.clear();
+        self.orbit_frame_positions.reserve(running_count as usize);
         for sat in &self.satellites {
             if !allowed.contains(&sat.category) {
                 continue;
@@ -1516,6 +1617,7 @@ impl Renderer {
                 world_pos: pos,
                 color: [srgb8_to_linear(r), srgb8_to_linear(g), srgb8_to_linear(b)],
             });
+            self.orbit_frame_positions.push((sat.norad_id, pos));
         }
         let needed = instances.len() as u32;
         if needed > self.orbit_instance_capacity {
