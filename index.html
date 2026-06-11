@@ -452,6 +452,70 @@
       margin-top: 2px;
     }
 
+    /* Attribution overlay (foundation M4). Bottom-right chip pops
+       a panel listing all credits — active body+basemap (dynamic),
+       Earth-only sources gated on body, plus the always-on search
+       backend + project repo. Body/basemap-awareness keeps the
+       panel honest as the user toggles. */
+    #aegis-attribution {
+      position: absolute;
+      right: 16px;
+      bottom: 16px;
+      z-index: 10;
+      font: 11px/1.35 ui-sans-serif, system-ui, -apple-system, sans-serif;
+      user-select: none;
+    }
+    #aegis-attribution .toggle {
+      appearance: none;
+      border: 1px solid #1d232b;
+      background: rgba(11, 14, 18, 0.78);
+      color: #8d97a3;
+      padding: 4px 12px;
+      border-radius: 999px;
+      cursor: pointer;
+      backdrop-filter: blur(6px);
+      -webkit-backdrop-filter: blur(6px);
+      box-shadow: 0 2px 12px rgba(0, 0, 0, 0.35);
+      font: inherit;
+      letter-spacing: 0.02em;
+      transition: color 120ms;
+    }
+    #aegis-attribution .toggle:hover { color: #e6e8eb; }
+    #aegis-attribution .panel {
+      display: none;
+      position: absolute;
+      right: 0;
+      bottom: 30px;
+      width: 320px;
+      max-height: 60vh;
+      overflow-y: auto;
+      background: rgba(11, 14, 18, 0.94);
+      border: 1px solid #2a3340;
+      border-radius: 8px;
+      padding: 10px 14px 12px;
+      color: #c0c8d4;
+      box-shadow: 0 4px 16px rgba(0, 0, 0, 0.5);
+      backdrop-filter: blur(8px);
+      -webkit-backdrop-filter: blur(8px);
+    }
+    #aegis-attribution[data-open="true"] .panel { display: block; }
+    #aegis-attribution .panel a {
+      color: #d4dae3;
+      text-decoration: underline;
+      text-decoration-color: rgba(212, 218, 227, 0.4);
+    }
+    #aegis-attribution .panel a:hover { text-decoration-color: #e6e8eb; }
+    #aegis-attribution .panel h4 {
+      margin: 10px 0 3px;
+      font: 500 10px/1 ui-sans-serif, system-ui, sans-serif;
+      color: #8d97a3;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+    }
+    #aegis-attribution .panel h4:first-child { margin-top: 0; }
+    #aegis-attribution .panel section { display: none; }
+    #aegis-attribution .panel section[data-active="true"] { display: block; }
+
     footer {
       border-top: 1px solid #1d232b;
       font-size: 12px;
@@ -531,18 +595,47 @@
       <button type="button" data-cat="weather" aria-pressed="false" title="Weather + Earth-observation">Weather</button>
       <button type="button" data-cat="debris" aria-pressed="false" title="Tracked orbital debris (active-debris + 4 big breakup catalogs, ~6500 objects ≥10 cm)">Debris</button>
     </div>
+    <div id="aegis-attribution" data-open="false">
+      <button
+        type="button"
+        class="toggle"
+        id="aegis-attribution-toggle"
+        aria-haspopup="dialog"
+        aria-expanded="false"
+        title="Data sources & licenses"
+      >Sources</button>
+      <div class="panel" role="dialog" aria-label="Data sources">
+        <section data-context="basemap" data-active="true">
+          <h4>Basemap</h4>
+          <div id="aegis-attr-basemap"></div>
+        </section>
+        <section data-context="earth-texture" data-active="false">
+          <h4>Earth texture (fallback)</h4>
+          <div>NASA <a href="https://visibleearth.nasa.gov/collection/1484/blue-marble">Visible Earth — Blue Marble</a> (public domain)</div>
+        </section>
+        <section data-context="earth-outlines" data-active="false">
+          <h4>Country outlines</h4>
+          <div><a href="https://www.naturalearthdata.com/about/terms-of-use/">Natural Earth</a> 110m (public domain)</div>
+        </section>
+        <section data-context="earth-satellites" data-active="false">
+          <h4>Satellite catalog</h4>
+          <div><a href="https://celestrak.org/">Celestrak</a> TLE / GP element sets (public domain)</div>
+        </section>
+        <section data-context="search" data-active="true">
+          <h4>Place search</h4>
+          <div><a href="https://photon.komoot.io/">Photon</a> by komoot, on <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> data (ODbL)</div>
+        </section>
+        <section data-context="project" data-active="true">
+          <h4>aeGIS</h4>
+          <div><a href="https://github.com/timthirion/aeGIS">github.com/timthirion/aeGIS</a> — open source</div>
+        </section>
+      </div>
+    </div>
   </main>
   <footer>
     <span>aeGIS · Open-source GIS in Rust + WebGPU</span>
     &nbsp;·&nbsp;
     <a href="https://github.com/timthirion/aeGIS">github.com/timthirion/aeGIS</a>
-    &nbsp;·&nbsp;
-    Map © <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors,
-    © <a href="https://carto.com/attributions">CARTO</a>
-    &nbsp;·&nbsp;
-    Satellite: Source:
-    <a href="https://www.esri.com/en-us/legal/copyright-trademarks">Esri</a>,
-    Maxar, Earthstar Geographics, and the GIS User Community
   </footer>
   <script type="module">
     import init, { start, version } from "./pkg/aegis.js";
@@ -566,6 +659,7 @@
         wireOrbitCategories(aegis);
         wireSatTooltip(aegis);
         wireSatPanel(aegis);
+        wireAttribution(aegis);
       } catch (e) {
         console.error("aegis start failed", e);
         const host = document.getElementById("aegis-host");
@@ -1055,6 +1149,61 @@
         buttons.forEach((b) =>
           b.setAttribute("aria-pressed", b.dataset.mode === mode ? "true" : "false"),
         );
+      });
+    }
+
+    // Attribution overlay (foundation M4). Click the bottom-right
+    // "Sources" chip to open a panel listing every active credit.
+    // The basemap line is pulled live from the Rust side so it
+    // reflects whichever body + basemap the user has selected;
+    // Earth-only sections (Blue Marble, Natural Earth, Celestrak)
+    // hide on Mars / Moon. The chip itself is always visible —
+    // open-data attribution is a baseline obligation, not a per-
+    // body opt-in.
+    function wireAttribution(instance) {
+      const root = document.getElementById("aegis-attribution");
+      if (!root) return;
+      const toggle = document.getElementById("aegis-attribution-toggle");
+      const basemapEl = document.getElementById("aegis-attr-basemap");
+
+      const refresh = () => {
+        basemapEl.innerHTML = instance.basemapAttributionHtml();
+        const onEarth = instance.body() === "earth";
+        root
+          .querySelectorAll(
+            'section[data-context="earth-texture"], ' +
+            'section[data-context="earth-outlines"], ' +
+            'section[data-context="earth-satellites"]',
+          )
+          .forEach((s) => {
+            s.setAttribute("data-active", onEarth ? "true" : "false");
+          });
+      };
+      refresh();
+      // Cheap poll — refreshes any state that the body switcher /
+      // basemap toggle / category buttons could've changed without
+      // having to thread a refresh callback through each of them.
+      setInterval(refresh, 1000);
+
+      const setOpen = (open) => {
+        root.setAttribute("data-open", open ? "true" : "false");
+        toggle.setAttribute("aria-expanded", open ? "true" : "false");
+      };
+      toggle.addEventListener("click", (e) => {
+        e.stopPropagation();
+        setOpen(root.getAttribute("data-open") !== "true");
+      });
+      // Click outside the panel closes it.
+      document.addEventListener("click", (e) => {
+        if (!root.contains(e.target) && root.getAttribute("data-open") === "true") {
+          setOpen(false);
+        }
+      });
+      // Escape also closes.
+      document.addEventListener("keydown", (e) => {
+        if (e.key === "Escape" && root.getAttribute("data-open") === "true") {
+          setOpen(false);
+        }
       });
     }
     main();

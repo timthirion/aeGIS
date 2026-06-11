@@ -1250,6 +1250,15 @@ impl Renderer {
         BasemapMode::from_basemap_id(self.active_basemap)
     }
 
+    /// HTML credit string for the currently active body + basemap,
+    /// pulled from `Basemap::attribution_html` in `body.rs`. Consumed
+    /// by the JS attribution overlay (foundation M4) so the panel
+    /// reflects the live source whenever the user switches body or
+    /// toggles Map ↔ Satellite.
+    pub fn active_basemap_attribution_html(&self) -> &'static str {
+        self.active_basemap_ref().attribution_html
+    }
+
     /// Switch the basemap on the active body. Calling with the
     /// current basemap is a no-op. When switching **to** Satellite
     /// we skip the dwell wait and dispatch the visible-tile fetch

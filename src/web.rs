@@ -220,6 +220,20 @@ impl AegisInstance {
         }
     }
 
+    /// HTML credit line for the body + basemap currently rendered.
+    /// Sourced from `Basemap::attribution_html` in `body.rs` so the
+    /// attribution overlay refreshes whenever the user toggles
+    /// Earth Map ↔ Satellite, Mars Color ↔ Terrain, or switches
+    /// body altogether. Foundation M4.
+    #[wasm_bindgen(js_name = basemapAttributionHtml)]
+    pub fn basemap_attribution_html(&self) -> String {
+        self.inner
+            .borrow()
+            .renderer
+            .active_basemap_attribution_html()
+            .to_string()
+    }
+
     /// Toggle a satellite category on/off. Recognised slugs:
     /// `"stations"`, `"starlink"`, `"gnss"`, `"weather"`,
     /// `"debris"`. Unknown slugs are silently ignored. Plan 0004 M2.
