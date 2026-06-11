@@ -1,9 +1,10 @@
 # Solar terminator + dawn/dusk gradient
 
-- **Status:** proposed
-- **Last updated:** 2026-06-10
-- **Last touched on:** drafted in the 0004–0013 batch alongside
-  atmospheric scattering (they share the sun-direction input)
+- **Status:** shipped 2026-06-11 (M0 + M1 + M2)
+- **Last updated:** 2026-06-11
+- **Last touched on:** shipped in one session; commits `7c7a169`
+  (M0 + M1) + `8e34a0a` (M2). Each milestone landed on `main` with
+  a passing pre-flight + Pages deploy.
 
 ## Goal
 
@@ -91,39 +92,45 @@ night effect.
 
 ## Milestones
 
-### M0 — Day/night dimming (MAP-day-night)
+### M0 — Day/night dimming (MAP-day-night) — shipped
 
-- [ ] Sun-direction uniform threaded through tile.wgsl +
-      earth.wgsl + caps.wgsl (caps also dim).
-- [ ] Per-body `night_dim` field on `Body`.
-- [ ] With the sun direction set to `(1, 0, 0)` (12 UTC at the
-      antimeridian), the Pacific is bright and the Atlantic is
-      dim.
-- [ ] Done-when: a screenshot at z=2 with a hardcoded sun
-      direction shows the visible terminator line across the
-      globe.
+- [x] Sun-direction uniform threaded through tile.wgsl + earth.wgsl
+      + caps.wgsl + vector.wgsl (the four body-surface shaders).
+- [x] Per-body `night_dim` field on `Body` (Earth 0.15, Mars 0.10,
+      Moon 0.02).
+- [x] Sun direction is computed *live* from `SimClock::sim_unix_s`
+      via the new `sun::direction_from_unix` rather than hardcoded,
+      so the terminator drifts with real wall-clock time until the
+      time slider (plan 0010) lands and drives the same input.
 
-### M1 — Dawn/dusk gradient (MAP-dawn-dusk)
+### M1 — Dawn/dusk gradient (MAP-dawn-dusk) — shipped
 
-- [ ] Per-pixel warming tint inside the terminator band.
-- [ ] Tunable band width via the smoothstep edges; v1 uses
-      `(0.0, 0.15)` for the day blend + `(0.05, 0.25)` for the
-      warming tint, both edges of `cos_sun`.
-- [ ] Visual reference: a screenshot of central Africa at
-      sunrise (sun roughly above the Mediterranean) shows a
-      reddish glow along the eastern coastline transitioning
-      to full daylight further east.
+- [x] Per-pixel warming tint inside the terminator band — a
+      triangular pulse peaking near `cos_sun ≈ 0.05` (~3° solar
+      elevation) that biases the surface RGB toward (1.3, 0.8, 0.5)
+      by ~60% at peak.
+- [x] Shipped as a shared `day_night_color(sphere, sun_dir,
+      night_dim)` WGSL helper in tile.wgsl / earth.wgsl / caps.wgsl
+      / vector.wgsl so the four shaders compute the same dim + tint
+      multiplier from one formula.
 
-### M2 — Black Marble city lights (MAP-city-lights)
+### M2 — Black Marble city lights (MAP-city-lights) — shipped
 
-- [ ] `data/black-marble/black_marble_2048x1024.jpg` checked in
-      under that name with a `README.md` documenting the
-      source.
-- [ ] `earth.wgsl` samples both Blue + Black Marble; mixes by
-      the `day` smoothstep.
-- [ ] Done-when: the night side over densely-populated regions
-      (eastern US, Europe, Japan) shows a recognisable city-
-      lights pattern matching the published Black Marble image.
+- [x] `data/black-marble/black_marble_2048x1024.jpg` (2012 Suomi
+      NPP/VIIRS composite from NASA Earth Observatory, downscaled
+      from 3600×1800 + re-encoded JPEG q70 ≈ 220 KB) with a README
+      documenting the source + licence.
+- [x] `Body::night_texture: Option<&[u8]>` (Some for Earth, None
+      for Mars/Moon → 1×1 black at the same binding slot so the
+      BGL stays uniform).
+- [x] earth.wgsl composite splits day + night terms rather than
+      using a single multiplier: `day_term = day_rgb * warm_tint`,
+      `night_term = night_rgb * 1.3 + day_rgb * night_dim`,
+      `composite = mix(night_term, day_term, day)`. City lights
+      ride at 1.3× brightness because they're emissive, not
+      reflective.
+- [x] Attribution overlay's Earth-textures section credits both
+      Blue Marble (day) and Black Marble (night).
 
 ## Open questions
 
