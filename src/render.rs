@@ -51,6 +51,7 @@ const CAPS_SHADER: &str = include_str!("shaders/caps.wgsl");
 const EARTH_SHADER: &str = include_str!("shaders/earth.wgsl");
 const ORBIT_SHADER: &str = include_str!("shaders/orbit.wgsl");
 const ORBIT_TRAIL_SHADER: &str = include_str!("shaders/orbit_trail.wgsl");
+const ATMOSPHERE_SHADER: &str = include_str!("shaders/atmosphere.wgsl");
 
 /// Frames the camera state must stay unchanged before we consider it
 /// "settled" and trigger a satellite-tile fetch. At 60 fps this is
@@ -81,6 +82,11 @@ const EARTH_DRAW_VERTS: u32 = 64 * 128 * 6;
 const CAP_RING_VERTS: u32 = 64;
 /// Vertex count per cap = 3 verts × `CAP_RING_VERTS` triangles.
 const CAP_DRAW_VERTS: u32 = 3 * CAP_RING_VERTS;
+
+/// Atmosphere-shell vertex count — mirrors the `LAT_BANDS *
+/// LON_SEGMENTS * QUAD_VERTS` constants at the top of
+/// `atmosphere.wgsl`. Keep in lock-step with that file.
+const ATMOSPHERE_DRAW_VERTS: u32 = 48 * 96 * 6;
 
 const TILE_UNIFORM_SIZE: u64 = std::mem::size_of::<TileUniforms>() as u64;
 
@@ -218,6 +224,32 @@ struct EarthCameraUniform {
     night_dim: f32,
 }
 
+/// Per-frame uniform consumed by `atmosphere.wgsl`. 144 bytes
+/// (9 × vec4). Owns the per-body Rayleigh + Mie params alongside
+/// the camera / sun state; one buffer is rewritten each frame for
+/// the active body's atmosphere when present (plan 0008 M1+M2).
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, Pod, Zeroable)]
+struct AtmosphereUniform {
+    view_proj: [f32; 16],
+    camera_pos: [f32; 3],
+    planet_radius: f32,
+    sun_dir: [f32; 3],
+    atmosphere_radius: f32,
+    rayleigh_beta: [f32; 3],
+    sun_intensity: f32,
+    mie_beta: [f32; 3],
+    mie_g: f32,
+    rayleigh_scale: f32,
+    mie_scale: f32,
+    /// Zoom-driven 0..1 fade (full at globe view, 0 at street zoom).
+    /// Matches the window used by `day_night_color` in the surface
+    /// shaders so atmosphere + terminator appear / disappear in
+    /// lockstep.
+    strength: f32,
+    _pad: f32,
+}
+
 /// Which basemap the user is currently looking at. Mutually exclusive
 /// — the two are alternative views of the same Earth, not layers, so
 /// switching turns the other off both at draw time and at fetch time
@@ -342,6 +374,15 @@ pub struct Renderer {
     /// body's `BodyResources` is bound at draw time. Plan 0003 M2.
     body_pipeline: wgpu::RenderPipeline,
     body_resources: HashMap<BodyId, BodyResources>,
+
+    /// Atmospheric-scattering pipeline + uniform buffer. One
+    /// procedural sphere mesh at `body.atmosphere.atmosphere_radius`
+    /// drawn after the body texture + tiles + caps, additively
+    /// blended. Bodies with `atmosphere: None` (the Moon) skip the
+    /// draw entirely. Plan 0008.
+    atmosphere_pipeline: wgpu::RenderPipeline,
+    atmosphere_uniform_buf: wgpu::Buffer,
+    atmosphere_bind_group: wgpu::BindGroup,
 
     /// Tiles that have been decoded + uploaded to the GPU.
     tiles: HashMap<TileId, TileBinding>,
@@ -685,6 +726,8 @@ impl Renderer {
         // Body fallback-texture pipeline. Shared across every body;
         // each body gets its own bind group via `build_body_resources`.
         let (body_pipeline, body_bgl) = build_body_pipeline(&device, format);
+        let (atmosphere_pipeline, atmosphere_uniform_buf, atmosphere_bind_group) =
+            build_atmosphere_pipeline(&device, format);
         let mut body_resources: HashMap<BodyId, BodyResources> = HashMap::new();
         for body in body::all() {
             body_resources.insert(
@@ -767,6 +810,9 @@ impl Renderer {
             south_cap_bind_group,
             body_pipeline,
             body_resources,
+            atmosphere_pipeline,
+            atmosphere_uniform_buf,
+            atmosphere_bind_group,
             tiles: HashMap::new(),
             requested: HashSet::new(),
             failed: HashSet::new(),
@@ -2194,6 +2240,36 @@ impl Renderer {
                 .write_buffer(&res.camera_buf, 0, bytemuck::bytes_of(&body_camera));
         }
 
+        // Atmosphere uniform (plan 0008 M1+M2). Skipped entirely
+        // when the active body has no atmosphere (Moon); otherwise
+        // the per-body Rayleigh + Mie params are merged with the
+        // shared sun + camera state and a zoom-driven strength.
+        // The strength shares the `smoothstep(0.05, 0.5)` window
+        // with `day_night_color` so atmosphere + terminator fade
+        // in / out together at globe ↔ street zoom.
+        if let Some(atm) = self.active_body_ref().atmosphere {
+            let atm_uniform = AtmosphereUniform {
+                view_proj,
+                camera_pos,
+                planet_radius: 1.0,
+                sun_dir,
+                atmosphere_radius: atm.atmosphere_radius,
+                rayleigh_beta: atm.rayleigh_beta,
+                sun_intensity: atm.sun_intensity,
+                mie_beta: atm.mie_beta,
+                mie_g: atm.mie_g,
+                rayleigh_scale: atm.rayleigh_scale,
+                mie_scale: atm.mie_scale,
+                strength: smoothstep_f32(0.05, 0.5, cam_alt),
+                _pad: 0.0,
+            };
+            self.queue.write_buffer(
+                &self.atmosphere_uniform_buf,
+                0,
+                bytemuck::bytes_of(&atm_uniform),
+            );
+        }
+
         // Orbit overlay camera (plan 0004 M1). Same view_proj +
         // camera_pos as the other passes, plus viewport pixels for
         // the billboard pixel-size math in the shader.
@@ -2338,6 +2414,18 @@ impl Renderer {
             pass.draw(0..CAP_DRAW_VERTS, 0..1);
             pass.set_bind_group(0, &self.south_cap_bind_group, &[]);
             pass.draw(0..CAP_DRAW_VERTS, 0..1);
+
+            // Atmospheric-scattering shell (plan 0008 M1+M2). Drawn
+            // additively after caps + tiles so the halo brightens
+            // whatever surface is underneath. Bodies without an
+            // atmosphere (Moon) skip the draw; the strength
+            // uniform also gates at zero alpha so the fragment
+            // shader discards early at street zoom.
+            if self.active_body_ref().atmosphere.is_some() {
+                pass.set_pipeline(&self.atmosphere_pipeline);
+                pass.set_bind_group(0, &self.atmosphere_bind_group, &[]);
+                pass.draw(0..ATMOSPHERE_DRAW_VERTS, 0..1);
+            }
 
             // Vector overlay (Natural Earth country outlines) — only
             // makes sense on Earth. Mars / Moon / Middle-earth have
@@ -2903,6 +2991,109 @@ fn smoothstep_f32(edge0: f32, edge1: f32, x: f32) -> f32 {
     t * t * (3.0 - 2.0 * t)
 }
 
+/// Build the atmospheric-scattering pipeline + one shared uniform
+/// buffer (rewritten each frame for the active body when its
+/// `Body::atmosphere` is Some). Plan 0008 M1+M2.
+///
+/// The pipeline draws a procedural sphere mesh at the body's
+/// atmosphere radius (front face only — cull `Back` since the
+/// camera is outside the shell at any zoom where strength > 0)
+/// and additively blends the per-fragment scattered light onto
+/// the planet underneath.
+///
+/// Vertex count for the draw call: `LAT_BANDS * LON_SEGMENTS *
+/// QUAD_VERTS` in atmosphere.wgsl (48 × 96 × 6 = 27 648).
+fn build_atmosphere_pipeline(
+    device: &wgpu::Device,
+    format: wgpu::TextureFormat,
+) -> (wgpu::RenderPipeline, wgpu::Buffer, wgpu::BindGroup) {
+    let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("aegis-atmosphere-bgl"),
+        entries: &[wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        }],
+    });
+    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("aegis-atmosphere-shader"),
+        source: wgpu::ShaderSource::Wgsl(ATMOSPHERE_SHADER.into()),
+    });
+    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("aegis-atmosphere-layout"),
+        bind_group_layouts: &[Some(&bgl)],
+        immediate_size: 0,
+    });
+    let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("aegis-atmosphere-pipeline"),
+        layout: Some(&layout),
+        vertex: wgpu::VertexState {
+            module: &module,
+            entry_point: Some("vs_main"),
+            buffers: &[],
+            compilation_options: Default::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &module,
+            entry_point: Some("fs_main"),
+            targets: &[Some(wgpu::ColorTargetState {
+                format,
+                // Additive blend — the atmosphere's scattered light
+                // adds to whatever's behind. Pre-multiplied alpha
+                // out of the shader (`color * alpha, alpha`) keeps
+                // the limb halo from over-saturating when stacked
+                // on the lit globe.
+                blend: Some(wgpu::BlendState {
+                    color: wgpu::BlendComponent {
+                        src_factor: wgpu::BlendFactor::One,
+                        dst_factor: wgpu::BlendFactor::One,
+                        operation: wgpu::BlendOperation::Add,
+                    },
+                    alpha: wgpu::BlendComponent {
+                        src_factor: wgpu::BlendFactor::One,
+                        dst_factor: wgpu::BlendFactor::One,
+                        operation: wgpu::BlendOperation::Add,
+                    },
+                }),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            compilation_options: Default::default(),
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            strip_index_format: None,
+            front_face: wgpu::FrontFace::Ccw,
+            cull_mode: Some(wgpu::Face::Back),
+            polygon_mode: wgpu::PolygonMode::Fill,
+            unclipped_depth: false,
+            conservative: false,
+        },
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        multiview_mask: None,
+        cache: None,
+    });
+    let uniform_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("aegis-atmosphere-uniform"),
+        contents: bytemuck::bytes_of(&AtmosphereUniform::default()),
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+    });
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("aegis-atmosphere-bg"),
+        layout: &bgl,
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: uniform_buf.as_entire_binding(),
+        }],
+    });
+    (pipeline, uniform_buf, bind_group)
+}
+
 /// Convert an 8-bit sRGB channel to linear-light. Used so cap (and
 /// future overlay) colours can live in the source as the same RGB-8
 /// triples a paint picker or hex code would surface, while the GPU
@@ -3204,5 +3395,6 @@ mod tests {
         assert_eq!(std::mem::size_of::<VectorCameraUniform>(), 112);
         assert_eq!(std::mem::size_of::<CapUniform>(), 112);
         assert_eq!(std::mem::size_of::<EarthCameraUniform>(), 96);
+        assert_eq!(std::mem::size_of::<AtmosphereUniform>(), 144);
     }
 }

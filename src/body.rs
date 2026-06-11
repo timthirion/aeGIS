@@ -81,6 +81,44 @@ pub struct Basemap {
     pub cap_colors: CapColors,
 }
 
+/// Atmospheric-scattering parameters for a body. Consumed by
+/// `atmosphere.wgsl` (plan 0008 M1+M2). Bodies without a meaningful
+/// atmosphere (the Moon) leave `Body::atmosphere` as `None` and the
+/// scattering pipeline skips them entirely.
+///
+/// **Tuning convention.** The renderer treats every body as a unit
+/// sphere (`planet_radius = 1.0`), so `atmosphere_radius` is the
+/// only thickness knob; values are exaggerated above real-world
+/// ratios so the halo reads visibly without a 6000× zoom. Likewise
+/// `rayleigh_beta` / `mie_beta` are pre-multiplied by the
+/// planet-radius-in-metres factor that would otherwise appear in
+/// the optical-depth integral, so the shader can treat all
+/// distances as normalised.
+#[derive(Copy, Clone, Debug)]
+pub struct Atmosphere {
+    /// Outer-shell radius in normalised units (`planet_radius = 1.0`).
+    /// Earth ~1.025 (a bit thicker than the real 1.016), Mars ~1.012.
+    pub atmosphere_radius: f32,
+    /// Per-wavelength Rayleigh extinction (R, G, B). Earth's blue
+    /// sky comes from the third component being ~4× the first.
+    pub rayleigh_beta: [f32; 3],
+    /// Mie extinction (per-wavelength for tuning; usually all three
+    /// equal for an Earth-like haze, slightly red-shifted on Mars).
+    pub mie_beta: [f32; 3],
+    /// Mie phase-function asymmetry. Positive = forward-scattering
+    /// (haze glow near the sun). Earth uses ~0.76; Mars's coarser
+    /// dust scatters more isotropically (~0.5).
+    pub mie_g: f32,
+    /// Top-of-atmosphere sun intensity in normalised units.
+    pub sun_intensity: f32,
+    /// Rayleigh density scale height (fraction of planet radius).
+    /// Earth real ~0.00126; v1 uses larger values so the halo is
+    /// thick enough to read at globe view.
+    pub rayleigh_scale: f32,
+    /// Mie density scale height.
+    pub mie_scale: f32,
+}
+
 /// Polar-cap colour pair. Stored as `sRGB8` since the renderer
 /// already round-trips through `srgb8_to_linear_rgba` for every
 /// cap write.
@@ -143,6 +181,10 @@ pub struct Body {
     /// None and fall back to the plain `night_dim` darken. Plan
     /// 0009 M2.
     pub night_texture: Option<&'static [u8]>,
+    /// Atmospheric-scattering parameters. None for airless bodies
+    /// (Moon); the renderer skips the atmosphere draw entirely
+    /// when this is None. Plan 0008.
+    pub atmosphere: Option<Atmosphere>,
 }
 
 impl Body {
@@ -228,6 +270,19 @@ pub static EARTH: Body = Body {
     show_political_overlays: true,
     night_dim: 0.15,
     night_texture: Some(EARTH_NIGHT_BYTES),
+    // Earth atmosphere — tuned for visible blue halo + reddish
+    // terminator glow at globe view, not radiometrically accurate
+    // (real atmosphere thickness ratio ~0.0157; v1 exaggerates to
+    // 0.025 so the halo reads at canvas-pixel sizes).
+    atmosphere: Some(Atmosphere {
+        atmosphere_radius: 1.025,
+        rayleigh_beta: [5.5, 13.0, 33.1],
+        mie_beta: [21.0, 21.0, 21.0],
+        mie_g: 0.76,
+        sun_intensity: 18.0,
+        rayleigh_scale: 0.008,
+        mie_scale: 0.0014,
+    }),
 };
 
 // --- Mars -----------------------------------------------------------------
@@ -284,6 +339,19 @@ pub static MARS: Body = Body {
     show_political_overlays: false,
     night_dim: 0.10,
     night_texture: None,
+    // Mars atmosphere — thin (real ~0.6% Earth's surface pressure)
+    // and dust-tinted. Less Rayleigh, more red-shifted Mie haze;
+    // smaller atmosphere shell. The look should read as "thin
+    // reddish halo," not radiometrically accurate.
+    atmosphere: Some(Atmosphere {
+        atmosphere_radius: 1.012,
+        rayleigh_beta: [16.0, 9.0, 4.5],
+        mie_beta: [9.0, 6.0, 4.0],
+        mie_g: 0.5,
+        sun_intensity: 9.0,
+        rayleigh_scale: 0.004,
+        mie_scale: 0.0008,
+    }),
 };
 
 // --- Moon -----------------------------------------------------------------
@@ -324,6 +392,7 @@ pub static MOON: Body = Body {
     show_political_overlays: false,
     night_dim: 0.02,
     night_texture: None,
+    atmosphere: None,
 };
 
 // A Middle-earth body was prototyped in plan 0003 M4 as a procedural

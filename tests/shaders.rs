@@ -54,3 +54,11 @@ fn orbit_trail_shader_validates() {
         "orbit_trail.wgsl",
     );
 }
+
+#[test]
+fn atmosphere_shader_validates() {
+    validate_wgsl(
+        include_str!("../src/shaders/atmosphere.wgsl"),
+        "atmosphere.wgsl",
+    );
+}
