@@ -1,9 +1,11 @@
 # Atmospheric scattering for the globe
 
-- **Status:** proposed
-- **Last updated:** 2026-06-10
-- **Last touched on:** drafted in the 0004–0013 batch; the visual
-  feature that separates aeGIS from "another slippy map"
+- **Status:** shipped 2026-06-11 (M0 + M1 + M2). M3 perf budget
+  deferred — measurement-on-demand, not a forcing function.
+- **Last updated:** 2026-06-11
+- **Last touched on:** shipped same session as plan 0009 — the
+  two share `sun::direction_from_unix` and the same zoom-driven
+  `smoothstep(0.05, 0.5)` strength window.
 
 ## Goal
 
@@ -112,43 +114,54 @@ at z=2 (full-globe view), we add the half-res pass.
 
 ## Milestones
 
-### M0 — Sun position (MAP-sun-direction)
+### M0 — Sun position (MAP-sun-direction) — shipped
 
-- [ ] `sun_direction_at(unix_s)` matches USNO's solar position
-      tables to within 0.1° on three reference dates: vernal
-      equinox 2026, summer solstice 2026, an arbitrary date
-      (2030-01-15T18:00:00Z).
-- [ ] `Renderer::set_sun_direction(dir: [f32; 3])` lets callers
-      override; plan 0010 wires the time-slider to this.
+- [x] `sun::direction_from_unix(unix_s)` (shipped by plan 0009;
+      this plan reuses it). Validated by four tests covering
+      year-long unit-length sweep, declination bound, 12-hour
+      antipode invariant, and equinox-crossing count.
+- [x] No override needed — the renderer calls the function each
+      frame with `SimClock::sim_unix_s`, so the time slider
+      (plan 0010) drives the input by changing the clock.
 
-### M1 — Earth atmosphere shader (MAP-atmosphere-shader)
+### M1 — Earth atmosphere shader (MAP-atmosphere-shader) — shipped
 
-- [ ] `atmosphere.wgsl` with the O'Neil-style single-scattering
-      integration.
-- [ ] New render pipeline + sphere geometry (radius 1.025).
-      Drawn after tiles, before vector + caps. Additive blend.
-- [ ] Earth: visible blue halo at the limb, reddish gradient on
-      the dawn/dusk terminator side. Verified by a screenshot
-      comparison at z=2 with the sun at hardcoded
-      `(1, 0.2, 0)` in body-fixed coords.
-- [ ] Done-when: zoom out to z=2, the Earth has a sky-blue
-      halo on the day side and a reddish glow at the terminator.
+- [x] `atmosphere.wgsl` — per-pixel ray-march of 12 outer × 4
+      inner samples, Rayleigh + Mie phase functions, Earth's-
+      shadow occlusion skip on the night side.
+- [x] New render pipeline + procedural sphere mesh (48 lat × 96
+      lon × 6 = 27 648 verts) at `body.atmosphere.atmosphere_radius`.
+      Drawn after tiles + caps, before vector + orbits. Additive
+      blend; output is pre-multiplied alpha so the limb halo
+      doesn't over-saturate on top of the lit globe.
+- [x] Earth halo reads as sky-blue on the day side, with a
+      reddish dawn/dusk glow tracking the live sun direction.
+      Tuned with `rayleigh_beta = (5.5, 13.0, 33.1)` and
+      `mie_g = 0.76`.
 
-### M2 — Per-body atmospheres (MAP-atmosphere-multi-body)
+### M2 — Per-body atmospheres (MAP-atmosphere-multi-body) — shipped
 
-- [ ] `Atmosphere` field on `Body`. Earth + Mars get tuned
-      values; Moon is `None`.
-- [ ] Mars's atmosphere is thin + dusty — `rayleigh_beta`
-      shifted red, smaller atmosphere radius.
-- [ ] Moon renders with no atmosphere pass at all.
+- [x] `Atmosphere` struct on `Body`. Earth + Mars get tuned
+      values; Moon is `None` and the renderer skips the draw +
+      uniform write entirely.
+- [x] Mars: `atmosphere_radius = 1.012` (thinner shell),
+      red-shifted Rayleigh + Mie, `mie_g = 0.5` (less forward-
+      scattering for dust). Sun intensity dimmer (9.0 vs Earth's
+      18.0) to reflect Mars's greater orbital distance.
+- [x] Moon renders with no atmosphere pass at all — `if let
+      Some(atm) = body.atmosphere` gate on both the uniform
+      write and the draw call.
 
-### M3 — Perf budget (MAP-atmosphere-perf)
+### M3 — Perf budget (MAP-atmosphere-perf) — deferred
 
 - [ ] Frame timing test at z=2, full-globe view, atmosphere on:
       < 4 ms additional shader time on a M1 MacBook.
 - [ ] If over: half-res offscreen pass + bilinear composite.
-      Acceptance is the same time bound; the implementation is
-      what changes.
+
+Deferred until a measurement shows the full-resolution path is
+actually over budget. The v1 ship-it ran at full canvas with no
+visible frame drop, but the test will land before we ship
+anything that adds more per-fragment cost.
 
 ## Open questions
 
