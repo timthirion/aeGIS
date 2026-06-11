@@ -122,6 +122,14 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // keep it small. Boost the city-lights term so it's clearly
     // visible against the dimmed surface.
     let night_term = night_rgb * 1.3 + day_rgb * camera.night_dim;
-    let composite = mix(night_term, day_term, day);
+    let composite_full = mix(night_term, day_term, day);
+    // Zoom ramp — at street zoom the user wants the basemap at
+    // full brightness, so blend back to the unmodified day texture.
+    // Same `(0.05, 0.5)` window as `day_night_color` in the other
+    // shaders so the four passes ramp in lock-step and we don't
+    // get flickery seams when tiles overdraw the globe.
+    let cam_alt = length(camera.position) - 1.0;
+    let strength = smoothstep(0.05, 0.5, cam_alt);
+    let composite = mix(day_rgb, composite_full, strength);
     return vec4<f32>(composite, 1.0);
 }

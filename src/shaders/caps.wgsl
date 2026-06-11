@@ -48,9 +48,10 @@ fn lonlat_to_sphere(lon: f32, lat: f32) -> vec3<f32> {
     return vec3<f32>(cos(lat) * sin(lon), sin(lat), cos(lat) * cos(lon));
 }
 
-/// Day/night dim + dawn/dusk warm tint multiplier (plan 0009 M0+M1).
-/// See `day_night_color` in tile.wgsl for the same formula.
-fn day_night_color(sphere: vec3<f32>, sun_dir: vec3<f32>, night_dim: f32) -> vec3<f32> {
+/// Day/night dim + dawn/dusk warm tint multiplier, zoom-ramped
+/// (plan 0009 M0+M1). See `day_night_color` in tile.wgsl for the
+/// full formula + the rationale for the zoom ramp.
+fn day_night_color(sphere: vec3<f32>, sun_dir: vec3<f32>, night_dim: f32, camera_pos: vec3<f32>) -> vec3<f32> {
     let cos_sun = dot(sphere, sun_dir);
     let day = smoothstep(0.0, 0.15, cos_sun);
     let dim = mix(night_dim, 1.0, day);
@@ -58,7 +59,10 @@ fn day_night_color(sphere: vec3<f32>, sun_dir: vec3<f32>, night_dim: f32) -> vec
     let warm_fall = 1.0 - smoothstep(0.05, 0.3, cos_sun);
     let warm = warm_rise * warm_fall * 0.6;
     let tint = mix(vec3<f32>(1.0, 1.0, 1.0), vec3<f32>(1.3, 0.8, 0.5), warm);
-    return vec3<f32>(dim, dim, dim) * tint;
+    let full = vec3<f32>(dim, dim, dim) * tint;
+    let cam_alt = length(camera_pos) - 1.0;
+    let strength = smoothstep(0.05, 0.5, cam_alt);
+    return mix(vec3<f32>(1.0, 1.0, 1.0), full, strength);
 }
 
 @vertex
@@ -96,6 +100,6 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     if (in.visibility < 0.0) {
         discard;
     }
-    let mult = day_night_color(normalize(in.sphere), u.sun_dir, u.night_dim);
+    let mult = day_night_color(normalize(in.sphere), u.sun_dir, u.night_dim, u.camera_pos);
     return vec4<f32>(u.color.rgb * mult, u.color.a);
 }

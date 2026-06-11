@@ -87,7 +87,16 @@ fn lonlat_to_sphere(lonlat: vec2<f32>) -> vec3<f32> {
 ///   - dawn/dusk warm tint — a soft triangular pulse peaking near
 ///     `cos_sun ≈ 0.05` (~3° solar elevation) that biases R up + B
 ///     down so the terminator band reads as a sunrise/sunset glow.
-fn day_night_color(sphere: vec3<f32>, sun_dir: vec3<f32>, night_dim: f32) -> vec3<f32> {
+///
+/// **Zoom ramp.** Both effects are interpolated to "no effect" (1, 1, 1)
+/// as the camera approaches the surface — `smoothstep(0.05, 0.5,
+/// length(camera_pos) − 1.0)`. At street zoom the basemap reads at
+/// full brightness; at globe view the terminator is fully visible.
+/// Without this the slippy basemap drops to 15% brightness on the
+/// night hemisphere and the mid-zoom transition flickers as tiles
+/// (which apply the dim) stream over the textured Earth globe
+/// (which already composited city lights).
+fn day_night_color(sphere: vec3<f32>, sun_dir: vec3<f32>, night_dim: f32, camera_pos: vec3<f32>) -> vec3<f32> {
     let cos_sun = dot(sphere, sun_dir);
     let day = smoothstep(0.0, 0.15, cos_sun);
     let dim = mix(night_dim, 1.0, day);
@@ -95,7 +104,10 @@ fn day_night_color(sphere: vec3<f32>, sun_dir: vec3<f32>, night_dim: f32) -> vec
     let warm_fall = 1.0 - smoothstep(0.05, 0.3, cos_sun);
     let warm = warm_rise * warm_fall * 0.6;
     let tint = mix(vec3<f32>(1.0, 1.0, 1.0), vec3<f32>(1.3, 0.8, 0.5), warm);
-    return vec3<f32>(dim, dim, dim) * tint;
+    let full = vec3<f32>(dim, dim, dim) * tint;
+    let cam_alt = length(camera_pos) - 1.0;
+    let strength = smoothstep(0.05, 0.5, cam_alt);
+    return mix(vec3<f32>(1.0, 1.0, 1.0), full, strength);
 }
 
 @vertex
@@ -130,6 +142,6 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         discard;
     }
     let sample = textureSample(tile_tex, tile_sampler, in.uv);
-    let mult = day_night_color(normalize(in.sphere), u.sun_dir, u.night_dim);
+    let mult = day_night_color(normalize(in.sphere), u.sun_dir, u.night_dim, u.camera_pos);
     return vec4<f32>(sample.rgb * mult, sample.a * u.tile_alpha);
 }
