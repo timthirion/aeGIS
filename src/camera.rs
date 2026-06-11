@@ -301,16 +301,16 @@ impl Camera {
         // and a third of the world is in view, but flat math would
         // return a 4-tile-wide strip near the centre.
         //
-        // Trigger: altitude > 0.05 (roughly z ≤ 7.5). The historical
-        // `globeness() > 0` cutoff at z=5 missed the z=5..7 band
+        // Trigger: altitude > 0.1 (roughly z ≤ 6). The historical
+        // `globeness() > 0` cutoff at z=5 missed the z=5..6 band
         // where the tile-alpha ramp (plan 0009 follow-up) still
         // shows the underlying lit globe through partially-faded
-        // tiles. With only a flat-rect wedge of tiles selected
-        // there, the user sees a clear "wedge of tiles fading in"
-        // artifact at the centre with no tiles around it. Using
-        // the sphere-cap test up to the tile-fully-opaque threshold
-        // (alt ≈ 0.05) keeps the selection continuous.
-        if self.altitude(canvas) > 0.05 {
+        // tiles. Trigger picked deliberately to *not* fire at z≥7:
+        // sphere-cap at z=7 selects ~350 tiles which would burst
+        // the tile-CDN fetch budget — and by z=7 the tile alpha is
+        // already ≈ 0.998 so any wedge artifact is invisible
+        // anyway.
+        if self.altitude(canvas) > 0.1 {
             return self.visible_tiles_globe(canvas, z, projection);
         }
 
@@ -895,21 +895,20 @@ mod tests {
 
     #[test]
     fn visible_tiles_transition_band_uses_sphere_cap() {
-        // At z=5..7 the renderer's vertex shader is in pure-flat mode
-        // (globeness = 0 at z ≥ 5) but the tile-alpha fade (plan 0009
-        // follow-up) keeps tiles partially transparent up to z ≈ 7.5,
+        // At z=5..6 the renderer's vertex shader is in pure-flat
+        // mode (globeness = 0 at z ≥ 5) but the tile-alpha fade
+        // (plan 0009 follow-up) keeps tiles partially transparent,
         // letting the underlying lit globe show through. If the
-        // tile selector still uses the flat-rect math there, the
-        // user sees a wedge of tiles fading in at the centre with
-        // bare globe around it. The fix: altitude-driven trigger
-        // extends sphere-cap selection up to alt ≈ 0.05.
-        for z in [5.0_f64, 6.0, 7.0] {
+        // tile selector still uses flat-rect math there, the user
+        // sees a wedge of tiles fading in at the centre with bare
+        // globe around it. The fix: altitude-driven trigger keeps
+        // sphere-cap selection on through z=6. At z=7 we
+        // deliberately fall back to flat because the cap there
+        // selects ~350 tiles — too many for the tile CDN — and the
+        // tile-alpha is ≈ 0.998 so any wedge artifact is invisible.
+        for z in [5.0_f64, 6.0] {
             let c = Camera::new(CHICAGO_LONLAT.0, CHICAGO_LONLAT.1, z);
             let tiles = c.visible_tiles((800, 600));
-            // At z=5, alt ≈ 0.23 → sphere-cap fires, cap angle ~40°.
-            // The cap should cover ~30+ tiles even on a roughly-
-            // square 800×600 canvas. The old flat-rect math at z=5
-            // returned a single-digit number of tiles.
             assert!(
                 tiles.len() >= 20,
                 "z={z} should use sphere-cap selection (got {} tiles); \
