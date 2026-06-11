@@ -2038,12 +2038,23 @@ impl Renderer {
         // Coarse-first: finer tiles overdraw their parents.
         draws.sort_by_key(|(id, _, _)| id.z);
 
-        // Carto tiles render at full opacity at every zoom. The
-        // earlier zoom-driven fade existed so the bundled Blue Marble
-        // texture showed through at globe view; with the basemap
-        // toggle, Map is *purely* Carto (no satellite mix) and the
-        // fade would just expose the background colour.
-        let tile_alpha = 1.0_f32;
+        // Tile alpha fades out at globe view so the earth.wgsl
+        // composite (Blue Marble + Black Marble + day/night
+        // terminator) is the visible surface there. Without this
+        // fade, opaque tiles overdraw the lit globe at low zoom
+        // and the city-lights texture appears to blink in and out
+        // as tiles stream in — plan 0009 M2 follow-up.
+        //
+        // Window matches `day_night_color`'s `smoothstep(0.05, 0.5)`
+        // so the dim ramp on tiles + the alpha ramp + the globe
+        // composite's strength term all step in lockstep. The
+        // basemap toggle (Map ↔ Satellite) is still visible past
+        // z ≈ 4 where alpha > 0; at globe view the toggle has no
+        // visible effect, which is fine — the user sees Earth-
+        // from-space regardless.
+        let cam_alt =
+            (camera_pos[0].powi(2) + camera_pos[1].powi(2) + camera_pos[2].powi(2)).sqrt() - 1.0;
+        let tile_alpha = 1.0 - smoothstep_f32(0.05, 0.5, cam_alt);
 
         for (_, world_rect, binding) in &draws {
             let u = TileUniforms {
@@ -2093,7 +2104,7 @@ impl Renderer {
             let u = TileUniforms {
                 view_proj,
                 camera_pos,
-                tile_alpha: 1.0,
+                tile_alpha,
                 world_rect: *world_rect,
                 projection_kind: sat_projection_kind,
                 _pad: [0; 3],
@@ -2882,6 +2893,14 @@ fn build_body_pipeline(
         cache: None,
     });
     (pipeline, bgl)
+}
+
+/// Standard `smoothstep` (Hermite interpolation, 3t² − 2t³). Used
+/// by the tile-alpha zoom fade so the camera-altitude → opacity
+/// curve matches the WGSL `day_night_color` ramp in lockstep.
+fn smoothstep_f32(edge0: f32, edge1: f32, x: f32) -> f32 {
+    let t = ((x - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
 }
 
 /// Convert an 8-bit sRGB channel to linear-light. Used so cap (and
