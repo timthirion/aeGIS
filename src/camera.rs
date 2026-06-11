@@ -299,9 +299,18 @@ impl Camera {
         // flat-Mercator viewport rect under-represents what the camera
         // actually sees. At zoom 3 the camera is looking at a sphere
         // and a third of the world is in view, but flat math would
-        // return a 4-tile-wide strip near the centre. Switch to a
-        // sphere-cap test whenever any curvature is being rendered.
-        if self.globeness() > 0.0 {
+        // return a 4-tile-wide strip near the centre.
+        //
+        // Trigger: altitude > 0.05 (roughly z ≤ 7.5). The historical
+        // `globeness() > 0` cutoff at z=5 missed the z=5..7 band
+        // where the tile-alpha ramp (plan 0009 follow-up) still
+        // shows the underlying lit globe through partially-faded
+        // tiles. With only a flat-rect wedge of tiles selected
+        // there, the user sees a clear "wedge of tiles fading in"
+        // artifact at the centre with no tiles around it. Using
+        // the sphere-cap test up to the tile-fully-opaque threshold
+        // (alt ≈ 0.05) keeps the selection continuous.
+        if self.altitude(canvas) > 0.05 {
             return self.visible_tiles_globe(canvas, z, projection);
         }
 
@@ -882,6 +891,32 @@ mod tests {
             tiles.contains(&corner_visible),
             "z=2 tile with corner in view but centre past limb was dropped: {tiles:?}"
         );
+    }
+
+    #[test]
+    fn visible_tiles_transition_band_uses_sphere_cap() {
+        // At z=5..7 the renderer's vertex shader is in pure-flat mode
+        // (globeness = 0 at z ≥ 5) but the tile-alpha fade (plan 0009
+        // follow-up) keeps tiles partially transparent up to z ≈ 7.5,
+        // letting the underlying lit globe show through. If the
+        // tile selector still uses the flat-rect math there, the
+        // user sees a wedge of tiles fading in at the centre with
+        // bare globe around it. The fix: altitude-driven trigger
+        // extends sphere-cap selection up to alt ≈ 0.05.
+        for z in [5.0_f64, 6.0, 7.0] {
+            let c = Camera::new(CHICAGO_LONLAT.0, CHICAGO_LONLAT.1, z);
+            let tiles = c.visible_tiles((800, 600));
+            // At z=5, alt ≈ 0.23 → sphere-cap fires, cap angle ~40°.
+            // The cap should cover ~30+ tiles even on a roughly-
+            // square 800×600 canvas. The old flat-rect math at z=5
+            // returned a single-digit number of tiles.
+            assert!(
+                tiles.len() >= 20,
+                "z={z} should use sphere-cap selection (got {} tiles); \
+                 flat-rect math returns < 10 here",
+                tiles.len()
+            );
+        }
     }
 
     #[test]
