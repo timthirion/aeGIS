@@ -23,6 +23,9 @@ struct Camera {
     _pad0: f32,
     // Line colour for this overlay.
     color: vec4<f32>,
+    // Day/night state (plan 0009 M0).
+    sun_dir: vec3<f32>,
+    night_dim: f32,
 };
 
 @group(0) @binding(0) var<uniform> camera: Camera;
@@ -34,6 +37,7 @@ struct VsIn {
 struct VsOut {
     @builtin(position) clip: vec4<f32>,
     @location(0) visibility: f32,
+    @location(1) sphere: vec3<f32>,
 };
 
 const PI: f32 = 3.14159265358979323846;
@@ -53,6 +57,19 @@ fn lonlat_to_sphere(lonlat: vec2<f32>) -> vec3<f32> {
     return vec3<f32>(cos(lat) * sin(lon), sin(lat), cos(lat) * cos(lon));
 }
 
+/// Day/night dim + dawn/dusk warm tint multiplier (plan 0009 M0+M1).
+/// See `day_night_color` in tile.wgsl for the same formula.
+fn day_night_color(sphere: vec3<f32>, sun_dir: vec3<f32>, night_dim: f32) -> vec3<f32> {
+    let cos_sun = dot(sphere, sun_dir);
+    let day = smoothstep(0.0, 0.15, cos_sun);
+    let dim = mix(night_dim, 1.0, day);
+    let warm_rise = smoothstep(-0.05, 0.05, cos_sun);
+    let warm_fall = 1.0 - smoothstep(0.05, 0.3, cos_sun);
+    let warm = warm_rise * warm_fall * 0.6;
+    let tint = mix(vec3<f32>(1.0, 1.0, 1.0), vec3<f32>(1.3, 0.8, 0.5), warm);
+    return vec3<f32>(dim, dim, dim) * tint;
+}
+
 @vertex
 fn vs_main(in: VsIn) -> VsOut {
     let lonlat = world_to_lonlat_rad(in.world);
@@ -62,6 +79,7 @@ fn vs_main(in: VsIn) -> VsOut {
     // > 0 = front of sphere, < 0 = back. Linear interpolation across
     // segments handles the horizon-crossing case per-fragment.
     out.visibility = dot(sphere, camera.position) - 1.0;
+    out.sphere = sphere;
     return out;
 }
 
@@ -70,5 +88,8 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     if (in.visibility < 0.0) {
         discard;
     }
-    return camera.color;
+    // Country outlines fade with the surface they sit on,
+    // otherwise they float distractingly across the night side.
+    let mult = day_night_color(normalize(in.sphere), camera.sun_dir, camera.night_dim);
+    return vec4<f32>(camera.color.rgb * mult, camera.color.a);
 }

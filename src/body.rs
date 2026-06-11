@@ -128,6 +128,14 @@ pub struct Body {
     /// outlines) layer should render. False for everything except
     /// Earth — Mars has no countries.
     pub show_political_overlays: bool,
+    /// Fragment-shader dim multiplier for the night side. The day
+    /// side renders at 1.0; the night side is `mix(night_dim, 1.0,
+    /// day)` where `day` is a smoothstep over `dot(sphere, sun_dir)`.
+    /// Earth uses 0.15 (city-lights texture brings detail back on
+    /// top); Moon uses 0.02 (essentially black — there's nothing
+    /// for moonlight to scatter off); Mars sits in between at 0.10.
+    /// Plan 0009 M0.
+    pub night_dim: f32,
 }
 
 impl Body {
@@ -206,6 +214,7 @@ pub static EARTH: Body = Body {
     },
     fallback_texture: EARTH_FALLBACK_BYTES,
     show_political_overlays: true,
+    night_dim: 0.15,
 };
 
 // --- Mars -----------------------------------------------------------------
@@ -260,6 +269,7 @@ pub static MARS: Body = Body {
     },
     fallback_texture: MARS_FALLBACK_BYTES,
     show_political_overlays: false,
+    night_dim: 0.10,
 };
 
 // --- Moon -----------------------------------------------------------------
@@ -298,6 +308,7 @@ pub static MOON: Body = Body {
     },
     fallback_texture: MOON_FALLBACK_BYTES,
     show_political_overlays: false,
+    night_dim: 0.02,
 };
 
 // A Middle-earth body was prototyped in plan 0003 M4 as a procedural

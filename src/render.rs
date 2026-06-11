@@ -93,11 +93,14 @@ pub fn make_instance() -> wgpu::Instance {
 }
 
 /// Per-tile uniform consumed by `tile.wgsl`. Matches the WGSL
-/// `Uniforms` struct byte-for-byte (6 × `vec4` = 96 bytes):
+/// `Uniforms` struct byte-for-byte (8 × `vec4` = 128 bytes after
+/// the day/night extension):
 /// - rows 0–3: view-projection matrix (column-major)
 /// - row 4: camera position (xyz) + per-frame `tile_alpha` (the
 ///   smoothstepped zoom-fade multiplier)
 /// - row 5: tile's world rect (xmin, ymin, xmax, ymax)
+/// - row 6: projection kind (u32) + 3 pad u32
+/// - row 7: sun direction (xyz) + per-body `night_dim` scalar
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default, Pod, Zeroable)]
 struct TileUniforms {
@@ -110,13 +113,23 @@ struct TileUniforms {
     /// Plan 0003 M1.
     projection_kind: u32,
     _pad: [u32; 3],
+    /// Sun direction in body-fixed frame (prime meridian at +Z).
+    /// Computed each frame from `SimClock` via `sun::direction_from_unix`.
+    /// Plan 0009 M0.
+    sun_dir: [f32; 3],
+    /// Per-body night-side dim multiplier. The fragment uses
+    /// `mix(night_dim, 1.0, smoothstep(0.0, 0.15, dot(sphere, sun_dir)))`
+    /// to fade between day and night intensities.
+    night_dim: f32,
 }
 
 /// Per-frame camera uniform consumed by `vector.wgsl`. Matches the
-/// WGSL `Camera` struct byte-for-byte (5 × `vec4` = 80 bytes):
+/// WGSL `Camera` struct byte-for-byte (7 × `vec4` = 112 bytes after
+/// the day/night extension):
 /// - rows 0–3: view-projection matrix (column-major)
 /// - row 4: camera position (xyz) + 1 pad
 /// - row 5: color (rgba)
+/// - row 6: sun direction (xyz) + night_dim
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default, Pod, Zeroable)]
 struct VectorCameraUniform {
@@ -124,12 +137,14 @@ struct VectorCameraUniform {
     position: [f32; 3],
     _pad0: f32,
     color: [f32; 4],
+    sun_dir: [f32; 3],
+    night_dim: f32,
 }
 
-/// Per-cap uniform consumed by `caps.wgsl`. Same 80-byte layout as
-/// `VectorCameraUniform` with `position` reused for camera_pos and
-/// the trailing f32 carrying `pole_sign` (+1 north, −1 south) instead
-/// of pad.
+/// Per-cap uniform consumed by `caps.wgsl`. Mirrors the layout of
+/// `VectorCameraUniform` but with the colour slot reused as the
+/// cap's solid colour and a sibling `pole_sign` (+1 north, −1 south)
+/// in the camera_pos pad. 96 bytes after the day/night extension.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default, Pod, Zeroable)]
 struct CapUniform {
@@ -137,6 +152,8 @@ struct CapUniform {
     camera_pos: [f32; 3],
     pole_sign: f32,
     color: [f32; 4],
+    sun_dir: [f32; 3],
+    night_dim: f32,
 }
 
 /// Per-frame camera uniform consumed by `orbit.wgsl`. 96 bytes
@@ -188,14 +205,17 @@ struct OrbitTrailVertex {
     color: [f32; 4],
 }
 
-/// Per-frame camera uniform consumed by `earth.wgsl`. 80 bytes —
-/// view_proj, camera_pos (used for the back-hemisphere discard), pad.
+/// Per-frame camera uniform consumed by `earth.wgsl`. 96 bytes
+/// after the day/night extension — view_proj, camera_pos + pad,
+/// sun direction + night_dim.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default, Pod, Zeroable)]
 struct EarthCameraUniform {
     view_proj: [f32; 16],
     position: [f32; 3],
     _pad0: f32,
+    sun_dir: [f32; 3],
+    night_dim: f32,
 }
 
 /// Which basemap the user is currently looking at. Mutually exclusive
@@ -1979,6 +1999,14 @@ impl Renderer {
         let canvas = self.size();
         let view_proj = self.camera.view_projection_matrix(canvas);
         let camera_pos = self.camera.camera_3d_position(canvas);
+        // Day/night state shared across every body-surface uniform
+        // upload this frame (plan 0009 M0). The sun direction is
+        // pulled from `SimClock` so that, once the time slider
+        // (plan 0010) lands, scrubbing time also scrubs the
+        // terminator. `night_dim` is the per-body intensity floor
+        // on the night side — Earth 0.15, Mars 0.10, Moon 0.02.
+        let sun_dir = crate::sun::direction_from_unix(self.sim_clock.sim_unix_s());
+        let night_dim = self.active_body_ref().night_dim;
 
         // Tile draws: every loaded tile at or below the current
         // rounded camera zoom. Filtering out deeper-than-current
@@ -2025,6 +2053,8 @@ impl Renderer {
                 world_rect: *world_rect,
                 projection_kind: map_projection_kind,
                 _pad: [0; 3],
+                sun_dir,
+                night_dim,
             };
             self.queue
                 .write_buffer(&binding.uniform_buf, 0, bytemuck::bytes_of(&u));
@@ -2067,12 +2097,14 @@ impl Renderer {
                 world_rect: *world_rect,
                 projection_kind: sat_projection_kind,
                 _pad: [0; 3],
+                sun_dir,
+                night_dim,
             };
             self.queue
                 .write_buffer(&binding.uniform_buf, 0, bytemuck::bytes_of(&u));
         }
 
-        // Per-frame vector-camera uniform. Single 80-byte upload.
+        // Per-frame vector-camera uniform. 112 bytes post day/night.
         let vector_camera = VectorCameraUniform {
             view_proj,
             position: camera_pos,
@@ -2081,6 +2113,8 @@ impl Renderer {
             // against OSM's brown/beige basemap. Alpha kept moderate
             // so the basemap shows faintly under the lines.
             color: [0.95, 0.42, 0.22, 0.85],
+            sun_dir,
+            night_dim,
         };
         self.queue.write_buffer(
             &self.vector_camera_buf,
@@ -2116,12 +2150,16 @@ impl Renderer {
             camera_pos,
             pole_sign: 1.0,
             color: north_cap_color,
+            sun_dir,
+            night_dim,
         };
         let south_cap = CapUniform {
             view_proj,
             camera_pos,
             pole_sign: -1.0,
             color: south_cap_color,
+            sun_dir,
+            night_dim,
         };
         self.queue
             .write_buffer(&self.north_cap_buf, 0, bytemuck::bytes_of(&north_cap));
@@ -2137,6 +2175,8 @@ impl Renderer {
             view_proj,
             position: camera_pos,
             _pad0: 0.0,
+            sun_dir,
+            night_dim,
         };
         if let Some(res) = self.body_resources.get(&self.active_body) {
             self.queue
@@ -3053,5 +3093,19 @@ mod tests {
         let rgba = srgb8_to_linear_rgba(0, 0, 0, 128);
         assert_eq!(rgba[0], 0.0);
         assert!((rgba[3] - 128.0 / 255.0).abs() < 1e-6);
+    }
+
+    /// Uniform structs are mirrored on the WGSL side; their sizes
+    /// must match each shader's `Uniforms` / `Camera` / `CapUniforms`
+    /// struct or fragments read garbage. Per AGENTS.md §Testing
+    /// rule 2: pin the sizes so the day/night extension (plan 0009
+    /// M0) — and any future trailing-vec3 pad — can't silently
+    /// inflate the layout (see `feedback_wgsl_struct_layout`).
+    #[test]
+    fn uniform_struct_sizes_match_wgsl() {
+        assert_eq!(std::mem::size_of::<TileUniforms>(), 128);
+        assert_eq!(std::mem::size_of::<VectorCameraUniform>(), 112);
+        assert_eq!(std::mem::size_of::<CapUniform>(), 112);
+        assert_eq!(std::mem::size_of::<EarthCameraUniform>(), 96);
     }
 }

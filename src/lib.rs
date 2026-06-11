@@ -15,6 +15,7 @@ pub mod net;
 pub mod orbit;
 pub mod render;
 pub mod search;
+pub mod sun;
 pub mod tile;
 pub mod vector;
 pub mod version;
