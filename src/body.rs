@@ -136,6 +136,13 @@ pub struct Body {
     /// for moonlight to scatter off); Mars sits in between at 0.10.
     /// Plan 0009 M0.
     pub night_dim: f32,
+    /// Optional equirectangular city-lights texture, additively
+    /// composited on top of the dimmed day-side surface on the
+    /// night hemisphere. Earth uses NASA Black Marble; bodies
+    /// without recognisable nightlights (Mars, Moon) leave it
+    /// None and fall back to the plain `night_dim` darken. Plan
+    /// 0009 M2.
+    pub night_texture: Option<&'static [u8]>,
 }
 
 impl Body {
@@ -173,6 +180,11 @@ impl Body {
 /// 4096×2048 JPEG, ~3 MB. Shown beneath the sphere before satellite
 /// tiles stream in.
 const EARTH_FALLBACK_BYTES: &[u8] = include_bytes!("../data/blue-marble/earth_4096x2048.jpg");
+
+/// Compile-time bundled NASA Black Marble equirectangular night-
+/// lights texture. 2048×1024 JPEG, ~220 KB. Sampled by `earth.wgsl`
+/// on the night side. Plan 0009 M2; see `data/black-marble/README.md`.
+const EARTH_NIGHT_BYTES: &[u8] = include_bytes!("../data/black-marble/black_marble_2048x1024.jpg");
 
 const EARTH_BASEMAPS: &[Basemap] = &[
     Basemap {
@@ -215,6 +227,7 @@ pub static EARTH: Body = Body {
     fallback_texture: EARTH_FALLBACK_BYTES,
     show_political_overlays: true,
     night_dim: 0.15,
+    night_texture: Some(EARTH_NIGHT_BYTES),
 };
 
 // --- Mars -----------------------------------------------------------------
@@ -270,6 +283,7 @@ pub static MARS: Body = Body {
     fallback_texture: MARS_FALLBACK_BYTES,
     show_political_overlays: false,
     night_dim: 0.10,
+    night_texture: None,
 };
 
 // --- Moon -----------------------------------------------------------------
@@ -309,6 +323,7 @@ pub static MOON: Body = Body {
     fallback_texture: MOON_FALLBACK_BYTES,
     show_political_overlays: false,
     night_dim: 0.02,
+    night_texture: None,
 };
 
 // A Middle-earth body was prototyped in plan 0003 M4 as a procedural

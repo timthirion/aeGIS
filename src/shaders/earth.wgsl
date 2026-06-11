@@ -25,6 +25,10 @@ struct Camera {
 @group(0) @binding(0) var<uniform> camera: Camera;
 @group(0) @binding(1) var earth_tex: texture_2d<f32>;
 @group(0) @binding(2) var earth_sampler: sampler;
+// City-lights texture (plan 0009 M2). Earth binds NASA Black Marble;
+// other bodies bind a 1×1 black pixel so the BGL is uniform —
+// sampling black there reduces to the M0 + M1 behaviour cleanly.
+@group(0) @binding(3) var night_tex: texture_2d<f32>;
 
 const PI: f32 = 3.14159265358979323846;
 const HALF_PI: f32 = 1.5707963267948966;
@@ -98,6 +102,26 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         discard;
     }
     let day_rgb = textureSample(earth_tex, earth_sampler, in.uv).rgb;
-    let mult = day_night_color(normalize(in.sphere), camera.sun_dir, camera.night_dim);
-    return vec4<f32>(day_rgb * mult, 1.0);
+    let night_rgb = textureSample(night_tex, earth_sampler, in.uv).rgb;
+    let sphere_n = normalize(in.sphere);
+    let cos_sun = dot(sphere_n, camera.sun_dir);
+    let day = smoothstep(0.0, 0.15, cos_sun);
+    // Dawn/dusk warm tint on the day side. Same coefficients as
+    // `day_night_color`; inlined here because Earth's composite
+    // splits the day + night terms rather than applying a single
+    // multiplier.
+    let warm_rise = smoothstep(-0.05, 0.05, cos_sun);
+    let warm_fall = 1.0 - smoothstep(0.05, 0.3, cos_sun);
+    let warm = warm_rise * warm_fall * 0.6;
+    let warm_tint = mix(vec3<f32>(1.0, 1.0, 1.0), vec3<f32>(1.3, 0.8, 0.5), warm);
+    let day_term = day_rgb * warm_tint;
+    // Night side: city lights at full brightness on top of a very
+    // faint copy of the day surface. Black Marble already encodes
+    // both lights + dim oceans/continents so adding `day_rgb *
+    // night_dim` would brighten the whole night side too much —
+    // keep it small. Boost the city-lights term so it's clearly
+    // visible against the dimmed surface.
+    let night_term = night_rgb * 1.3 + day_rgb * camera.night_dim;
+    let composite = mix(night_term, day_term, day);
+    return vec4<f32>(composite, 1.0);
 }

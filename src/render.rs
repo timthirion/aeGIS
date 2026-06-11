@@ -2574,6 +2574,10 @@ struct BodyResources {
     /// Held only to keep the texture view inside `bind_group`
     /// alive for the lifetime of the renderer.
     _texture: wgpu::Texture,
+    /// Held to keep the bind-group's night-texture view alive.
+    /// Bodies without a city-lights texture (Mars, Moon) still
+    /// own a 1×1 black pixel so the BGL stays uniform.
+    _night_texture: wgpu::Texture,
     _sampler: wgpu::Sampler,
     camera_buf: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
@@ -2690,6 +2694,65 @@ fn build_body_resources(
         mipmap_filter: wgpu::MipmapFilterMode::Nearest,
         ..Default::default()
     });
+
+    // Night-side city-lights texture (plan 0009 M2). Earth ships
+    // NASA Black Marble; other bodies bind a 1×1 black pixel so
+    // the bind-group layout stays uniform. The fragment shader
+    // composites this on top of the dimmed day surface on the
+    // night hemisphere (additive blend, so a black sampling falls
+    // back cleanly to the M1 behaviour).
+    let (night_rgba, night_w, night_h) = if let Some(bytes) = body.night_texture {
+        let decoded = tile::decode_image(bytes).unwrap_or_else(|_| {
+            panic!(
+                "{} night-lights JPEG failed to decode — binary is corrupt",
+                body.display_name
+            )
+        });
+        log::info!(
+            "body night-lights: {} decoded {}×{} from bundled JPEG",
+            body.display_name,
+            decoded.width,
+            decoded.height
+        );
+        (decoded.rgba, decoded.width, decoded.height)
+    } else {
+        (vec![0u8, 0, 0, 255], 1u32, 1u32)
+    };
+    let night_texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("aegis-body-night-texture"),
+        size: wgpu::Extent3d {
+            width: night_w,
+            height: night_h,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: &night_texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        &night_rgba,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(night_w * 4),
+            rows_per_image: Some(night_h),
+        },
+        wgpu::Extent3d {
+            width: night_w,
+            height: night_h,
+            depth_or_array_layers: 1,
+        },
+    );
+    let night_view = night_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
     let camera_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("aegis-body-camera"),
         contents: bytemuck::bytes_of(&EarthCameraUniform::default()),
@@ -2711,10 +2774,15 @@ fn build_body_resources(
                 binding: 2,
                 resource: wgpu::BindingResource::Sampler(&sampler),
             },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: wgpu::BindingResource::TextureView(&night_view),
+            },
         ],
     });
     BodyResources {
         _texture: texture,
+        _night_texture: night_texture,
         _sampler: sampler,
         camera_buf,
         bind_group,
@@ -2757,6 +2825,16 @@ fn build_body_pipeline(
                 binding: 2,
                 visibility: wgpu::ShaderStages::FRAGMENT,
                 ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 3,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
                 count: None,
             },
         ],
