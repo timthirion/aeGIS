@@ -525,6 +525,11 @@ pub struct Renderer {
     /// panel header; default on. When off, no per-satellite trails
     /// or selected-satellite trail draws.
     trails_enabled: bool,
+    /// User-controlled country-outline visibility. AND-ed with the
+    /// body's `show_political_overlays` so Mars / Moon still hide
+    /// the (Earth-shaped) outlines regardless of this flag. Default
+    /// true; toggle lives in the bottom-left "Borders" pill.
+    borders_visible: bool,
     /// NORAD ids the user has explicitly hidden via the per-row
     /// checkbox in the satellite-list panel. Hidden satellites
     /// skip both the dot draw and any trail draw. The set is
@@ -884,6 +889,7 @@ impl Renderer {
             selected_satellite: None,
             hovered_satellite: None,
             trails_enabled: true,
+            borders_visible: true,
             hidden_satellites: HashSet::new(),
             orbit_frame_positions: Vec::new(),
         }
@@ -1637,6 +1643,18 @@ impl Renderer {
     /// Turn orbital trails on or off.
     pub fn set_trails_enabled(&mut self, enabled: bool) {
         self.trails_enabled = enabled;
+    }
+
+    /// Whether country outlines are currently drawn. AND-ed with
+    /// the active body's `show_political_overlays` — Mars / Moon
+    /// hide the outlines regardless.
+    pub fn borders_visible(&self) -> bool {
+        self.borders_visible
+    }
+
+    /// Turn the country-outline vector overlay on or off.
+    pub fn set_borders_visible(&mut self, visible: bool) {
+        self.borders_visible = visible;
     }
 
     /// Show or hide a single satellite by NORAD id. Hidden
@@ -2468,7 +2486,7 @@ impl Renderer {
             // makes sense on Earth. Mars / Moon / Middle-earth have
             // no countries, and rendering the Earth-shaped outline
             // over them would look wrong.
-            if self.active_body_ref().show_political_overlays {
+            if self.active_body_ref().show_political_overlays && self.borders_visible {
                 if let Some(vector) = &self.vector {
                     pass.set_pipeline(&self.vector_pipeline);
                     pass.set_bind_group(0, &self.vector_bind_group, &[]);

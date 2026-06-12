@@ -110,11 +110,22 @@
        control: the active mode reads as a filled pill, the inactive
        one as a ghost button. Sits inside the canvas's positioned
        container so it floats over the render surface. */
-    #basemap-toggle {
+    /* Bottom-left UI row — basemap toggle + borders toggle sit
+       side-by-side, each in its own pill, with a small gap. The
+       wrapper owns the absolute position so individual pill
+       widths don't have to be coordinated with hand-tuned
+       `left:` offsets. */
+    #ui-bottom-left {
       position: absolute;
       left: 16px;
       bottom: 16px;
       z-index: 10;
+      display: inline-flex;
+      gap: 10px;
+      align-items: center;
+    }
+    #basemap-toggle,
+    #border-toggle {
       display: inline-flex;
       padding: 3px;
       background: rgba(11, 14, 18, 0.78);
@@ -126,7 +137,8 @@
       font: 12px/1 ui-sans-serif, system-ui, -apple-system, sans-serif;
       user-select: none;
     }
-    #basemap-toggle button {
+    #basemap-toggle button,
+    #border-toggle button {
       appearance: none;
       border: none;
       background: transparent;
@@ -138,11 +150,16 @@
       letter-spacing: 0.02em;
       transition: background-color 120ms, color 120ms;
     }
-    #basemap-toggle button:hover { color: #e6e8eb; }
-    #basemap-toggle button[aria-pressed="true"] {
+    #basemap-toggle button:hover,
+    #border-toggle button:hover { color: #e6e8eb; }
+    #basemap-toggle button[aria-pressed="true"],
+    #border-toggle button[aria-pressed="true"] {
       background: #2a3340;
       color: #e6e8eb;
     }
+    /* Borders only make sense on Earth — same data-body gate the
+       country outlines themselves use. */
+    body:not([data-body="earth"]) #border-toggle { display: none; }
 
     /* Satellite-category pills (plan 0004 M2). Same chrome palette
        as the basemap toggle. Earth-only — hidden on other bodies
@@ -547,9 +564,19 @@
       />
       <div id="aegis-search-results" role="listbox"></div>
     </div>
-    <div id="basemap-toggle" role="group" aria-label="Basemap">
-      <button type="button" data-mode="map" aria-pressed="false">Map</button>
-      <button type="button" data-mode="satellite" aria-pressed="true">Satellite</button>
+    <div id="ui-bottom-left">
+      <div id="basemap-toggle" role="group" aria-label="Basemap">
+        <button type="button" data-mode="map" aria-pressed="false">Map</button>
+        <button type="button" data-mode="satellite" aria-pressed="true">Satellite</button>
+      </div>
+      <div id="border-toggle" role="group" aria-label="Country outlines">
+        <button
+          type="button"
+          id="border-toggle-btn"
+          aria-pressed="true"
+          title="Toggle country outlines"
+        >Borders</button>
+      </div>
     </div>
     <div id="aegis-sat-tooltip" role="status" aria-live="polite"></div>
     <div id="aegis-sat-panel" role="region" aria-label="Satellites">
@@ -656,6 +683,7 @@
       try {
         aegis = await start("aegis-host");
         wireBasemapToggle(aegis);
+        wireBorderToggle(aegis);
         wireBodySwitcher(aegis);
         wireOrbitCategories(aegis);
         wireSatTooltip(aegis);
@@ -1130,6 +1158,18 @@
       // Demoted-state can change as TLEs stream in; poll a bit
       // after each click for the budget guard to settle.
       setInterval(syncState, 2000);
+    }
+
+    function wireBorderToggle(instance) {
+      const btn = document.getElementById("border-toggle-btn");
+      if (!btn) return;
+      // Sync to whatever the renderer's actual state is at startup.
+      btn.setAttribute("aria-pressed", instance.bordersVisible() ? "true" : "false");
+      btn.addEventListener("click", () => {
+        const next = btn.getAttribute("aria-pressed") !== "true";
+        instance.setBordersVisible(next);
+        btn.setAttribute("aria-pressed", next ? "true" : "false");
+      });
     }
 
     function wireBasemapToggle(instance) {

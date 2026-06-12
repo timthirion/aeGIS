@@ -332,6 +332,23 @@ impl AegisInstance {
         self.inner.borrow().renderer.trails_enabled()
     }
 
+    /// Toggle the country-outline vector overlay.
+    #[wasm_bindgen(js_name = setBordersVisible)]
+    pub fn set_borders_visible(&self, visible: bool) {
+        self.inner
+            .borrow_mut()
+            .renderer
+            .set_borders_visible(visible);
+    }
+
+    /// Whether country outlines are currently drawn (user-controlled
+    /// part of the gate; per-body `show_political_overlays` still
+    /// hides them off-Earth).
+    #[wasm_bindgen(js_name = bordersVisible)]
+    pub fn borders_visible(&self) -> bool {
+        self.inner.borrow().renderer.borders_visible()
+    }
+
     /// Show or hide a single satellite by NORAD id. Per-row
     /// visibility checkbox in the side-panel list drives this.
     #[wasm_bindgen(js_name = setSatelliteVisible)]
