@@ -62,10 +62,28 @@ const SAT_DWELL_FRAMES: u32 = 30;
 /// How many times a satellite-tile fetch is allowed to try before we
 /// give up and mark it permanently failed for this camera position.
 /// The first attempt is "1," so this number includes the original
-/// dispatch — `3` means original + 2 retries. Esri's CDN sometimes
+/// dispatch — `5` means original + 4 retries. Esri's CDN sometimes
 /// serves a header-stripped response from a misconfigured edge; a
-/// single retry almost always lands on a working edge.
-const SAT_MAX_ATTEMPTS: u32 = 3;
+/// single retry usually lands on a working edge, but under fetch
+/// pressure (browsers throttle ~6 concurrent requests per origin)
+/// some edges trip "Failed to fetch" and need more retries to land.
+const SAT_MAX_ATTEMPTS: u32 = 5;
+
+/// Maximum concurrent in-flight satellite-tile fetches. Browsers
+/// limit concurrent connections per origin (~6 in Chrome/Firefox);
+/// dispatching well past that gets some requests stuck or rejected
+/// outright with "Failed to fetch". Keep the in-flight count
+/// comfortably under the browser's per-origin cap so each request
+/// gets a working socket and our retries land cleanly.
+const SAT_MAX_INFLIGHT: usize = 6;
+
+/// Maximum new satellite-tile fetches dispatched per call to
+/// `dispatch_visible_sat_tiles`. Combined with the per-frame call
+/// from the post-dwell loop, this caps the dispatch rate to
+/// `MAX_PER_FRAME × 60 fps = 480 tiles/sec`, well within tile CDN
+/// budgets while still draining a 130-tile sphere-cap selection
+/// in under three seconds.
+const SAT_MAX_DISPATCH_PER_FRAME: usize = 8;
 
 // The bundled Blue Marble JPEG used to live at
 // `EARTH_JPG_BYTES = include_bytes!("../data/blue-marble/...")`
@@ -1270,16 +1288,32 @@ impl Renderer {
             self.sat_dwell_frames += 1;
             return;
         }
-        if self.sat_dwell_frames == SAT_DWELL_FRAMES {
-            self.dispatch_visible_sat_tiles();
-            self.sat_dwell_frames = self.sat_dwell_frames.saturating_add(1);
-        }
+        // Post-dwell, dispatch on every frame — the dispatcher's
+        // own caps (`SAT_MAX_INFLIGHT`, `SAT_MAX_DISPATCH_PER_FRAME`)
+        // keep the rate sane, and re-running each frame lets us
+        // drain a large visible set over many frames instead of
+        // bursting them all at once. Bursting saturates the
+        // browser's per-origin connection pool and surfaces as
+        // "Failed to fetch" errors at the JS layer.
+        self.dispatch_visible_sat_tiles();
+        self.sat_dwell_frames = self.sat_dwell_frames.saturating_add(1);
     }
 
-    /// Unconditionally enqueue the visible satellite-tile set for
-    /// fetch. Used by both the dwell-gated path above and the
-    /// immediate-fetch branch in [`Self::set_basemap_mode`].
+    /// Enqueue (up to) `SAT_MAX_DISPATCH_PER_FRAME` newly-visible
+    /// satellite-tile fetches. Bounded so a single dispatch never
+    /// bursts past the browser's per-origin connection cap; the
+    /// post-dwell loop re-calls this every frame so a large
+    /// visible set drains over many frames instead of all at once.
+    /// Also gated by `SAT_MAX_INFLIGHT` so we never push more
+    /// concurrent requests at the CDN than it can comfortably
+    /// service.
     fn dispatch_visible_sat_tiles(&mut self) {
+        let inflight = self.sat_requested.len();
+        if inflight >= SAT_MAX_INFLIGHT {
+            return;
+        }
+        let budget = SAT_MAX_INFLIGHT - inflight;
+        let per_frame = budget.min(SAT_MAX_DISPATCH_PER_FRAME);
         let canvas = self.size();
         let basemap = self.active_basemap_ref();
         let visible = self
@@ -1288,6 +1322,9 @@ impl Renderer {
         let visible_count = visible.len();
         let mut dispatched = 0;
         for id in visible {
+            if dispatched >= per_frame {
+                break;
+            }
             if self.sat_tiles.contains_key(&id)
                 || self.sat_requested.contains(&id)
                 || self.sat_failed.contains(&id)
