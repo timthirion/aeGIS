@@ -1010,9 +1010,20 @@ impl Renderer {
     /// polygons contain that point. Returns `None` if the cursor
     /// ray misses the sphere or no feature covers the hit. Plan
     /// 0007.
+    ///
+    /// **Zoom gate.** Only fires when `altitude > 0.05` — at
+    /// street zoom the user clicks to navigate, not to identify,
+    /// and a "United States of America" card popping under every
+    /// click is just noise. Matches the same threshold the
+    /// day/night + atmosphere + starfield strength ramps use, so
+    /// the feature card appears where the "globe-ish view"
+    /// affordances are already on.
     pub fn pick_feature_at(&self, cursor_x: f64, cursor_y: f64) -> Option<&str> {
         let canvas = self.size();
         if canvas.0 == 0 || canvas.1 == 0 {
+            return None;
+        }
+        if self.camera.altitude(canvas) < 0.05 {
             return None;
         }
         let ndc_x = (cursor_x / canvas.0 as f64) * 2.0 - 1.0;

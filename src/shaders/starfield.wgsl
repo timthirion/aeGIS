@@ -36,17 +36,22 @@ const PI: f32 = 3.14159265358979323846;
 /// Half the perspective camera's vertical FOV (60° / 2). Mirrors
 /// the `60.0_f32.to_radians()` in `Camera::view_projection_matrix`.
 const FOV_HALF_Y: f32 = 0.5235987755982988;
-/// Cells across the equal-area celestial-sphere parameterisation.
-/// Final star count ≈ density² × 2 × (1 − threshold) ≈ 1080 with
-/// the params below. Visually reads as a generous-but-not-busy
-/// star field at globe view.
-const STAR_DENSITY: f32 = 60.0;
-/// Hash threshold above which a cell holds a star. 0.85 = ~15% of
-/// cells generate a star.
+/// Cells per radian on the celestial sphere. Direct angular
+/// parameterisation `(lon, lat)` keeps cell aspect square at
+/// low latitudes so stars look round in screen space — the
+/// earlier `(lon/π, sin lat)` packing made them stretch
+/// horizontally by ~3× the vertical extent.
+///
+/// Total cells ≈ 2π² × density² ≈ 7900 here; at 15 % survival
+/// rate that's ~1200 visible stars on the celestial sphere.
+const STAR_DENSITY: f32 = 20.0;
+/// Hash threshold above which a cell holds a star. 0.85 = ~15 %
+/// of cells generate a star.
 const STAR_THRESHOLD: f32 = 0.85;
-/// Sharper exponential gives smaller stars; 60 ≈ 1/STAR_DENSITY
-/// per pixel diameter. Tunable.
-const STAR_FALLOFF: f32 = 60.0;
+/// Linear-falloff radius in cell units. Star covers up to
+/// `1 / STAR_INV_RADIUS = ~0.06` of a cell, ≈ 0.18° on sky →
+/// roughly 1–2 screen pixels at a 1000-px-wide canvas.
+const STAR_INV_RADIUS: f32 = 16.0;
 
 struct VsOut {
     @builtin(position) clip: vec4<f32>,
@@ -106,12 +111,13 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         + up * (in.ndc.y * tan_half)
     );
 
-    // Equal-area parameterisation of the celestial sphere:
-    // (lon/π, sin(lat)). Both axes range over [-1, 1] and a
-    // uniform grid in this space gives uniform-area cells on the
-    // sphere — much better than raw lat/lon, which would bunch
-    // stars near the poles.
-    let p = vec2<f32>(atan2(dir.x, dir.z) / PI, dir.y) * STAR_DENSITY;
+    // Direct angular parameterisation `(lon, lat)`. Stars look
+    // isotropic at low latitudes — the previous `(lon/π, sin lat)`
+    // packing stretched them horizontally by ~3× because the two
+    // axes spanned different arc lengths under the same density.
+    // Near-pole longitude bunching still happens but reads as
+    // "more stars near zenith," which looks natural.
+    let p = vec2<f32>(atan2(dir.x, dir.z), asin(dir.y)) * STAR_DENSITY;
     let cell = floor(p);
     let local = p - cell;
 
@@ -125,10 +131,22 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 
             let exists_hash = hash21(neighbor + vec2<f32>(5.7, 3.1));
             let exists = step(STAR_THRESHOLD, exists_hash);
-            // Rare bright stars: the top 3% of "exists" hashes get
-            // an extra 2× brightness so a few stand out.
-            let bright_boost = 1.0 + step(0.97, exists_hash) * 1.5;
-            let intensity = exists * bright_boost * exp(-dist * STAR_FALLOFF);
+
+            // Wide brightness range like a real night sky: most
+            // stars dim, occasional medium, rare very bright.
+            // Earlier flat curve made every star look the same.
+            let bright_boost =
+                0.35
+                + step(0.92, exists_hash) * 1.0
+                + step(0.98, exists_hash) * 2.5;
+
+            // Hard-cutoff quadratic falloff instead of the previous
+            // exponential. exp() has a long tail that reads as a
+            // soft halo — "smeared" stars. `max(0, 1 − d/r)²`
+            // goes cleanly to zero outside the star, giving the
+            // pin-prick look.
+            let radius_factor = max(0.0, 1.0 - dist * STAR_INV_RADIUS);
+            let intensity = exists * bright_boost * radius_factor * radius_factor;
 
             // Subtle blue/yellow tint by another hash slot.
             let color_h = hash21(neighbor + vec2<f32>(11.0, 17.0));
