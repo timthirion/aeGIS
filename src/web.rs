@@ -349,6 +349,21 @@ impl AegisInstance {
         self.inner.borrow().renderer.borders_visible()
     }
 
+    /// Inverse-project canvas pixel `(x, y)` (CSS pixels, top-left
+    /// origin) back to a sphere lon/lat and return the country
+    /// name at that hit, or `""` if the cursor missed the sphere
+    /// or no feature covers the hit. Plan 0007.
+    #[wasm_bindgen(js_name = pickFeature)]
+    pub fn pick_feature(&self, cursor_x: f64, cursor_y: f64) -> String {
+        let dpr = web_window().device_pixel_ratio().max(1.0);
+        self.inner
+            .borrow()
+            .renderer
+            .pick_feature_at(cursor_x * dpr, cursor_y * dpr)
+            .map(str::to_owned)
+            .unwrap_or_default()
+    }
+
     /// Show or hide a single satellite by NORAD id. Per-row
     /// visibility checkbox in the side-panel list drives this.
     #[wasm_bindgen(js_name = setSatelliteVisible)]
@@ -645,16 +660,16 @@ pub async fn start(host_id: String) -> Result<AegisInstance, JsValue> {
         let inner_for_vector = inner.clone();
         wasm_bindgen_futures::spawn_local(async move {
             match fetch_text("./data/natural-earth/countries.geojson").await {
-                Ok(source) => match crate::vector::load_geojson_lines(&source) {
-                    Ok(layer) => {
+                Ok(source) => match crate::vector::load_geojson(&source) {
+                    Ok((layer, index)) => {
                         log::info!(
-                            "loaded countries.geojson ({} segments)",
-                            layer.segment_count()
+                            "loaded countries.geojson ({} segments, {} features)",
+                            layer.segment_count(),
+                            index.features.len()
                         );
-                        inner_for_vector
-                            .borrow_mut()
-                            .renderer
-                            .set_vector_layer(&layer);
+                        let mut borrow = inner_for_vector.borrow_mut();
+                        borrow.renderer.set_vector_layer(&layer);
+                        borrow.renderer.set_identify_index(index);
                     }
                     Err(e) => log::warn!("parse countries.geojson: {e}"),
                 },

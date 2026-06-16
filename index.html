@@ -208,6 +208,26 @@
     /* Satellite hover tooltip (plan 0004 M4). Floats near the
        cursor, shows the hit satellite's name + altitude. Hidden
        when there's nothing under the cursor. */
+    /* Click-to-identify feature info card. Shows the country name
+       at the click location until the user clicks elsewhere or
+       presses Escape. Same chrome as the satellite hover tooltip
+       so the two read as one family. */
+    #aegis-feature-info {
+      position: absolute;
+      pointer-events: none;
+      z-index: 12;
+      padding: 6px 12px;
+      background: rgba(11, 14, 18, 0.92);
+      border: 1px solid #2a3340;
+      border-radius: 6px;
+      color: #e6e8eb;
+      font: 12px/1.3 ui-sans-serif, system-ui, -apple-system, sans-serif;
+      box-shadow: 0 2px 12px rgba(0, 0, 0, 0.45);
+      display: none;
+      transform: translate(12px, 12px);
+    }
+    #aegis-feature-info[data-visible="true"] { display: block; }
+
     #aegis-sat-tooltip {
       position: absolute;
       pointer-events: none;
@@ -579,6 +599,7 @@
       </div>
     </div>
     <div id="aegis-sat-tooltip" role="status" aria-live="polite"></div>
+    <div id="aegis-feature-info" role="status" aria-live="polite"></div>
     <div id="aegis-sat-panel" role="region" aria-label="Satellites">
       <header>
         <input
@@ -1104,15 +1125,40 @@
         setTooltip(info, e);
       });
       host.addEventListener("pointerleave", (e) => setTooltip(null, e));
+      const featureInfo = document.getElementById("aegis-feature-info");
+      const showFeature = (name, evt) => {
+        if (!name) {
+          featureInfo.setAttribute("data-visible", "false");
+          return;
+        }
+        featureInfo.textContent = name;
+        const r = host.getBoundingClientRect();
+        featureInfo.style.left = `${evt.clientX - r.left}px`;
+        featureInfo.style.top = `${evt.clientY - r.top}px`;
+        featureInfo.setAttribute("data-visible", "true");
+      };
       host.addEventListener("click", (e) => {
-        if (instance.body() !== "earth") return;
+        if (instance.body() !== "earth") {
+          showFeature(null, e);
+          return;
+        }
         const rect = host.getBoundingClientRect();
         const cx = e.clientX - rect.left;
         const cy = e.clientY - rect.top;
-        const info = instance.satelliteUnderCursor(cx, cy);
-        if (info) {
-          instance.selectSatellite(info.norad);
+        const sat = instance.satelliteUnderCursor(cx, cy);
+        if (sat) {
+          instance.selectSatellite(sat.norad);
+          showFeature(null, e);
+          return;
         }
+        // No satellite under cursor — try to identify the country.
+        const name = instance.pickFeature(cx, cy);
+        showFeature(name && name.length > 0 ? name : null, e);
+      });
+      // Escape clears the sticky feature info (matches the
+      // attribution overlay's keyboard convention).
+      document.addEventListener("keydown", (e) => {
+        if (e.key === "Escape") showFeature(null, e);
       });
 
       // List-row hover: same tooltip content as canvas hover, so

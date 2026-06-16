@@ -43,7 +43,7 @@ fn projection_to_u32(p: TileProjection) -> u32 {
         TileProjection::Equirectangular => 1,
     }
 }
-use crate::vector::VectorLayer;
+use crate::vector::{self, VectorLayer};
 
 const TILE_SHADER: &str = include_str!("shaders/tile.wgsl");
 const VECTOR_SHADER: &str = include_str!("shaders/vector.wgsl");
@@ -389,6 +389,11 @@ pub struct Renderer {
     vector_camera_buf: wgpu::Buffer,
     vector_bind_group: wgpu::BindGroup,
     vector: Option<VectorBinding>,
+    /// Polygon footprints + names paired with the country outlines.
+    /// Populated alongside `vector` by `set_vector_data`; used by
+    /// `pick_country_at` to answer click-to-identify queries. Plan
+    /// 0007.
+    identify_index: vector::IdentifyIndex,
 
     /// Polar-cap pipeline + one uniform buffer per cap. The shader is
     /// pure-procedural (no vertex buffer), so each draw needs only its
@@ -855,6 +860,7 @@ impl Renderer {
             vector_camera_buf,
             vector_bind_group,
             vector: None,
+            identify_index: vector::IdentifyIndex::default(),
             cap_pipeline,
             north_cap_buf,
             north_cap_bind_group,
@@ -988,6 +994,93 @@ impl Renderer {
             vertex_buf,
             vertex_count: layer.vertices.len() as u32,
         });
+    }
+
+    /// Install the click-to-identify polygon index alongside the
+    /// rendered outlines. Loaders that call `vector::load_geojson`
+    /// get both halves of the pair and pass each through its own
+    /// setter. Plan 0007.
+    pub fn set_identify_index(&mut self, index: vector::IdentifyIndex) {
+        log::info!("set_identify_index: {} features", index.features.len());
+        self.identify_index = index;
+    }
+
+    /// Inverse-project a canvas pixel back to a `(lon, lat)` on
+    /// the unit sphere, then look up the country / feature whose
+    /// polygons contain that point. Returns `None` if the cursor
+    /// ray misses the sphere or no feature covers the hit. Plan
+    /// 0007.
+    pub fn pick_feature_at(&self, cursor_x: f64, cursor_y: f64) -> Option<&str> {
+        let canvas = self.size();
+        if canvas.0 == 0 || canvas.1 == 0 {
+            return None;
+        }
+        let ndc_x = (cursor_x / canvas.0 as f64) * 2.0 - 1.0;
+        let ndc_y = 1.0 - (cursor_y / canvas.1 as f64) * 2.0;
+
+        let cam = self.camera.camera_3d_position(canvas);
+        let ro = [cam[0] as f64, cam[1] as f64, cam[2] as f64];
+        let cam_len = (ro[0] * ro[0] + ro[1] * ro[1] + ro[2] * ro[2]).sqrt();
+        // Camera always looks at the origin; forward = −normalize(camera_pos).
+        let forward = [-ro[0] / cam_len, -ro[1] / cam_len, -ro[2] / cam_len];
+        // Mirror `view_projection_matrix`'s pole-up switch so the
+        // basis matches the camera the user is actually looking
+        // through.
+        let up_hint = if self.camera.center_lonlat.1.abs() > 89.0 {
+            [0.0_f64, 0.0, 1.0]
+        } else {
+            [0.0_f64, 1.0, 0.0]
+        };
+        let cross_fu = [
+            forward[1] * up_hint[2] - forward[2] * up_hint[1],
+            forward[2] * up_hint[0] - forward[0] * up_hint[2],
+            forward[0] * up_hint[1] - forward[1] * up_hint[0],
+        ];
+        let cross_len = (cross_fu[0].powi(2) + cross_fu[1].powi(2) + cross_fu[2].powi(2)).sqrt();
+        if cross_len < 1e-9 {
+            return None;
+        }
+        let right = [
+            cross_fu[0] / cross_len,
+            cross_fu[1] / cross_len,
+            cross_fu[2] / cross_len,
+        ];
+        let up = [
+            right[1] * forward[2] - right[2] * forward[1],
+            right[2] * forward[0] - right[0] * forward[2],
+            right[0] * forward[1] - right[1] * forward[0],
+        ];
+
+        let aspect = canvas.0 as f64 / canvas.1 as f64;
+        let tan_half = (60.0_f64.to_radians() * 0.5).tan();
+        let rx = ndc_x * aspect * tan_half;
+        let ry = ndc_y * tan_half;
+        let rd_un = [
+            forward[0] + right[0] * rx + up[0] * ry,
+            forward[1] + right[1] * rx + up[1] * ry,
+            forward[2] + right[2] * rx + up[2] * ry,
+        ];
+        let rd_len = (rd_un[0].powi(2) + rd_un[1].powi(2) + rd_un[2].powi(2)).sqrt();
+        let rd = [rd_un[0] / rd_len, rd_un[1] / rd_len, rd_un[2] / rd_len];
+
+        // Ray–unit-sphere intersection (sphere at origin).
+        let b = ro[0] * rd[0] + ro[1] * rd[1] + ro[2] * rd[2];
+        let c = ro[0].powi(2) + ro[1].powi(2) + ro[2].powi(2) - 1.0;
+        let disc = b * b - c;
+        if disc < 0.0 {
+            return None;
+        }
+        let t = -b - disc.sqrt();
+        if t < 0.0 {
+            return None;
+        }
+        let p = [ro[0] + t * rd[0], ro[1] + t * rd[1], ro[2] + t * rd[2]];
+        // Sphere → lon/lat with prime meridian at +Z (matches
+        // `lonlat_to_sphere` in the shaders).
+        let lat = p[1].asin().to_degrees();
+        let lon = p[0].atan2(p[2]).to_degrees();
+
+        self.identify_index.pick(lon, lat).map(|f| f.name.as_str())
     }
 
     /// Surface dimensions in physical pixels.

@@ -66,14 +66,16 @@ pub fn run() {
     // run from any working directory the file might not be present).
     let geojson_path = "data/natural-earth/countries.geojson";
     match std::fs::read_to_string(geojson_path) {
-        Ok(source) => match vector::load_geojson_lines(&source) {
-            Ok(layer) => {
+        Ok(source) => match vector::load_geojson(&source) {
+            Ok((layer, index)) => {
                 log::info!(
-                    "loaded {} ({} segments)",
+                    "loaded {} ({} segments, {} features)",
                     geojson_path,
-                    layer.segment_count()
+                    layer.segment_count(),
+                    index.features.len()
                 );
                 renderer.set_vector_layer(&layer);
+                renderer.set_identify_index(index);
             }
             Err(e) => log::warn!("parse {geojson_path}: {e}"),
         },
