@@ -1160,6 +1160,15 @@
       document.addEventListener("keydown", (e) => {
         if (e.key === "Escape") showFeature(null, e);
       });
+      // Any camera-affecting interaction clears the card. The
+      // tooltip is screen-space-anchored but the country it
+      // labels can rotate / pan out from under it, leaving a
+      // "United States" tag floating over the Pacific. Drag
+      // start (pointerdown) + scroll (wheel) cover every input
+      // that moves the camera; the next click can re-pop a
+      // fresh card.
+      host.addEventListener("pointerdown", (e) => showFeature(null, e));
+      host.addEventListener("wheel", (e) => showFeature(null, e), { passive: true });
 
       // List-row hover: same tooltip content as canvas hover, so
       // users can browse the panel and see what each line *is*.
