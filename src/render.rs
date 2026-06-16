@@ -489,6 +489,11 @@ pub struct Renderer {
     /// User input (pan / zoom / basemap toggle) clears it so the
     /// animation never fights the user. Plan 0002 M3.
     flyto: Option<crate::flyto::FlyTo>,
+    /// Latched true at startup; the first `tick_fly_to` consumes it
+    /// to enqueue the from-space fly-in down to the home zoom.
+    /// Distinct from `flyto` so the trigger doesn't depend on a
+    /// monotonic clock that isn't available at construction time.
+    initial_fly_pending: bool,
 
     /// Simulation clock — drives satellite-orbit propagation
     /// (plan 0004) and, when plan 0010 ships, the day/night
@@ -884,10 +889,16 @@ impl Renderer {
             // will reuse in M4.
             active_body: BodyId::Earth,
             active_basemap: BasemapMode::Satellite.to_basemap_id(),
+            // Initial camera lands in globe view directly above the
+            // home longitude/latitude; the first frame triggers a
+            // fly-in down to `body.home.zoom` so first-load reads
+            // as "zoom in from space" rather than dropping the
+            // user straight into a street-level view.
             camera: {
                 let h = body::EARTH.home;
-                Camera::new(h.lon, h.lat, h.zoom)
+                Camera::new(h.lon, h.lat, 1.0)
             },
+            initial_fly_pending: true,
             flyto: None,
             sim_clock,
             satellites: Vec::new(),
@@ -1548,6 +1559,29 @@ impl Renderer {
     /// Clears the animation when complete. No-op when no fly-to
     /// is active.
     pub fn tick_fly_to(&mut self, now: f64) {
+        // First-frame from-space fly-in. We can't construct the
+        // FlyTo in `Renderer::new` because the monotonic clock is
+        // only available here — `now=0` would race with the same-
+        // tick `tick_orbit` that already reads the clock. Triggered
+        // exactly once, then `initial_fly_pending` stays false for
+        // the rest of the session (body switches construct their
+        // own short flies via `set_body`).
+        if self.initial_fly_pending {
+            self.initial_fly_pending = false;
+            let h = body::EARTH.home;
+            self.flyto = Some(crate::flyto::FlyTo {
+                start_lonlat: (h.lon, h.lat),
+                start_zoom: 1.0,
+                target_lonlat: (h.lon, h.lat),
+                target_zoom: h.zoom,
+                started_at: now,
+                // Bypass the great-circle-arc-derived duration —
+                // a same-lonlat fly would otherwise snap in 0.4s.
+                // 2.5s gives the user time to actually see the
+                // globe before the dive.
+                duration: 2.5,
+            });
+        }
         let Some(fly) = self.flyto else { return };
         let (lonlat, zoom) = fly.sample(now);
         self.camera.center_lonlat = lonlat;
