@@ -52,6 +52,7 @@ const EARTH_SHADER: &str = include_str!("shaders/earth.wgsl");
 const ORBIT_SHADER: &str = include_str!("shaders/orbit.wgsl");
 const ORBIT_TRAIL_SHADER: &str = include_str!("shaders/orbit_trail.wgsl");
 const ATMOSPHERE_SHADER: &str = include_str!("shaders/atmosphere.wgsl");
+const STARFIELD_SHADER: &str = include_str!("shaders/starfield.wgsl");
 
 /// Frames the camera state must stay unchanged before we consider it
 /// "settled" and trigger a satellite-tile fetch. At 60 fps this is
@@ -242,6 +243,18 @@ struct EarthCameraUniform {
     night_dim: f32,
 }
 
+/// Per-frame uniform consumed by `starfield.wgsl`. 32 bytes —
+/// camera pos + aspect ratio, up-hint + zoom-driven strength.
+/// Mirrors the WGSL struct of the same name byte-for-byte.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, Pod, Zeroable)]
+struct StarfieldUniform {
+    camera_pos: [f32; 3],
+    aspect: f32,
+    up_hint: [f32; 3],
+    strength: f32,
+}
+
 /// Per-frame uniform consumed by `atmosphere.wgsl`. 144 bytes
 /// (9 × vec4). Owns the per-body Rayleigh + Mie params alongside
 /// the camera / sun state; one buffer is rewritten each frame for
@@ -401,6 +414,15 @@ pub struct Renderer {
     atmosphere_pipeline: wgpu::RenderPipeline,
     atmosphere_uniform_buf: wgpu::Buffer,
     atmosphere_bind_group: wgpu::BindGroup,
+
+    /// Procedural starfield drawn first in the pass so the lit
+    /// globe + tiles + atmosphere overwrite it where they cover.
+    /// One fullscreen quad, fragment hash → ~1000 stars in the
+    /// celestial sphere. Zoom-ramped strength fades to 0 by
+    /// street zoom.
+    starfield_pipeline: wgpu::RenderPipeline,
+    starfield_uniform_buf: wgpu::Buffer,
+    starfield_bind_group: wgpu::BindGroup,
 
     /// Tiles that have been decoded + uploaded to the GPU.
     tiles: HashMap<TileId, TileBinding>,
@@ -751,6 +773,8 @@ impl Renderer {
         let (body_pipeline, body_bgl) = build_body_pipeline(&device, format);
         let (atmosphere_pipeline, atmosphere_uniform_buf, atmosphere_bind_group) =
             build_atmosphere_pipeline(&device, format);
+        let (starfield_pipeline, starfield_uniform_buf, starfield_bind_group) =
+            build_starfield_pipeline(&device, format);
         let mut body_resources: HashMap<BodyId, BodyResources> = HashMap::new();
         for body in body::all() {
             body_resources.insert(
@@ -836,6 +860,9 @@ impl Renderer {
             atmosphere_pipeline,
             atmosphere_uniform_buf,
             atmosphere_bind_group,
+            starfield_pipeline,
+            starfield_uniform_buf,
+            starfield_bind_group,
             tiles: HashMap::new(),
             requested: HashSet::new(),
             failed: HashSet::new(),
@@ -2295,6 +2322,31 @@ impl Renderer {
                 .write_buffer(&res.camera_buf, 0, bytemuck::bytes_of(&body_camera));
         }
 
+        // Starfield uniform. Camera basis is re-derived in-shader
+        // from `camera_pos` (target = origin), so we only need to
+        // pass the position + aspect + up-hint + a zoom-driven
+        // strength. The up-hint mirrors the same near-pole switch
+        // that `view_projection_matrix` uses so the cross product
+        // producing `right` doesn't degenerate at the poles.
+        let star_strength = smoothstep_f32(0.05, 0.5, cam_alt);
+        let up_hint = if self.camera.center_lonlat.1.abs() > 89.0 {
+            [0.0_f32, 0.0, 1.0]
+        } else {
+            [0.0_f32, 1.0, 0.0]
+        };
+        let aspect = canvas.0 as f32 / canvas.1.max(1) as f32;
+        let star_uniform = StarfieldUniform {
+            camera_pos,
+            aspect,
+            up_hint,
+            strength: star_strength,
+        };
+        self.queue.write_buffer(
+            &self.starfield_uniform_buf,
+            0,
+            bytemuck::bytes_of(&star_uniform),
+        );
+
         // Atmosphere uniform (plan 0008 M1+M2). Skipped entirely
         // when the active body has no atmosphere (Moon); otherwise
         // the per-body Rayleigh + Mie params are merged with the
@@ -2407,6 +2459,18 @@ impl Renderer {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
+
+            // Procedural starfield — drawn first so the lit globe +
+            // atmosphere overdraw it where they cover the canvas.
+            // Strength ramps to 0 at street zoom; below that the
+            // fragment shader early-discards so we don't pay the
+            // per-pixel hash cost when stars wouldn't be visible
+            // anyway.
+            if star_strength > 0.0 {
+                pass.set_pipeline(&self.starfield_pipeline);
+                pass.set_bind_group(0, &self.starfield_bind_group, &[]);
+                pass.draw(0..6, 0..1);
+            }
 
             // Body fallback texture — bundled equirectangular imagery
             // covering the full sphere. Drawn under every basemap
@@ -3038,6 +3102,96 @@ fn build_body_pipeline(
     (pipeline, bgl)
 }
 
+/// Build the procedural-starfield pipeline + uniform buffer. One
+/// fullscreen quad (6 vertices, no buffer) renders first in the
+/// pass so subsequent draws can overwrite the stars where they
+/// cover the view.
+fn build_starfield_pipeline(
+    device: &wgpu::Device,
+    format: wgpu::TextureFormat,
+) -> (wgpu::RenderPipeline, wgpu::Buffer, wgpu::BindGroup) {
+    let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("aegis-starfield-bgl"),
+        entries: &[wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        }],
+    });
+    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("aegis-starfield-shader"),
+        source: wgpu::ShaderSource::Wgsl(STARFIELD_SHADER.into()),
+    });
+    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("aegis-starfield-layout"),
+        bind_group_layouts: &[Some(&bgl)],
+        immediate_size: 0,
+    });
+    let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("aegis-starfield-pipeline"),
+        layout: Some(&layout),
+        vertex: wgpu::VertexState {
+            module: &module,
+            entry_point: Some("vs_main"),
+            buffers: &[],
+            compilation_options: Default::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &module,
+            entry_point: Some("fs_main"),
+            targets: &[Some(wgpu::ColorTargetState {
+                format,
+                // Pre-multiplied alpha — the shader outputs
+                // (color * strength, strength) so this blend gives
+                // stars at strength=1 and a clean fade to the
+                // cleared background at strength=0.
+                blend: Some(wgpu::BlendState {
+                    color: wgpu::BlendComponent {
+                        src_factor: wgpu::BlendFactor::One,
+                        dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                        operation: wgpu::BlendOperation::Add,
+                    },
+                    alpha: wgpu::BlendComponent::OVER,
+                }),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            compilation_options: Default::default(),
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            strip_index_format: None,
+            front_face: wgpu::FrontFace::Ccw,
+            cull_mode: None,
+            polygon_mode: wgpu::PolygonMode::Fill,
+            unclipped_depth: false,
+            conservative: false,
+        },
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        multiview_mask: None,
+        cache: None,
+    });
+    let uniform_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("aegis-starfield-uniform"),
+        contents: bytemuck::bytes_of(&StarfieldUniform::default()),
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+    });
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("aegis-starfield-bg"),
+        layout: &bgl,
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: uniform_buf.as_entire_binding(),
+        }],
+    });
+    (pipeline, uniform_buf, bind_group)
+}
+
 /// Standard `smoothstep` (Hermite interpolation, 3t² − 2t³). Used
 /// by the tile-alpha zoom fade so the camera-altitude → opacity
 /// curve matches the WGSL `day_night_color` ramp in lockstep.
@@ -3451,5 +3605,6 @@ mod tests {
         assert_eq!(std::mem::size_of::<CapUniform>(), 112);
         assert_eq!(std::mem::size_of::<EarthCameraUniform>(), 96);
         assert_eq!(std::mem::size_of::<AtmosphereUniform>(), 144);
+        assert_eq!(std::mem::size_of::<StarfieldUniform>(), 32);
     }
 }

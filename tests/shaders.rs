@@ -62,3 +62,11 @@ fn atmosphere_shader_validates() {
         "atmosphere.wgsl",
     );
 }
+
+#[test]
+fn starfield_shader_validates() {
+    validate_wgsl(
+        include_str!("../src/shaders/starfield.wgsl"),
+        "starfield.wgsl",
+    );
+}
