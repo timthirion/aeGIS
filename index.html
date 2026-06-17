@@ -1129,6 +1129,7 @@
       const showFeature = (name, evt) => {
         if (!name) {
           featureInfo.setAttribute("data-visible", "false");
+          instance.clearSelectedFeature();
           return;
         }
         featureInfo.textContent = name;

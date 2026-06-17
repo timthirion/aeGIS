@@ -350,18 +350,26 @@ impl AegisInstance {
     }
 
     /// Inverse-project canvas pixel `(x, y)` (CSS pixels, top-left
-    /// origin) back to a sphere lon/lat and return the country
-    /// name at that hit, or `""` if the cursor missed the sphere
-    /// or no feature covers the hit. Plan 0007.
+    /// origin) back to a sphere lon/lat, return the country name
+    /// at that hit, and as a side effect set the feature as the
+    /// click-highlight. Returns `""` if the cursor missed the
+    /// sphere or no feature covers the hit. Plan 0007.
     #[wasm_bindgen(js_name = pickFeature)]
     pub fn pick_feature(&self, cursor_x: f64, cursor_y: f64) -> String {
         let dpr = web_window().device_pixel_ratio().max(1.0);
         self.inner
-            .borrow()
+            .borrow_mut()
             .renderer
             .pick_feature_at(cursor_x * dpr, cursor_y * dpr)
-            .map(str::to_owned)
             .unwrap_or_default()
+    }
+
+    /// Drop the click-highlight. JS calls this on any camera-
+    /// moving interaction (pointerdown, wheel, Escape) so a stale
+    /// highlight doesn't outline ocean after a rotation.
+    #[wasm_bindgen(js_name = clearSelectedFeature)]
+    pub fn clear_selected_feature(&self) {
+        self.inner.borrow_mut().renderer.clear_selected_feature();
     }
 
     /// Show or hide a single satellite by NORAD id. Per-row

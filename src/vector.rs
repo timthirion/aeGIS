@@ -52,12 +52,20 @@ impl IdentifyIndex {
     /// for a few-ring island country, fast enough that an rstar
     /// R-tree (plan 0007's stretch goal) would be premature.
     pub fn pick(&self, lon: f64, lat: f64) -> Option<&IdentifyFeature> {
-        for f in &self.features {
+        self.pick_with_index(lon, lat).map(|(_, f)| f)
+    }
+
+    /// Same as `pick` but also returns the feature's position in
+    /// `features` so a caller (the highlight pipeline in the
+    /// renderer) can refer to it later by `usize` index without
+    /// holding a borrow across calls.
+    pub fn pick_with_index(&self, lon: f64, lat: f64) -> Option<(usize, &IdentifyFeature)> {
+        for (i, f) in self.features.iter().enumerate() {
             if lon < f.bbox[0] || lon > f.bbox[2] || lat < f.bbox[1] || lat > f.bbox[3] {
                 continue;
             }
             if point_in_multipolygon((lon, lat), &f.polygons) {
-                return Some(f);
+                return Some((i, f));
             }
         }
         None

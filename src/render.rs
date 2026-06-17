@@ -394,6 +394,15 @@ pub struct Renderer {
     /// `pick_country_at` to answer click-to-identify queries. Plan
     /// 0007.
     identify_index: vector::IdentifyIndex,
+    /// Sibling vector binding used to draw the picked feature's
+    /// outline in a highlight colour over the regular orange
+    /// outlines. Rebuilt on every selection change. Cleared by
+    /// any camera-moving interaction.
+    highlight_camera_buf: wgpu::Buffer,
+    highlight_bind_group: wgpu::BindGroup,
+    selected_feature_idx: Option<usize>,
+    selected_vector_buf: Option<wgpu::Buffer>,
+    selected_vector_count: u32,
 
     /// Polar-cap pipeline + one uniform buffer per cap. The shader is
     /// pure-procedural (no vertex buffer), so each draw needs only its
@@ -762,6 +771,25 @@ impl Renderer {
         });
         let vector_pipeline = build_vector_pipeline(&device, format, &vector_bgl);
 
+        // Highlight pipeline reuses `vector_pipeline` + the same
+        // `VectorCameraUniform` layout — only the colour differs.
+        // Two sibling buffers + bind groups so both colours can be
+        // bound back-to-back in one frame without a per-call
+        // rewrite.
+        let highlight_camera_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("aegis-highlight-camera"),
+            contents: bytemuck::bytes_of(&VectorCameraUniform::default()),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        let highlight_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("aegis-highlight-bg"),
+            layout: &vector_bgl,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: highlight_camera_buf.as_entire_binding(),
+            }],
+        });
+
         // Polar caps. Both use the same bind-group layout as the
         // vector pipeline (single uniform). Two buffers + two bind
         // groups so a single `render()` can draw north and south
@@ -861,6 +889,11 @@ impl Renderer {
             vector_bind_group,
             vector: None,
             identify_index: vector::IdentifyIndex::default(),
+            highlight_camera_buf,
+            highlight_bind_group,
+            selected_feature_idx: None,
+            selected_vector_buf: None,
+            selected_vector_count: 0,
             cap_pipeline,
             north_cap_buf,
             north_cap_bind_group,
@@ -1018,7 +1051,7 @@ impl Renderer {
     /// day/night + atmosphere + starfield strength ramps use, so
     /// the feature card appears where the "globe-ish view"
     /// affordances are already on.
-    pub fn pick_feature_at(&self, cursor_x: f64, cursor_y: f64) -> Option<&str> {
+    pub fn pick_feature_at(&mut self, cursor_x: f64, cursor_y: f64) -> Option<String> {
         let canvas = self.size();
         if canvas.0 == 0 || canvas.1 == 0 {
             return None;
@@ -1091,7 +1124,83 @@ impl Renderer {
         let lat = p[1].asin().to_degrees();
         let lon = p[0].atan2(p[2]).to_degrees();
 
-        self.identify_index.pick(lon, lat).map(|f| f.name.as_str())
+        let pick = self
+            .identify_index
+            .pick_with_index(lon, lat)
+            .map(|(idx, f)| (idx, f.name.clone()));
+        if let Some((idx, name)) = pick {
+            self.set_selected_feature(Some(idx));
+            Some(name)
+        } else {
+            None
+        }
+    }
+
+    /// Set (or clear) the click-highlighted feature by index. Rebuilds
+    /// the small GPU vertex buffer used by the highlight draw. Called
+    /// from `pick_feature_at` on a hit, and from
+    /// `clear_selected_feature` on any camera-moving interaction.
+    pub fn set_selected_feature(&mut self, idx: Option<usize>) {
+        if idx == self.selected_feature_idx {
+            return;
+        }
+        self.selected_feature_idx = idx;
+        let Some(i) = idx else {
+            self.selected_vector_buf = None;
+            self.selected_vector_count = 0;
+            return;
+        };
+        let Some(f) = self.identify_index.features.get(i) else {
+            self.selected_vector_buf = None;
+            self.selected_vector_count = 0;
+            return;
+        };
+
+        // Project each ring of each polygon into normalised
+        // Mercator world coords (same space the main outline
+        // vertices live in) and emit LineList pairs. Polygons in
+        // GeoJSON aren't guaranteed to repeat the first vertex at
+        // the end of each ring — add a closing segment when
+        // needed so the highlight outline is fully closed.
+        let mut verts: Vec<[f32; 2]> = Vec::new();
+        for poly in &f.polygons {
+            for ring in poly {
+                if ring.len() < 2 {
+                    continue;
+                }
+                for w in ring.windows(2) {
+                    let (wx0, wy0) = crate::crs::lonlat_to_world(w[0][0], w[0][1]);
+                    let (wx1, wy1) = crate::crs::lonlat_to_world(w[1][0], w[1][1]);
+                    verts.push([wx0 as f32, wy0 as f32]);
+                    verts.push([wx1 as f32, wy1 as f32]);
+                }
+                let first = &ring[0];
+                let last = &ring[ring.len() - 1];
+                if (first[0] - last[0]).abs() > 1e-9 || (first[1] - last[1]).abs() > 1e-9 {
+                    let (wx0, wy0) = crate::crs::lonlat_to_world(last[0], last[1]);
+                    let (wx1, wy1) = crate::crs::lonlat_to_world(first[0], first[1]);
+                    verts.push([wx0 as f32, wy0 as f32]);
+                    verts.push([wx1 as f32, wy1 as f32]);
+                }
+            }
+        }
+        let bytes = bytemuck::cast_slice::<[f32; 2], u8>(&verts);
+        let buf = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("aegis-highlight-vbo"),
+                contents: bytes,
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+        self.selected_vector_buf = Some(buf);
+        self.selected_vector_count = verts.len() as u32;
+    }
+
+    /// Drop any highlighted feature. Called from the JS side on
+    /// camera-moving interactions so a "United States" highlight
+    /// doesn't outline the ocean after a rotation.
+    pub fn clear_selected_feature(&mut self) {
+        self.set_selected_feature(None);
     }
 
     /// Surface dimensions in physical pixels.
@@ -2399,6 +2508,24 @@ impl Renderer {
             bytemuck::bytes_of(&vector_camera),
         );
 
+        // Sibling uniform for the click-highlight draw. Same
+        // camera + sun state, different colour — bright cyan that
+        // reads against both the orange country outlines and the
+        // basemap imagery underneath.
+        let highlight_uniform = VectorCameraUniform {
+            view_proj,
+            position: camera_pos,
+            _pad0: 0.0,
+            color: [0.15, 0.95, 0.95, 0.95],
+            sun_dir,
+            night_dim,
+        };
+        self.queue.write_buffer(
+            &self.highlight_camera_buf,
+            0,
+            bytemuck::bytes_of(&highlight_uniform),
+        );
+
         // Per-frame cap uniforms. Same view_proj + camera_pos as the
         // other passes; the per-cap `pole_sign` and `color` are baked
         // into each buffer.
@@ -2694,6 +2821,25 @@ impl Renderer {
                     pass.set_bind_group(0, &self.vector_bind_group, &[]);
                     pass.set_vertex_buffer(0, vector.vertex_buf.slice(..));
                     pass.draw(0..vector.vertex_count, 0..1);
+                }
+            }
+
+            // Highlight the click-picked country outline. Drawn
+            // after the orange outlines so the cyan overlay wins
+            // where they overlap; bound to a sibling uniform
+            // buffer carrying the highlight colour. Skips when
+            // the user has toggled borders off — without the
+            // base outline as visual context the highlight floats
+            // on its own and reads as noise.
+            if self.active_body_ref().show_political_overlays
+                && self.borders_visible
+                && self.selected_vector_count > 0
+            {
+                if let Some(buf) = &self.selected_vector_buf {
+                    pass.set_pipeline(&self.vector_pipeline);
+                    pass.set_bind_group(0, &self.highlight_bind_group, &[]);
+                    pass.set_vertex_buffer(0, buf.slice(..));
+                    pass.draw(0..self.selected_vector_count, 0..1);
                 }
             }
 
