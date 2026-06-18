@@ -60,7 +60,20 @@ pub struct Camera {
     /// When all satellites are hidden / no category is enabled, it
     /// resets to [`MIN_ZOOM`].
     pub min_zoom: f64,
+    /// Camera pitch in radians. 0 = straight-down top-down view (the
+    /// default — preserves all prior behaviour); positive values
+    /// tilt the camera away from the radial axis, around the east-
+    /// tangent vector at the centre `(lon, lat)`, so the user sees
+    /// the surface at an angle. Clamped to `[0, MAX_PITCH]`. Plan
+    /// 0014 / 0015.
+    pub pitch_rad: f64,
 }
+
+/// Largest pitch the camera will accept. ~70° leaves a thin band
+/// of sky at the top of the canvas at street zoom; past that the
+/// horizon clips through the top of the frame and the visual
+/// degrades.
+pub const MAX_PITCH: f64 = 1.221_730_476_396_030_5; // 70° in rad
 
 impl Camera {
     /// A new camera centred at `(lon, lat)` and `zoom`.
@@ -69,7 +82,13 @@ impl Camera {
             center_lonlat: (lon, lat),
             zoom: zoom.clamp(MIN_ZOOM, MAX_ZOOM),
             min_zoom: MIN_ZOOM,
+            pitch_rad: 0.0,
         }
+    }
+
+    /// Set the pitch in radians, clamped to `[0, MAX_PITCH]`.
+    pub fn set_pitch(&mut self, rad: f64) {
+        self.pitch_rad = rad.clamp(0.0, MAX_PITCH);
     }
 
     /// How many display pixels one normalised-Mercator unit covers at
@@ -106,19 +125,70 @@ impl Camera {
     }
 
     /// 3D position of the perspective camera in the same coordinate
-    /// system as `lonlat_to_sphere` returns. Camera sits on the line
-    /// from sphere centre outward through the camera's `(lon, lat)`,
-    /// at a distance `D = 1 + altitude(zoom, canvas)`.
+    /// system as `lonlat_to_sphere` returns. At `pitch_rad = 0` the
+    /// camera sits on the line from sphere centre outward through
+    /// the camera's `(lon, lat)` at distance `1 + altitude`. With
+    /// non-zero pitch the camera tilts off that radial axis around
+    /// the east-tangent at the centre, keeping the surface point
+    /// at `(lon, lat)` in frame.
     pub fn camera_3d_position(&self, canvas: (u32, u32)) -> [f32; 3] {
+        let surface_point = self.surface_point_3d();
+        let alt = self.altitude(canvas) as f32;
+        if self.pitch_rad.abs() < 1e-9 {
+            // Fast path that exactly matches the pre-pitch math.
+            let d = 1.0 + alt;
+            return [
+                surface_point[0] * d,
+                surface_point[1] * d,
+                surface_point[2] * d,
+            ];
+        }
+        // Tilted: pull the camera back along a vector that's the
+        // surface normal rotated by `pitch_rad` around the east-
+        // tangent. Camera position = surface_point + tilted_radial
+        // * altitude — so the surface point itself stays the look
+        // target and the user sees the ground at an angle.
+        let east = self.east_tangent_3d();
+        let tilted = rotate_around_axis(surface_point, east, self.pitch_rad as f32);
+        [
+            surface_point[0] + tilted[0] * alt,
+            surface_point[1] + tilted[1] * alt,
+            surface_point[2] + tilted[2] * alt,
+        ]
+    }
+
+    /// Point on the unit sphere directly under the camera centre.
+    /// At pitch = 0 the camera looks straight at it (along the
+    /// radial); at any pitch the view-projection matrix targets it
+    /// so the surface point stays framed.
+    pub fn surface_point_3d(&self) -> [f32; 3] {
         let lon = self.center_lonlat.0.to_radians();
         let lat = self.center_lonlat.1.to_radians();
-        let c = [
+        [
             (lat.cos() * lon.sin()) as f32,
             lat.sin() as f32,
             (lat.cos() * lon.cos()) as f32,
-        ];
-        let d = 1.0 + self.altitude(canvas) as f32;
-        [c[0] * d, c[1] * d, c[2] * d]
+        ]
+    }
+
+    /// East-tangent unit vector at the camera centre. Derived from
+    /// the surface normal × world-up (or world-Z near the poles);
+    /// used as the rotation axis for pitch so tilting reads as
+    /// "lean the camera north" — the user sees more sky in front
+    /// and less behind.
+    fn east_tangent_3d(&self) -> [f32; 3] {
+        let n = self.surface_point_3d();
+        let up_hint = if self.center_lonlat.1.abs() > 89.0 {
+            [0.0_f32, 0.0, 1.0]
+        } else {
+            [0.0_f32, 1.0, 0.0]
+        };
+        // east = normalize(cross(n, up_hint))
+        let cx = n[1] * up_hint[2] - n[2] * up_hint[1];
+        let cy = n[2] * up_hint[0] - n[0] * up_hint[2];
+        let cz = n[0] * up_hint[1] - n[1] * up_hint[0];
+        let len = (cx * cx + cy * cy + cz * cz).sqrt().max(1e-9);
+        [cx / len, cy / len, cz / len]
     }
 
     /// Camera altitude above the sphere surface in 3D units (sphere
@@ -188,7 +258,15 @@ impl Camera {
         } else {
             [0.0, 1.0, 0.0]
         };
-        let view = look_at(cam_pos, [0.0, 0.0, 0.0], up);
+        // Look at the surface point under the camera centre. At
+        // pitch = 0 this is collinear with the origin from the
+        // camera, so the view direction is identical to the old
+        // "look at origin" behaviour — pre-pitch tests still pass.
+        // At positive pitch the camera is off the radial axis and
+        // targeting origin would make the view miss the surface;
+        // targeting the surface point keeps the framing honest.
+        let target = self.surface_point_3d();
+        let view = look_at(cam_pos, target, up);
         let altitude = self.altitude(canvas) as f32;
         let default_near = (altitude * 0.1).max(1e-6);
         let near = if min_near_floor > 0.0 {
@@ -540,6 +618,25 @@ impl Camera {
 /// Critical for wgpu: using the OpenGL convention here would map
 /// near-plane vertices to clip-z = -1, outside wgpu's valid range,
 /// so the whole foreground would get clipped.
+/// Rotate `v` around unit-vector `axis` by `angle_rad` using
+/// Rodrigues' rotation formula. Returns a 3-vector of the same
+/// scale as `v`. Used by the camera pitch path.
+fn rotate_around_axis(v: [f32; 3], axis: [f32; 3], angle_rad: f32) -> [f32; 3] {
+    let c = angle_rad.cos();
+    let s = angle_rad.sin();
+    let dot = v[0] * axis[0] + v[1] * axis[1] + v[2] * axis[2];
+    let cross = [
+        axis[1] * v[2] - axis[2] * v[1],
+        axis[2] * v[0] - axis[0] * v[2],
+        axis[0] * v[1] - axis[1] * v[0],
+    ];
+    [
+        v[0] * c + cross[0] * s + axis[0] * dot * (1.0 - c),
+        v[1] * c + cross[1] * s + axis[1] * dot * (1.0 - c),
+        v[2] * c + cross[2] * s + axis[2] * dot * (1.0 - c),
+    ]
+}
+
 fn perspective(fov_y_rad: f32, aspect: f32, near: f32, far: f32) -> [f32; 16] {
     let f = 1.0 / (fov_y_rad / 2.0).tan();
     let nf = 1.0 / (near - far);

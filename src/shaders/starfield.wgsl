@@ -12,8 +12,7 @@
 
 struct StarfieldUniform {
     // Camera position in body-fixed coords (same convention as the
-    // other surface shaders). `forward = −normalize(camera_pos)`
-    // because the camera always looks at the origin.
+    // other surface shaders).
     camera_pos: vec3<f32>,
     /// Canvas aspect ratio (width / height). Used to undo the
     /// projection's horizontal stretch when reconstructing rays.
@@ -33,7 +32,17 @@ struct StarfieldUniform {
     /// small disc + halo at this direction so the day/night work
     /// has a visible source.
     sun_dir: vec3<f32>,
-    _pad: f32,
+    _pad0: f32,
+    /// Camera look target in body-fixed coords. `forward =
+    /// normalize(look_target − camera_pos)`. At zero pitch this
+    /// is the surface point under the camera centre — collinear
+    /// with the origin from the camera, so the math reduces to
+    /// the pre-pitch `−normalize(camera_pos)`. At non-zero pitch
+    /// the camera is off the radial axis and this keeps the
+    /// basis honest. `target` itself is a reserved keyword in
+    /// WGSL — hence the `look_target` rename.
+    look_target: vec3<f32>,
+    _pad1: f32,
 };
 
 @group(0) @binding(0) var<uniform> u: StarfieldUniform;
@@ -105,11 +114,13 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         discard;
     }
 
-    // Camera basis. Camera always looks at the origin, so
-    // forward = −normalize(camera_pos). `right` and `up` follow
-    // from the cross-product convention used by `look_at` in
-    // camera.rs.
-    let forward = -normalize(u.camera_pos);
+    // Camera basis from the look target — matches what
+    // `view_projection_matrix` builds + what `pick_feature_at`
+    // ray-marches through. Reduces to `−normalize(camera_pos)`
+    // at pitch=0 (target is the surface point on the line
+    // through origin from camera) and stays correct under
+    // non-zero pitch.
+    let forward = normalize(u.look_target - u.camera_pos);
     let right = normalize(cross(forward, u.up_hint));
     let up = cross(right, forward);
 

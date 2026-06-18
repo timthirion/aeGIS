@@ -259,9 +259,9 @@ struct BuildingUniforms {
     wall_color: [f32; 4],
 }
 
-/// Per-frame uniform consumed by `starfield.wgsl`. 48 bytes —
-/// camera pos + aspect ratio, up-hint + zoom-driven strength, sun
-/// direction (for the sun-glyph disc + halo) + trailing pad.
+/// Per-frame uniform consumed by `starfield.wgsl`. 64 bytes —
+/// camera pos + aspect, up-hint + zoom-driven strength, sun
+/// direction + pad, look target (for non-zero camera pitch) + pad.
 /// Mirrors the WGSL struct of the same name byte-for-byte.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default, Pod, Zeroable)]
@@ -271,7 +271,9 @@ struct StarfieldUniform {
     up_hint: [f32; 3],
     strength: f32,
     sun_dir: [f32; 3],
-    _pad: f32,
+    _pad0: f32,
+    look_target: [f32; 3],
+    _pad1: f32,
 }
 
 /// Per-frame uniform consumed by `atmosphere.wgsl`. 144 bytes
@@ -1214,9 +1216,29 @@ impl Renderer {
 
         let cam = self.camera.camera_3d_position(canvas);
         let ro = [cam[0] as f64, cam[1] as f64, cam[2] as f64];
-        let cam_len = (ro[0] * ro[0] + ro[1] * ro[1] + ro[2] * ro[2]).sqrt();
-        // Camera always looks at the origin; forward = −normalize(camera_pos).
-        let forward = [-ro[0] / cam_len, -ro[1] / cam_len, -ro[2] / cam_len];
+        // Look target — the surface point under the camera centre.
+        // At pitch=0 this is collinear with the origin from the
+        // camera, so `forward` matches the old `-normalize(cam)`.
+        // At non-zero pitch the camera is off-axis and the look
+        // direction differs from the radial — must use the same
+        // target the `view_projection_matrix` uses so the picking
+        // ray reconstructs the pixels the user sees.
+        let tgt = self.camera.surface_point_3d();
+        let to_target = [
+            tgt[0] as f64 - ro[0],
+            tgt[1] as f64 - ro[1],
+            tgt[2] as f64 - ro[2],
+        ];
+        let to_len = (to_target[0] * to_target[0]
+            + to_target[1] * to_target[1]
+            + to_target[2] * to_target[2])
+            .sqrt()
+            .max(1e-9);
+        let forward = [
+            to_target[0] / to_len,
+            to_target[1] / to_len,
+            to_target[2] / to_len,
+        ];
         // Mirror `view_projection_matrix`'s pole-up switch so the
         // basis matches the camera the user is actually looking
         // through.
@@ -2788,7 +2810,9 @@ impl Renderer {
             up_hint,
             strength: star_strength,
             sun_dir,
-            _pad: 0.0,
+            _pad0: 0.0,
+            look_target: self.camera.surface_point_3d(),
+            _pad1: 0.0,
         };
         self.queue.write_buffer(
             &self.starfield_uniform_buf,
@@ -4306,7 +4330,7 @@ mod tests {
         assert_eq!(std::mem::size_of::<CapUniform>(), 112);
         assert_eq!(std::mem::size_of::<EarthCameraUniform>(), 96);
         assert_eq!(std::mem::size_of::<AtmosphereUniform>(), 144);
-        assert_eq!(std::mem::size_of::<StarfieldUniform>(), 48);
+        assert_eq!(std::mem::size_of::<StarfieldUniform>(), 64);
         assert_eq!(std::mem::size_of::<BuildingUniforms>(), 128);
         assert_eq!(
             std::mem::size_of::<crate::buildings::BuildingPerInstance>(),

@@ -398,6 +398,25 @@ impl AegisInstance {
         self.inner.borrow().renderer.camera_altitude()
     }
 
+    /// Current camera pitch in degrees. 0 = top-down. Used by the
+    /// pitch-slider UI to read the current value on init.
+    #[wasm_bindgen(js_name = cameraPitchDeg)]
+    pub fn camera_pitch_deg(&self) -> f64 {
+        self.inner.borrow().renderer.camera.pitch_rad.to_degrees()
+    }
+
+    /// Set camera pitch in degrees; clamped to `[0, 70]` (the
+    /// `MAX_PITCH` past which the horizon clips through the top
+    /// of the frame).
+    #[wasm_bindgen(js_name = setCameraPitchDeg)]
+    pub fn set_camera_pitch_deg(&self, deg: f64) {
+        self.inner
+            .borrow_mut()
+            .renderer
+            .camera
+            .set_pitch(deg.to_radians());
+    }
+
     /// Show or hide a single satellite by NORAD id. Per-row
     /// visibility checkbox in the side-panel list drives this.
     #[wasm_bindgen(js_name = setSatelliteVisible)]

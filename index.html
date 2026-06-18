@@ -161,6 +161,29 @@
        country outlines themselves use. */
     body:not([data-body="earth"]) #border-toggle { display: none; }
 
+    /* Camera pitch slider — same chrome palette as the toggle
+       pills, but a horizontal slider instead of a button. Lives
+       in the bottom-left row alongside the toggles. */
+    #pitch-control {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 4px 12px;
+      background: rgba(11, 14, 18, 0.78);
+      border: 1px solid #1d232b;
+      border-radius: 999px;
+      backdrop-filter: blur(6px);
+      -webkit-backdrop-filter: blur(6px);
+      box-shadow: 0 2px 12px rgba(0, 0, 0, 0.35);
+      font: 12px/1 ui-sans-serif, system-ui, -apple-system, sans-serif;
+      color: #8d97a3;
+      user-select: none;
+    }
+    #pitch-control input[type="range"] {
+      width: 120px;
+      accent-color: #9cb2cf;
+    }
+
     /* Satellite-category pills (plan 0004 M2). Same chrome palette
        as the basemap toggle. Earth-only — hidden on other bodies
        via the same data-body gate the search bar uses. Lives
@@ -652,6 +675,18 @@
           title="Toggle country outlines"
         >Borders</button>
       </div>
+      <div id="pitch-control" role="group" aria-label="Camera pitch">
+        <label for="pitch-range">Tilt</label>
+        <input
+          type="range"
+          id="pitch-range"
+          min="0"
+          max="70"
+          step="1"
+          value="0"
+          title="Camera pitch (0° = top-down, 70° = oblique)"
+        />
+      </div>
     </div>
     <div id="aegis-sat-tooltip" role="status" aria-live="polite"></div>
     <div id="aegis-feature-info" role="status" aria-live="polite"></div>
@@ -773,6 +808,7 @@
         aegis = await start("aegis-host");
         wireBasemapToggle(aegis);
         wireBorderToggle(aegis);
+        wirePitchSlider(aegis);
         wireBodySwitcher(aegis);
         wireOrbitCategories(aegis);
         wireSatTooltip(aegis);
@@ -1283,6 +1319,15 @@
       // Demoted-state can change as TLEs stream in; poll a bit
       // after each click for the budget guard to settle.
       setInterval(syncState, 2000);
+    }
+
+    function wirePitchSlider(instance) {
+      const slider = document.getElementById("pitch-range");
+      if (!slider) return;
+      slider.value = String(Math.round(instance.cameraPitchDeg()));
+      slider.addEventListener("input", () => {
+        instance.setCameraPitchDeg(Number(slider.value));
+      });
     }
 
     function wireBorderToggle(instance) {
