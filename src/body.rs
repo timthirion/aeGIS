@@ -185,6 +185,24 @@ pub struct Body {
     /// (Moon); the renderer skips the atmosphere draw entirely
     /// when this is None. Plan 0008.
     pub atmosphere: Option<Atmosphere>,
+    /// 3D-building rendering parameters. Earth's set tuned for
+    /// the Carto Voyager palette + the Esri imagery; Mars / Moon
+    /// are None and the renderer skips building load + draw
+    /// entirely. Plan 0014.
+    pub buildings: Option<BuildingStyle>,
+}
+
+/// Per-body building-rendering style. Buildings ship colours and
+/// not textures in v1; the per-body knob lets a future Mars/Moon
+/// extension (lunar habitats?) drop in with a different palette
+/// without a renderer change. Plan 0014.
+#[derive(Copy, Clone, Debug)]
+pub struct BuildingStyle {
+    /// Top-face base RGBA.
+    pub fill_color: [f32; 4],
+    /// Wall base RGBA — typically a touch darker than fill so
+    /// silhouettes pop against the rooftops.
+    pub wall_color: [f32; 4],
 }
 
 impl Body {
@@ -283,6 +301,13 @@ pub static EARTH: Body = Body {
         rayleigh_scale: 0.008,
         mie_scale: 0.0014,
     }),
+    buildings: Some(BuildingStyle {
+        // Warm grey rooftops that read against the Carto Voyager
+        // basemap + the Esri satellite imagery without fighting.
+        fill_color: [0.86, 0.84, 0.80, 1.0],
+        // Walls slightly darker so the silhouette pops.
+        wall_color: [0.72, 0.70, 0.66, 1.0],
+    }),
 };
 
 // --- Mars -----------------------------------------------------------------
@@ -352,6 +377,7 @@ pub static MARS: Body = Body {
         rayleigh_scale: 0.004,
         mie_scale: 0.0008,
     }),
+    buildings: None,
 };
 
 // --- Moon -----------------------------------------------------------------
@@ -393,6 +419,7 @@ pub static MOON: Body = Body {
     night_dim: 0.02,
     night_texture: None,
     atmosphere: None,
+    buildings: None,
 };
 
 // A Middle-earth body was prototyped in plan 0003 M4 as a procedural

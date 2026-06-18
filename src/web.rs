@@ -734,6 +734,15 @@ pub async fn start(host_id: String) -> Result<AegisInstance, JsValue> {
             .load_satellites(crate::orbit::Category::Stations, ISS_FIXTURE);
     }
 
+    // Bundled Chicago downtown buildings (plan 0014 M1).
+    {
+        const CHICAGO_BUILDINGS: &[u8] = include_bytes!("../data/buildings/chicago.geojson.gz");
+        inner
+            .borrow_mut()
+            .renderer
+            .load_buildings_gz(CHICAGO_BUILDINGS);
+    }
+
     // rAF loop — self-rescheduling closure.
     let raf: Rc<RefCell<Option<Closure<dyn FnMut()>>>> = Rc::new(RefCell::new(None));
     {

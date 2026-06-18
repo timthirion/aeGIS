@@ -53,6 +53,7 @@ const ORBIT_SHADER: &str = include_str!("shaders/orbit.wgsl");
 const ORBIT_TRAIL_SHADER: &str = include_str!("shaders/orbit_trail.wgsl");
 const ATMOSPHERE_SHADER: &str = include_str!("shaders/atmosphere.wgsl");
 const STARFIELD_SHADER: &str = include_str!("shaders/starfield.wgsl");
+const BUILDING_SHADER: &str = include_str!("shaders/building.wgsl");
 
 /// Frames the camera state must stay unchanged before we consider it
 /// "settled" and trigger a satellite-tile fetch. At 60 fps this is
@@ -243,6 +244,21 @@ struct EarthCameraUniform {
     night_dim: f32,
 }
 
+/// Per-frame uniform consumed by `building.wgsl`. 128 bytes
+/// (8 × vec4 rows). Mirrors the WGSL struct of the same name
+/// byte-for-byte. Plan 0014 M1.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, Pod, Zeroable)]
+struct BuildingUniforms {
+    view_proj: [f32; 16],
+    camera_pos: [f32; 3],
+    strength: f32,
+    sun_dir: [f32; 3],
+    night_dim: f32,
+    fill_color: [f32; 4],
+    wall_color: [f32; 4],
+}
+
 /// Per-frame uniform consumed by `starfield.wgsl`. 48 bytes —
 /// camera pos + aspect ratio, up-hint + zoom-driven strength, sun
 /// direction (for the sun-glyph disc + halo) + trailing pad.
@@ -334,6 +350,24 @@ struct VectorBinding {
     vertex_count: u32,
 }
 
+/// GPU resources for a loaded city's building mesh — single VBO +
+/// IBO + per-building storage buffer + the bind group binding the
+/// storage buffer to the building pipeline at binding 1.
+struct BuildingBinding {
+    vbo: wgpu::Buffer,
+    ibo: wgpu::Buffer,
+    /// Held so the storage buffer's view inside `bind_group`
+    /// stays alive for the binding's lifetime.
+    _per_building_buf: wgpu::Buffer,
+    bind_group: wgpu::BindGroup,
+    /// Number of indices in `ibo` — drives `pass.draw_indexed`.
+    index_count: u32,
+    /// Tallest building's normalised-units height. Passed to
+    /// `view_projection_matrix_with_floor` so the near plane
+    /// doesn't clip the loaded city's tallest tower.
+    max_height_world: f32,
+}
+
 /// A raster tile that's been uploaded to the GPU.
 struct TileBinding {
     /// Kept alive so the bind-group's texture view stays valid.
@@ -383,6 +417,14 @@ pub struct Renderer {
     /// when the surface's native format is linear (the common case
     /// on WebGPU canvases).
     view_format: wgpu::TextureFormat,
+
+    /// Depth attachment for the main pass. Buildings (plan 0014) use
+    /// `Less` + write so they occlude each other correctly; every
+    /// other pipeline runs `Always` + no-write so draw order still
+    /// rules for them. Recreated by `resize` when the surface size
+    /// changes.
+    depth_texture: wgpu::Texture,
+    depth_view: wgpu::TextureView,
 
     tile_pipeline: wgpu::RenderPipeline,
     tile_bgl: wgpu::BindGroupLayout,
@@ -440,6 +482,22 @@ pub struct Renderer {
     starfield_pipeline: wgpu::RenderPipeline,
     starfield_uniform_buf: wgpu::Buffer,
     starfield_bind_group: wgpu::BindGroup,
+
+    /// Extruded-building pipeline (plan 0014 M1). One indexed
+    /// draw per loaded city; the city dataset is `None` until
+    /// the renderer's startup hook loads the bundled
+    /// `chicago.geojson.gz`. The depth attachment on the main
+    /// pass keeps building-vs-building occlusion correct.
+    building_pipeline: wgpu::RenderPipeline,
+    building_bgl: wgpu::BindGroupLayout,
+    building_uniform_buf: wgpu::Buffer,
+    /// Loaded city's GPU resources. `None` until `load_buildings`
+    /// runs.
+    building_binding: Option<BuildingBinding>,
+    /// Mirrors `vector::IdentifyIndex` shape so M3's picker can
+    /// surface building names. Built alongside the GPU binding;
+    /// empty until `load_buildings` runs.
+    buildings_identify: vector::IdentifyIndex,
 
     /// Tiles that have been decoded + uploaded to the GPU.
     tiles: HashMap<TileId, TileBinding>,
@@ -688,6 +746,8 @@ impl Renderer {
             desired_maximum_frame_latency: 2,
         };
         surface.configure(&device, &config);
+        let (depth_texture, depth_view) =
+            create_depth_texture(&device, config.width, config.height);
         // Pipelines target the sRGB *view* format, not the configured
         // surface format — that's the format the render-pass attachment
         // will be in each frame.
@@ -816,6 +876,8 @@ impl Renderer {
             build_atmosphere_pipeline(&device, format);
         let (starfield_pipeline, starfield_uniform_buf, starfield_bind_group) =
             build_starfield_pipeline(&device, format);
+        let (building_pipeline, building_bgl, building_uniform_buf) =
+            build_building_pipeline(&device, format);
         let mut body_resources: HashMap<BodyId, BodyResources> = HashMap::new();
         for body in body::all() {
             body_resources.insert(
@@ -884,6 +946,8 @@ impl Renderer {
             queue,
             config,
             view_format,
+            depth_texture,
+            depth_view,
             tile_pipeline,
             tile_bgl,
             tile_sampler,
@@ -910,6 +974,11 @@ impl Renderer {
             starfield_pipeline,
             starfield_uniform_buf,
             starfield_bind_group,
+            building_pipeline,
+            building_bgl,
+            building_uniform_buf,
+            building_binding: None,
+            buildings_identify: vector::IdentifyIndex::default(),
             tiles: HashMap::new(),
             requested: HashSet::new(),
             failed: HashSet::new(),
@@ -1039,6 +1108,84 @@ impl Renderer {
     pub fn set_identify_index(&mut self, index: vector::IdentifyIndex) {
         log::info!("set_identify_index: {} features", index.features.len());
         self.identify_index = index;
+    }
+
+    /// Load a city's bundled building footprints (gzipped GeoJSON).
+    /// Replaces any previously loaded city. Plan 0014 M1.
+    pub fn load_buildings_gz(&mut self, gz_bytes: &[u8]) {
+        let parsed = match crate::buildings::load_buildings_geojson_gz(gz_bytes) {
+            Ok(b) => b,
+            Err(e) => {
+                log::warn!("load_buildings_gz: parse failed: {e}");
+                return;
+            }
+        };
+        let (t, l, d) = crate::buildings::height_source_counts(&parsed);
+        log::info!(
+            "load_buildings_gz: {} buildings ({} tagged, {} levels, {} default)",
+            parsed.len(),
+            t,
+            l,
+            d
+        );
+        let mesh = crate::buildings::build_mesh(&parsed);
+        let identify = crate::buildings::build_identify_index(&parsed);
+
+        if mesh.vertices.is_empty() || mesh.indices.is_empty() {
+            log::warn!("load_buildings_gz: empty mesh, skipping upload");
+            return;
+        }
+
+        let vbo = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("aegis-building-vbo"),
+                contents: bytemuck::cast_slice(&mesh.vertices),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+        let ibo = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("aegis-building-ibo"),
+                contents: bytemuck::cast_slice(&mesh.indices),
+                usage: wgpu::BufferUsages::INDEX,
+            });
+        let per_building_buf = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("aegis-building-per-instance"),
+                contents: bytemuck::cast_slice(&mesh.per_building),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("aegis-building-bg"),
+            layout: &self.building_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.building_uniform_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: per_building_buf.as_entire_binding(),
+                },
+            ],
+        });
+        log::info!(
+            "load_buildings_gz: uploaded {} verts, {} indices, max_h_world={:.5}",
+            mesh.vertices.len(),
+            mesh.indices.len(),
+            mesh.max_height_world
+        );
+        self.building_binding = Some(BuildingBinding {
+            vbo,
+            ibo,
+            _per_building_buf: per_building_buf,
+            bind_group,
+            index_count: mesh.indices.len() as u32,
+            max_height_world: mesh.max_height_world,
+        });
+        self.buildings_identify = identify;
     }
 
     /// Inverse-project a canvas pixel back to a `(lon, lat)` on
@@ -1220,6 +1367,9 @@ impl Renderer {
         self.config.width = w;
         self.config.height = h;
         self.surface.configure(&self.device, &self.config);
+        let (depth_texture, depth_view) = create_depth_texture(&self.device, w, h);
+        self.depth_texture = depth_texture;
+        self.depth_view = depth_view;
     }
 
     /// Upload an RGBA raster tile and bind it under `id`. Idempotent —
@@ -2391,7 +2541,20 @@ impl Renderer {
     /// from the camera being far enough out to see the whole sphere.
     pub fn render(&self) {
         let canvas = self.size();
-        let view_proj = self.camera.view_projection_matrix(canvas);
+        // When a city's building mesh is loaded, pull the near plane
+        // in below its tallest building so the top doesn't clip at
+        // street zoom (plan 0014 § Coordinate frame for extrusion).
+        // Half the max height gives a comfortable margin; with no
+        // buildings loaded we pass 0.0 and the call falls through
+        // to the existing `altitude * 0.1` near.
+        let min_near_floor = self
+            .building_binding
+            .as_ref()
+            .map(|b| b.max_height_world * 0.5)
+            .unwrap_or(0.0);
+        let view_proj = self
+            .camera
+            .view_projection_matrix_with_floor(canvas, min_near_floor);
         let camera_pos = self.camera.camera_3d_position(canvas);
         // Day/night state shared across every body-surface uniform
         // upload this frame (plan 0009 M0). The sun direction is
@@ -2663,6 +2826,35 @@ impl Renderer {
             );
         }
 
+        // Building uniform (plan 0014 M1). Strength is zoom-gated
+        // by `smoothstep(14.0, 15.5, zoom)` so buildings fade in
+        // across that band rather than popping. Per-body fill +
+        // wall colours come from `Body::buildings`. The draw call
+        // gate (further down) skips entirely when buildings are
+        // off-body or unloaded — the uniform write is harmless
+        // either way.
+        let zoom = self.camera.zoom as f32;
+        let building_strength = smoothstep_f32(14.0, 15.5, zoom);
+        let (fill_color, wall_color) = self
+            .active_body_ref()
+            .buildings
+            .map(|s| (s.fill_color, s.wall_color))
+            .unwrap_or(([0.0; 4], [0.0; 4]));
+        let building_uniform = BuildingUniforms {
+            view_proj,
+            camera_pos,
+            strength: building_strength,
+            sun_dir,
+            night_dim,
+            fill_color,
+            wall_color,
+        };
+        self.queue.write_buffer(
+            &self.building_uniform_buf,
+            0,
+            bytemuck::bytes_of(&building_uniform),
+        );
+
         // Orbit overlay camera (plan 0004 M1). Same view_proj +
         // camera_pos as the other passes, plus viewport pixels for
         // the billboard pixel-size math in the shader.
@@ -2740,7 +2932,14 @@ impl Renderer {
                         store: wgpu::StoreOp::Store,
                     },
                 })],
-                depth_stencil_attachment: None,
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
                 timestamp_writes: None,
                 occlusion_query_set: None,
                 multiview_mask: None,
@@ -2819,6 +3018,24 @@ impl Renderer {
             pass.draw(0..CAP_DRAW_VERTS, 0..1);
             pass.set_bind_group(0, &self.south_cap_bind_group, &[]);
             pass.draw(0..CAP_DRAW_VERTS, 0..1);
+
+            // Extruded buildings (plan 0014 M1). Earth-only;
+            // gated on zoom > 14 so we don't burn fragment work
+            // when buildings are invisible anyway. The depth
+            // attachment on this pass keeps building-vs-building
+            // occlusion correct in the single indexed draw call.
+            if let Some(binding) = &self.building_binding {
+                if self.active_body == BodyId::Earth
+                    && self.active_body_ref().buildings.is_some()
+                    && self.camera.zoom > 14.0
+                {
+                    pass.set_pipeline(&self.building_pipeline);
+                    pass.set_bind_group(0, &binding.bind_group, &[]);
+                    pass.set_vertex_buffer(0, binding.vbo.slice(..));
+                    pass.set_index_buffer(binding.ibo.slice(..), wgpu::IndexFormat::Uint32);
+                    pass.draw_indexed(0..binding.index_count, 0, 0..1);
+                }
+            }
 
             // Atmospheric-scattering shell (plan 0008 M1+M2). Drawn
             // additively after caps + tiles so the halo brightens
@@ -2942,7 +3159,7 @@ fn build_tile_pipeline(
             unclipped_depth: false,
             conservative: false,
         },
-        depth_stencil: None,
+        depth_stencil: Some(pass_through_depth_state()),
         multisample: wgpu::MultisampleState::default(),
         multiview_mask: None,
         cache: None,
@@ -3001,7 +3218,7 @@ fn build_vector_pipeline(
             unclipped_depth: false,
             conservative: false,
         },
-        depth_stencil: None,
+        depth_stencil: Some(pass_through_depth_state()),
         multisample: wgpu::MultisampleState::default(),
         multiview_mask: None,
         cache: None,
@@ -3050,7 +3267,7 @@ fn build_cap_pipeline(
             unclipped_depth: false,
             conservative: false,
         },
-        depth_stencil: None,
+        depth_stencil: Some(pass_through_depth_state()),
         multisample: wgpu::MultisampleState::default(),
         multiview_mask: None,
         cache: None,
@@ -3399,7 +3616,7 @@ fn build_body_pipeline(
             unclipped_depth: false,
             conservative: false,
         },
-        depth_stencil: None,
+        depth_stencil: Some(pass_through_depth_state()),
         multisample: wgpu::MultisampleState::default(),
         multiview_mask: None,
         cache: None,
@@ -3411,6 +3628,125 @@ fn build_body_pipeline(
 /// fullscreen quad (6 vertices, no buffer) renders first in the
 /// pass so subsequent draws can overwrite the stars where they
 /// cover the view.
+/// Build the extruded-building pipeline + the shared uniform
+/// buffer. Returns the pipeline, BGL (cached for re-binding when
+/// `load_buildings` rebuilds the per-city storage buffer), and the
+/// shared uniform buffer (rewritten each frame). Plan 0014 M1.
+fn build_building_pipeline(
+    device: &wgpu::Device,
+    format: wgpu::TextureFormat,
+) -> (wgpu::RenderPipeline, wgpu::BindGroupLayout, wgpu::Buffer) {
+    let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("aegis-building-bgl"),
+        entries: &[
+            // Uniform (camera + sun + per-body colour + strength).
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            // Per-building storage buffer (centroid normals).
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+        ],
+    });
+    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("aegis-building-shader"),
+        source: wgpu::ShaderSource::Wgsl(BUILDING_SHADER.into()),
+    });
+    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("aegis-building-layout"),
+        bind_group_layouts: &[Some(&bgl)],
+        immediate_size: 0,
+    });
+    // Vertex layout: world (vec2) + height_world (f32) +
+    // building_idx (u32) + face_kind (u32) + normal (vec3). 32 B
+    // total. Matches `BuildingVertex` in `crate::buildings`.
+    let vertex_buffer_layout = wgpu::VertexBufferLayout {
+        array_stride: std::mem::size_of::<crate::buildings::BuildingVertex>() as u64,
+        step_mode: wgpu::VertexStepMode::Vertex,
+        attributes: &[
+            wgpu::VertexAttribute {
+                format: wgpu::VertexFormat::Float32x2,
+                offset: 0,
+                shader_location: 0,
+            },
+            wgpu::VertexAttribute {
+                format: wgpu::VertexFormat::Float32,
+                offset: 8,
+                shader_location: 1,
+            },
+            wgpu::VertexAttribute {
+                format: wgpu::VertexFormat::Uint32,
+                offset: 12,
+                shader_location: 2,
+            },
+            wgpu::VertexAttribute {
+                format: wgpu::VertexFormat::Uint32,
+                offset: 16,
+                shader_location: 3,
+            },
+            wgpu::VertexAttribute {
+                format: wgpu::VertexFormat::Float32x3,
+                offset: 20,
+                shader_location: 4,
+            },
+        ],
+    };
+    let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("aegis-building-pipeline"),
+        layout: Some(&layout),
+        vertex: wgpu::VertexState {
+            module: &module,
+            entry_point: Some("vs_main"),
+            buffers: &[vertex_buffer_layout],
+            compilation_options: Default::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &module,
+            entry_point: Some("fs_main"),
+            targets: &[Some(wgpu::ColorTargetState {
+                format,
+                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            compilation_options: Default::default(),
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            strip_index_format: None,
+            front_face: wgpu::FrontFace::Ccw,
+            cull_mode: None, // walls + roofs both visible from above
+            polygon_mode: wgpu::PolygonMode::Fill,
+            unclipped_depth: false,
+            conservative: false,
+        },
+        depth_stencil: Some(building_depth_state()),
+        multisample: wgpu::MultisampleState::default(),
+        multiview_mask: None,
+        cache: None,
+    });
+    let uniform_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("aegis-building-uniform"),
+        contents: bytemuck::bytes_of(&BuildingUniforms::default()),
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+    });
+    (pipeline, bgl, uniform_buf)
+}
+
 fn build_starfield_pipeline(
     device: &wgpu::Device,
     format: wgpu::TextureFormat,
@@ -3476,7 +3812,7 @@ fn build_starfield_pipeline(
             unclipped_depth: false,
             conservative: false,
         },
-        depth_stencil: None,
+        depth_stencil: Some(pass_through_depth_state()),
         multisample: wgpu::MultisampleState::default(),
         multiview_mask: None,
         cache: None,
@@ -3587,7 +3923,7 @@ fn build_atmosphere_pipeline(
             unclipped_depth: false,
             conservative: false,
         },
-        depth_stencil: None,
+        depth_stencil: Some(pass_through_depth_state()),
         multisample: wgpu::MultisampleState::default(),
         multiview_mask: None,
         cache: None,
@@ -3721,7 +4057,7 @@ fn build_orbit_pipeline(
             unclipped_depth: false,
             conservative: false,
         },
-        depth_stencil: None,
+        depth_stencil: Some(pass_through_depth_state()),
         multisample: wgpu::MultisampleState::default(),
         multiview_mask: None,
         cache: None,
@@ -3830,7 +4166,7 @@ fn build_orbit_trail_pipeline(
             unclipped_depth: false,
             conservative: false,
         },
-        depth_stencil: None,
+        depth_stencil: Some(pass_through_depth_state()),
         multisample: wgpu::MultisampleState::default(),
         multiview_mask: None,
         cache: None,
@@ -3842,6 +4178,66 @@ fn build_orbit_trail_pipeline(
         mapped_at_creation: false,
     });
     (pipeline, bgl, uniform_buf, bind_group, vertex_buf)
+}
+
+/// `Depth32Float` is the depth attachment used by the main pass.
+/// The format is hardcoded across the renderer (texture creation +
+/// every pipeline's DepthStencilState); this constant makes the
+/// shared value explicit.
+const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
+
+/// Create the depth attachment texture + its view, sized to the
+/// current swapchain. Recreated on every `resize` so the depth
+/// buffer always matches the colour buffer.
+fn create_depth_texture(
+    device: &wgpu::Device,
+    width: u32,
+    height: u32,
+) -> (wgpu::Texture, wgpu::TextureView) {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("aegis-depth"),
+        size: wgpu::Extent3d {
+            width: width.max(1),
+            height: height.max(1),
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: DEPTH_FORMAT,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    (texture, view)
+}
+
+/// Pass-through depth state — `Always` compare + no depth write —
+/// for every pipeline *except* the building pass. With this state,
+/// draw order continues to decide what's on top (same as before
+/// the depth attachment landed in M1 of plan 0014), and the depth
+/// buffer carries information about buildings only.
+fn pass_through_depth_state() -> wgpu::DepthStencilState {
+    wgpu::DepthStencilState {
+        format: DEPTH_FORMAT,
+        depth_write_enabled: Some(false),
+        depth_compare: Some(wgpu::CompareFunction::Always),
+        stencil: wgpu::StencilState::default(),
+        bias: wgpu::DepthBiasState::default(),
+    }
+}
+
+/// Depth-tested + depth-writing state used by the building pass.
+/// Standard `Less` + write so building fragments correctly occlude
+/// each other.
+fn building_depth_state() -> wgpu::DepthStencilState {
+    wgpu::DepthStencilState {
+        format: DEPTH_FORMAT,
+        depth_write_enabled: Some(true),
+        depth_compare: Some(wgpu::CompareFunction::Less),
+        stencil: wgpu::StencilState::default(),
+        bias: wgpu::DepthBiasState::default(),
+    }
 }
 
 fn srgb8_to_linear_rgba(r: u8, g: u8, b: u8, a: u8) -> [f32; 4] {
@@ -3911,5 +4307,11 @@ mod tests {
         assert_eq!(std::mem::size_of::<EarthCameraUniform>(), 96);
         assert_eq!(std::mem::size_of::<AtmosphereUniform>(), 144);
         assert_eq!(std::mem::size_of::<StarfieldUniform>(), 48);
+        assert_eq!(std::mem::size_of::<BuildingUniforms>(), 128);
+        assert_eq!(
+            std::mem::size_of::<crate::buildings::BuildingPerInstance>(),
+            16
+        );
+        assert_eq!(std::mem::size_of::<crate::buildings::BuildingVertex>(), 32);
     }
 }

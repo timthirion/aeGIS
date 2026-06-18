@@ -161,24 +161,41 @@ impl Camera {
     /// below the fixed value and everything visible falls behind the
     /// near plane.
     pub fn view_projection_matrix(&self, canvas: (u32, u32)) -> [f32; 16] {
+        self.view_projection_matrix_with_floor(canvas, 0.0)
+    }
+
+    /// Build the view-projection matrix, allowing the caller to
+    /// pull the near plane in *below* the per-altitude default
+    /// (`altitude * 0.1`) so an extruded feature riding above the
+    /// surface — e.g. plan 0014's buildings — doesn't clip at
+    /// high zoom.
+    ///
+    /// `min_near_floor` is the smallest near-plane value the caller
+    /// is willing to accept. When 0 the function preserves the
+    /// existing behaviour. When set (by the renderer to roughly
+    /// `max_building_h_world * 0.5`), the near plane shrinks just
+    /// enough to keep the tallest visible building's top inside
+    /// the clip frustum.
+    pub fn view_projection_matrix_with_floor(
+        &self,
+        canvas: (u32, u32),
+        min_near_floor: f32,
+    ) -> [f32; 16] {
         let cam_pos = self.camera_3d_position(canvas);
         let aspect = canvas.0 as f32 / canvas.1.max(1) as f32;
-        // "Up" handling near the poles: when the camera is nearly
-        // along the +Y axis (overhead view), the canonical +Y up
-        // would be parallel to the look direction. Pick an up vector
-        // that always has a usable tangent component.
         let up = if self.center_lonlat.1.abs() > 89.0 {
-            // Looking nearly straight down (or up) — use +Z as up so
-            // the look direction (+Y or -Y) crosses it cleanly.
             [0.0, 0.0, 1.0]
         } else {
             [0.0, 1.0, 0.0]
         };
         let view = look_at(cam_pos, [0.0, 0.0, 0.0], up);
         let altitude = self.altitude(canvas) as f32;
-        let near = (altitude * 0.1).max(1e-6);
-        // far must comfortably contain the far side of the sphere
-        // (camera-to-far-vertex distance = D + 1 = altitude + 2).
+        let default_near = (altitude * 0.1).max(1e-6);
+        let near = if min_near_floor > 0.0 {
+            default_near.min(min_near_floor).max(1e-6)
+        } else {
+            default_near
+        };
         let far = (altitude + 2.0).max(10.0) * 1.5;
         let proj = perspective(60.0_f32.to_radians(), aspect, near, far);
         mat4_mul(proj, view)

@@ -70,3 +70,11 @@ fn starfield_shader_validates() {
         "starfield.wgsl",
     );
 }
+
+#[test]
+fn building_shader_validates() {
+    validate_wgsl(
+        include_str!("../src/shaders/building.wgsl"),
+        "building.wgsl",
+    );
+}
