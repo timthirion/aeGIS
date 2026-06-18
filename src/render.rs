@@ -2309,6 +2309,22 @@ impl Renderer {
         self.sim_clock.set_rate(rate);
     }
 
+    /// Jump the simulation clock to `unix_s` UTC seconds. The
+    /// monotonic playback continues from there at the current
+    /// rate, so the terminator + atmosphere + satellite positions
+    /// all respond immediately and then keep drifting. Plan 0010.
+    pub fn set_sim_unix_s(&mut self, unix_s: f64) {
+        self.sim_clock.set_sim(unix_s);
+    }
+
+    /// Camera altitude above the planet surface in unit-sphere
+    /// units. Useful for JS-side gating of globe-view-only UI
+    /// (the time-slider panel, etc.) without re-deriving the
+    /// formula.
+    pub fn camera_altitude(&self) -> f64 {
+        self.camera.altitude(self.size())
+    }
+
     /// Headless "search and go" — parses `query` as either a
     /// coordinate expression or a geocoder query, picks the first
     /// result, and kicks off a fly-to to it. Native only;

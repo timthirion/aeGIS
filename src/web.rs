@@ -372,6 +372,32 @@ impl AegisInstance {
         self.inner.borrow_mut().renderer.clear_selected_feature();
     }
 
+    /// Current simulation time in UNIX seconds (UTC). Read by the
+    /// time-slider UI every frame so the displayed clock + the
+    /// slider position stay in sync as time drifts. Plan 0010.
+    #[wasm_bindgen(js_name = simUnixS)]
+    pub fn sim_unix_s(&self) -> f64 {
+        self.inner.borrow().renderer.sim_unix_s()
+    }
+
+    /// Jump the simulation clock to `unix_s`. Real-time playback
+    /// continues from there at the same rate (1x by default), so
+    /// the terminator + atmosphere + sun + satellites all snap to
+    /// the new time and then keep drifting. Plan 0010.
+    #[wasm_bindgen(js_name = setSimUnixS)]
+    pub fn set_sim_unix_s(&self, unix_s: f64) {
+        self.inner.borrow_mut().renderer.set_sim_unix_s(unix_s);
+    }
+
+    /// Camera altitude above the planet surface in unit-sphere
+    /// units. The JS side reads this to gate globe-view-only UI
+    /// (the time-slider panel, etc.) without re-deriving the
+    /// same formula in JavaScript.
+    #[wasm_bindgen(js_name = cameraAltitude)]
+    pub fn camera_altitude(&self) -> f64 {
+        self.inner.borrow().renderer.camera_altitude()
+    }
+
     /// Show or hide a single satellite by NORAD id. Per-row
     /// visibility checkbox in the side-panel list drives this.
     #[wasm_bindgen(js_name = setSatelliteVisible)]

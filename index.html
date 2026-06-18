@@ -553,6 +553,61 @@
     #aegis-attribution .panel section { display: none; }
     #aegis-attribution .panel section[data-active="true"] { display: block; }
 
+    /* Time slider (plan 0010). Bottom-centre pill — UTC time-of-
+       day scrub. Hidden at street zoom because the day/night
+       effects it drives are also faded out there; gating mirrors
+       the same altitude threshold the `day_night_color` ramp
+       uses, so the slider appears exactly when it matters. The
+       `body[data-view="globe"]` attribute is set per-frame from
+       the JS tick. */
+    #aegis-time-slider {
+      position: absolute;
+      left: 50%;
+      bottom: 16px;
+      transform: translateX(-50%);
+      z-index: 10;
+      display: none;
+      align-items: center;
+      gap: 10px;
+      padding: 6px 14px;
+      background: rgba(11, 14, 18, 0.78);
+      border: 1px solid #1d232b;
+      border-radius: 999px;
+      backdrop-filter: blur(6px);
+      -webkit-backdrop-filter: blur(6px);
+      box-shadow: 0 2px 12px rgba(0, 0, 0, 0.35);
+      font: 12px/1 ui-monospace, SFMono-Regular, Menlo, monospace;
+      color: #c0c8d4;
+      user-select: none;
+    }
+    body[data-view="globe"] #aegis-time-slider { display: inline-flex; }
+    #aegis-time-slider .time {
+      color: #e6e8eb;
+      font-weight: 500;
+      font-variant-numeric: tabular-nums;
+      min-width: 16ch;
+      text-align: center;
+    }
+    #aegis-time-slider input[type="range"] {
+      width: 320px;
+      accent-color: #9cb2cf;
+    }
+    #aegis-time-slider button {
+      appearance: none;
+      border: 1px solid #2a3340;
+      background: transparent;
+      color: #8d97a3;
+      padding: 4px 10px;
+      border-radius: 999px;
+      cursor: pointer;
+      font: inherit;
+      transition: color 120ms, background-color 120ms;
+    }
+    #aegis-time-slider button:hover {
+      color: #e6e8eb;
+      background: #1d232b;
+    }
+
     footer {
       border-top: 1px solid #1d232b;
       font-size: 12px;
@@ -643,6 +698,19 @@
       <button type="button" data-cat="weather" aria-pressed="false" title="Weather + Earth-observation">Weather</button>
       <button type="button" data-cat="debris" aria-pressed="false" title="Tracked orbital debris (active-debris + 4 big breakup catalogs, ~6500 objects ≥10 cm)">Debris</button>
     </div>
+    <div id="aegis-time-slider" role="group" aria-label="Simulation time">
+      <span class="time" id="aegis-time-text">00:00:00 UTC</span>
+      <input
+        type="range"
+        id="aegis-time-range"
+        min="0"
+        max="86399"
+        step="1"
+        value="0"
+        aria-label="UTC time of day"
+      />
+      <button type="button" id="aegis-time-now" title="Snap to wall-clock time">Now</button>
+    </div>
     <div id="aegis-attribution" data-open="false">
       <button
         type="button"
@@ -710,6 +778,7 @@
         wireSatTooltip(aegis);
         wireSatPanel(aegis);
         wireAttribution(aegis);
+        wireTimeSlider(aegis);
       } catch (e) {
         console.error("aegis start failed", e);
         const host = document.getElementById("aegis-host");
@@ -1302,6 +1371,68 @@
           setOpen(false);
         }
       });
+    }
+
+    // Time slider (plan 0010 v1). Globe-view-only panel that
+    // scrubs the simulation clock through the current UTC day.
+    // The renderer drifts at 1× by default — dragging the slider
+    // jumps the clock, and time continues from there at 1× so
+    // the terminator + atmosphere + city lights + satellites all
+    // animate forward from the scrubbed instant.
+    function wireTimeSlider(instance) {
+      const text = document.getElementById("aegis-time-text");
+      const range = document.getElementById("aegis-time-range");
+      const nowBtn = document.getElementById("aegis-time-now");
+      if (!text || !range || !nowBtn) return;
+
+      const pad = (n) => String(n).padStart(2, "0");
+      const formatTime = (unix_s) => {
+        const sod = ((Math.floor(unix_s) % 86400) + 86400) % 86400;
+        const h = Math.floor(sod / 3600);
+        const m = Math.floor((sod % 3600) / 60);
+        const s = sod % 60;
+        return `${pad(h)}:${pad(m)}:${pad(s)} UTC`;
+      };
+
+      let dragging = false;
+      const onSlide = () => {
+        // Slider value is seconds-into-UTC-day. Pin the date
+        // bucket to whatever sim day we're currently on so the
+        // jump stays on the right calendar day.
+        const day = Math.floor(instance.simUnixS() / 86400);
+        const newUnix = day * 86400 + Number(range.value);
+        instance.setSimUnixS(newUnix);
+      };
+      range.addEventListener("pointerdown", () => { dragging = true; });
+      range.addEventListener("input", onSlide);
+      const releaseDrag = () => { dragging = false; };
+      range.addEventListener("pointerup", releaseDrag);
+      range.addEventListener("pointercancel", releaseDrag);
+      range.addEventListener("change", releaseDrag);
+
+      nowBtn.addEventListener("click", () => {
+        instance.setSimUnixS(Date.now() / 1000);
+      });
+
+      // Per-frame refresh of body[data-view] (drives the panel's
+      // visibility) + the slider position + time text. 60 fps is
+      // overkill for a clock display but matches the renderer's
+      // tick rate cleanly and avoids a separate setInterval.
+      const tick = () => {
+        const alt = instance.cameraAltitude();
+        document.body.setAttribute(
+          "data-view",
+          alt > 0.05 ? "globe" : "flat",
+        );
+        const sim = instance.simUnixS();
+        text.textContent = formatTime(sim);
+        if (!dragging) {
+          const sod = ((Math.floor(sim) % 86400) + 86400) % 86400;
+          range.value = String(sod);
+        }
+        requestAnimationFrame(tick);
+      };
+      requestAnimationFrame(tick);
     }
     main();
   </script>
