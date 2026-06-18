@@ -243,8 +243,9 @@ struct EarthCameraUniform {
     night_dim: f32,
 }
 
-/// Per-frame uniform consumed by `starfield.wgsl`. 32 bytes —
-/// camera pos + aspect ratio, up-hint + zoom-driven strength.
+/// Per-frame uniform consumed by `starfield.wgsl`. 48 bytes —
+/// camera pos + aspect ratio, up-hint + zoom-driven strength, sun
+/// direction (for the sun-glyph disc + halo) + trailing pad.
 /// Mirrors the WGSL struct of the same name byte-for-byte.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default, Pod, Zeroable)]
@@ -253,6 +254,8 @@ struct StarfieldUniform {
     aspect: f32,
     up_hint: [f32; 3],
     strength: f32,
+    sun_dir: [f32; 3],
+    _pad: f32,
 }
 
 /// Per-frame uniform consumed by `atmosphere.wgsl`. 144 bytes
@@ -2605,6 +2608,8 @@ impl Renderer {
             aspect,
             up_hint,
             strength: star_strength,
+            sun_dir,
+            _pad: 0.0,
         };
         self.queue.write_buffer(
             &self.starfield_uniform_buf,
@@ -3889,6 +3894,6 @@ mod tests {
         assert_eq!(std::mem::size_of::<CapUniform>(), 112);
         assert_eq!(std::mem::size_of::<EarthCameraUniform>(), 96);
         assert_eq!(std::mem::size_of::<AtmosphereUniform>(), 144);
-        assert_eq!(std::mem::size_of::<StarfieldUniform>(), 32);
+        assert_eq!(std::mem::size_of::<StarfieldUniform>(), 48);
     }
 }

@@ -28,6 +28,12 @@ struct StarfieldUniform {
     /// — gating on strength lets the fragment shader early-out
     /// and skip the per-pixel hash work.
     strength: f32,
+    /// Sun direction in body-fixed coords — same value the
+    /// surface + atmosphere shaders read. The fragment renders a
+    /// small disc + halo at this direction so the day/night work
+    /// has a visible source.
+    sun_dir: vec3<f32>,
+    _pad: f32,
 };
 
 @group(0) @binding(0) var<uniform> u: StarfieldUniform;
@@ -52,6 +58,13 @@ const STAR_THRESHOLD: f32 = 0.85;
 /// `1 / STAR_INV_RADIUS = ~0.06` of a cell, ≈ 0.18° on sky →
 /// roughly 1–2 screen pixels at a 1000-px-wide canvas.
 const STAR_INV_RADIUS: f32 = 16.0;
+
+/// `cos(angular_radius)` for the sun disc + halo. Real sun is
+/// 0.27° angular radius; we exaggerate to ~0.8° for the core and
+/// ~6° for the halo so the source reads clearly at globe view
+/// without being a dot lost in the starfield.
+const SUN_CORE_COS: f32 = 0.9999;
+const SUN_HALO_COS: f32 = 0.9945;
 
 struct VsOut {
     @builtin(position) clip: vec4<f32>,
@@ -157,6 +170,29 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
             );
             color = color + star_color * intensity;
         }
+    }
+
+    // Sun glyph — small disc + soft halo. Only renders when the
+    // sun isn't behind the planet from the camera's point of view:
+    // closest approach of the camera-to-sun ray to origin gives a
+    // clean occlusion test without spawning a second draw call.
+    let cs = dot(u.camera_pos, u.sun_dir);
+    let cc = dot(u.camera_pos, u.camera_pos);
+    // Sun ray hits planet iff its closest-approach distance < 1
+    // AND that closest approach is in front of the camera.
+    let sun_occluded = cs < 0.0 && (cc - cs * cs) < 1.0;
+    if (!sun_occluded) {
+        let cos_to_sun = dot(dir, u.sun_dir);
+        let core = step(SUN_CORE_COS, cos_to_sun);
+        let halo_t = clamp(
+            (cos_to_sun - SUN_HALO_COS) / max(SUN_CORE_COS - SUN_HALO_COS, 1e-6),
+            0.0,
+            1.0,
+        );
+        let halo = halo_t * halo_t;
+        let sun_color = vec3<f32>(1.0, 0.96, 0.78);
+        let sun_intensity = core * 1.8 + halo * 0.5;
+        color = color + sun_color * sun_intensity;
     }
 
     return vec4<f32>(color * u.strength, u.strength);
