@@ -583,20 +583,17 @@
        uses, so the slider appears exactly when it matters. The
        `body[data-view="globe"]` attribute is set per-frame from
        the JS tick. */
+    /* Time slider lives inline in `#ui-bottom-left` to the right
+       of the Tilt control, so the whole bottom-left chrome reads
+       as one row. Hidden until `body[data-view="globe"]` since
+       the day/night effects it drives all fade out at street
+       zoom anyway; the row collapses to Map/Sat + Borders + Tilt
+       there. */
     #aegis-time-slider {
-      position: absolute;
-      left: 50%;
-      /* Raised above the bottom-left chrome row (Map/Satellite +
-         Borders + Tilt) so the two pills don't overlap at narrower
-         desktop widths where the centered time slider stretches
-         into the left row's footprint. */
-      bottom: 64px;
-      transform: translateX(-50%);
-      z-index: 10;
       display: none;
       align-items: center;
-      gap: 10px;
-      padding: 6px 14px;
+      gap: 8px;
+      padding: 4px 12px;
       background: rgba(11, 14, 18, 0.78);
       border: 1px solid #1d232b;
       border-radius: 999px;
@@ -612,11 +609,13 @@
       color: #e6e8eb;
       font-weight: 500;
       font-variant-numeric: tabular-nums;
-      min-width: 16ch;
+      /* "14:32" UTC clock — five chars + a hair of breathing room.
+         The full "HH:MM:SS UTC" was too wide for a one-row layout. */
+      min-width: 5ch;
       text-align: center;
     }
     #aegis-time-slider input[type="range"] {
-      width: 320px;
+      width: 160px;
       accent-color: #9cb2cf;
     }
     #aegis-time-slider button {
@@ -624,7 +623,7 @@
       border: 1px solid #2a3340;
       background: transparent;
       color: #8d97a3;
-      padding: 4px 10px;
+      padding: 3px 8px;
       border-radius: 999px;
       cursor: pointer;
       font: inherit;
@@ -697,17 +696,15 @@
          responsive via min(480px, calc(100% - 32px)) but the
          top margin tightens). */
       #aegis-search { top: 8px; }
-      /* Time slider — narrower range input + smaller time text
-         + tighter padding so the pill fits a phone. */
+      /* Time slider now lives inside `#ui-bottom-left` which
+         flex-wraps on mobile — no absolute-position overrides
+         needed. Just keep it slim. */
       #aegis-time-slider {
-        bottom: 96px; /* clear the bottom-left wrapped row */
-        padding: 5px 10px;
+        padding: 4px 10px;
         gap: 6px;
       }
-      #aegis-time-slider .time { min-width: 13ch; font-size: 11px; }
-      #aegis-time-slider input[type="range"] {
-        width: min(220px, calc(100vw - 220px));
-      }
+      #aegis-time-slider .time { font-size: 11px; }
+      #aegis-time-slider input[type="range"] { width: 110px; }
       #aegis-time-slider button { padding: 3px 8px; font-size: 11px; }
       /* Attribution chip stays bottom-right but at a smaller
          pill so it doesn't bump into the time slider. */
@@ -769,6 +766,19 @@
           title="Camera pitch (0° = top-down, 70° = oblique)"
         />
       </div>
+      <div id="aegis-time-slider" role="group" aria-label="Simulation time">
+        <span class="time" id="aegis-time-text">00:00</span>
+        <input
+          type="range"
+          id="aegis-time-range"
+          min="0"
+          max="86399"
+          step="1"
+          value="0"
+          aria-label="UTC time of day"
+        />
+        <button type="button" id="aegis-time-now" title="Snap to wall-clock time">Now</button>
+      </div>
     </div>
     <div id="aegis-sat-tooltip" role="status" aria-live="polite"></div>
     <div id="aegis-feature-info" role="status" aria-live="polite"></div>
@@ -814,19 +824,6 @@
       <button type="button" data-cat="gnss" aria-pressed="false" title="GPS / GLONASS / Galileo / BeiDou">GNSS</button>
       <button type="button" data-cat="weather" aria-pressed="false" title="Weather + Earth-observation">Weather</button>
       <button type="button" data-cat="debris" aria-pressed="false" title="Tracked orbital debris (active-debris + 4 big breakup catalogs, ~6500 objects ≥10 cm)">Debris</button>
-    </div>
-    <div id="aegis-time-slider" role="group" aria-label="Simulation time">
-      <span class="time" id="aegis-time-text">00:00:00 UTC</span>
-      <input
-        type="range"
-        id="aegis-time-range"
-        min="0"
-        max="86399"
-        step="1"
-        value="0"
-        aria-label="UTC time of day"
-      />
-      <button type="button" id="aegis-time-now" title="Snap to wall-clock time">Now</button>
     </div>
     <div id="aegis-attribution" data-open="false">
       <button
@@ -1513,12 +1510,13 @@
       if (!text || !range || !nowBtn) return;
 
       const pad = (n) => String(n).padStart(2, "0");
+      // Condensed to HH:MM (UTC implicit) so the time pill fits
+      // in the bottom-left row alongside Map/Sat + Borders + Tilt.
       const formatTime = (unix_s) => {
         const sod = ((Math.floor(unix_s) % 86400) + 86400) % 86400;
         const h = Math.floor(sod / 3600);
         const m = Math.floor((sod % 3600) / 60);
-        const s = sod % 60;
-        return `${pad(h)}:${pad(m)}:${pad(s)} UTC`;
+        return `${pad(h)}:${pad(m)}`;
       };
 
       let dragging = false;
