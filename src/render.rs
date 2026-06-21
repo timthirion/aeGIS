@@ -96,6 +96,10 @@ const BLDG_MAX_INFLIGHT: usize = 2;
 const BLDG_MAX_DISPATCH_PER_FRAME: usize = 2;
 /// Maximum tiles held in GPU memory before FIFO eviction.
 const BLDG_TILE_CACHE_MAX: usize = 32;
+/// Buildings processed per rAF in the incremental mesh-build loop.
+/// Bounds the per-frame CPU budget so a dense Manhattan tile (~3000
+/// buildings) takes ~15 frames to materialise rather than one 300 ms stall.
+const BLDG_BUILDINGS_PER_FRAME: usize = 200;
 /// OFM `building` layer maxzoom — clamp tile dispatch to this.
 const BLDG_TILE_MAX_Z: u8 = 14;
 /// TileJSON endpoint for OpenFreeMap. Returns JSON with a `tiles[0]`
@@ -385,6 +389,16 @@ struct BuildingBinding {
     max_height_world: f32,
 }
 
+/// In-progress incremental mesh build for a single building tile.
+/// Held across frames; `next_idx` advances by `BLDG_BUILDINGS_PER_FRAME`
+/// each rAF until `next_idx >= buildings.len()`, then uploaded.
+struct BldgWip {
+    id: TileId,
+    mesh: crate::buildings::BuildingMesh,
+    buildings: Vec<crate::buildings::Building>,
+    next_idx: usize,
+}
+
 /// A raster tile that's been uploaded to the GPU.
 struct TileBinding {
     /// Kept alive so the bind-group's texture view stays valid.
@@ -523,6 +537,8 @@ pub struct Renderer {
     /// Insertion-order queue for FIFO eviction when the tile count
     /// exceeds `BLDG_TILE_CACHE_MAX`.
     bldg_lru: VecDeque<TileId>,
+    /// Tile whose mesh is currently being built incrementally across frames.
+    bldg_wip: Option<BldgWip>,
     /// URL template from the OFM TileJSON (versioned path). `None`
     /// until the one-time TileJSON fetch completes at startup.
     bldg_tile_url_template: Option<String>,
@@ -1023,6 +1039,7 @@ impl Renderer {
             bldg_dwell_snapshot: None,
             bldg_dwell_frames: 0,
             bldg_lru: VecDeque::new(),
+            bldg_wip: None,
             bldg_tile_url_template: None,
             bldg_tilejson_requested: false,
             bldg_tilejson_tx,
@@ -1087,7 +1104,7 @@ impl Renderer {
             hovered_satellite: None,
             trails_enabled: true,
             borders_visible: true,
-            bldg_visible: true,
+            bldg_visible: false,
             hidden_satellites: HashSet::new(),
             orbit_frame_positions: Vec::new(),
         }
@@ -1235,9 +1252,14 @@ impl Renderer {
         }
     }
 
-    /// Drain one building-tile fetch completion per call. The decode +
-    /// triangulation already ran in the async task; here we only upload
-    /// to GPU (cheap).
+    /// Incrementally builds building meshes across frames. Each call:
+    ///
+    /// 1. If no WIP: try to start one from the next completed fetch.
+    /// 2. Advance the active WIP by up to BLDG_BUILDINGS_PER_FRAME buildings.
+    /// 3. If WIP is complete, upload to GPU.
+    ///
+    /// Keeps per-frame CPU time bounded even for dense tiles (e.g. a
+    /// Manhattan z14 tile can have thousands of buildings).
     pub fn drain_bldg_completed_fetches(&mut self) {
         // Drain the TileJSON URL if it arrived
         if self.bldg_tile_url_template.is_none() {
@@ -1246,27 +1268,46 @@ impl Renderer {
                 self.bldg_tile_url_template = Some(url);
             }
         }
-        // One tile per frame: decode MVT + build mesh here (not in the
-        // fetch task) so the main thread never gets multiple CPU bursts
-        // back-to-back from concurrent fetches completing simultaneously.
-        match self.bldg_completed_rx.try_recv() {
-            Ok((id, Ok(bytes))) => match crate::mvt::decode_mvt_buildings(&bytes, id) {
-                Ok(buildings) => {
-                    let mesh = crate::buildings::build_mesh(&buildings);
-                    self.upload_bldg_tile(id, mesh);
-                }
-                Err(e) => {
+        // Start a new WIP from the channel only when the previous one is done.
+        if self.bldg_wip.is_none() {
+            match self.bldg_completed_rx.try_recv() {
+                Ok((id, Ok(bytes))) => match crate::mvt::decode_mvt_buildings(&bytes, id) {
+                    Ok(buildings) => {
+                        self.bldg_wip = Some(BldgWip {
+                            id,
+                            mesh: crate::buildings::BuildingMesh::default(),
+                            buildings,
+                            next_idx: 0,
+                        });
+                    }
+                    Err(e) => {
+                        self.bldg_requested.remove(&id);
+                        self.bldg_failed.insert(id);
+                        log::warn!("bldg tile {id:?} decode failed: {e}");
+                    }
+                },
+                Ok((id, Err(e))) => {
                     self.bldg_requested.remove(&id);
                     self.bldg_failed.insert(id);
-                    log::warn!("bldg tile {id:?} decode failed: {e}");
+                    log::warn!("bldg tile {id:?} fetch failed: {e}");
                 }
-            },
-            Ok((id, Err(e))) => {
-                self.bldg_requested.remove(&id);
-                self.bldg_failed.insert(id);
-                log::warn!("bldg tile {id:?} fetch failed: {e}");
+                Err(_) => {}
             }
-            Err(_) => {}
+        }
+        // Advance the in-progress mesh by up to BLDG_BUILDINGS_PER_FRAME buildings.
+        if let Some(wip) = &mut self.bldg_wip {
+            let to = (wip.next_idx + BLDG_BUILDINGS_PER_FRAME).min(wip.buildings.len());
+            crate::buildings::extend_mesh(&mut wip.mesh, &wip.buildings, wip.next_idx, to);
+            wip.next_idx = to;
+        }
+        // Upload and clear when the tile is fully meshed.
+        if self
+            .bldg_wip
+            .as_ref()
+            .is_some_and(|w| w.next_idx >= w.buildings.len())
+        {
+            let wip = self.bldg_wip.take().unwrap();
+            self.upload_bldg_tile(wip.id, wip.mesh);
         }
     }
 
@@ -2008,6 +2049,7 @@ impl Renderer {
         self.bldg_dwell_snapshot = None;
         self.bldg_dwell_frames = 0;
         self.bldg_lru.clear();
+        self.bldg_wip = None;
         // Snap the camera to the new body's home view. M4 may
         // upgrade this to a fly-to once a body-aware spherical
         // transition is fleshed out.
@@ -2129,12 +2171,10 @@ impl Renderer {
                 start_zoom: 1.0,
                 target_lonlat: (h.lon, h.lat),
                 target_zoom: h.zoom,
-                started_at: now,
+                started_at: now + 0.25,
                 // Bypass the great-circle-arc-derived duration —
                 // a same-lonlat fly would otherwise snap in 0.4s.
-                // 2.5s gives the user time to actually see the
-                // globe before the dive.
-                duration: 2.5,
+                duration: 1.5,
             });
         }
         let Some(fly) = self.flyto else { return };

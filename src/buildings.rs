@@ -98,6 +98,18 @@ pub struct BuildingPerInstance {
     pub _pad: f32,
 }
 
+/// Append buildings `[from, to)` into an existing (possibly partial) mesh.
+/// Called by the renderer's incremental drain loop — one chunk per rAF.
+pub(crate) fn extend_mesh(mesh: &mut BuildingMesh, buildings: &[Building], from: usize, to: usize) {
+    for (idx, b) in buildings.iter().enumerate().take(to).skip(from) {
+        append_building_to_mesh(mesh, idx, b);
+        let h_world = (b.height_m as f64 / EARTH_RADIUS_METRES) as f32;
+        if h_world > mesh.max_height_world {
+            mesh.max_height_world = h_world;
+        }
+    }
+}
+
 /// Build the GPU mesh (one indexed-draw VBO + storage buffer of
 /// per-building centroid normals) from the parsed `Building`s.
 /// Skips buildings whose top face fails to triangulate cleanly —
