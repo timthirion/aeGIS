@@ -1957,6 +1957,22 @@ impl Renderer {
         if self.initial_fly_pending {
             self.initial_fly_pending = false;
             let h = body::EARTH.home;
+            // Pre-flight the home-view tile fetch — snap the
+            // camera briefly to the home position, dispatch the
+            // visible-tile request, then restore for the fly-in
+            // start. Without this, the dwell-gated sat-tile path
+            // would only start fetching after the camera settled
+            // post-fly-in (~3s after load); with it, tiles begin
+            // downloading at t=0 in parallel with the dive so
+            // Chicago is already painted when the user arrives.
+            let saved_lonlat = self.camera.center_lonlat;
+            let saved_zoom = self.camera.zoom;
+            self.camera.center_lonlat = (h.lon, h.lat);
+            self.camera.zoom = h.zoom;
+            self.dispatch_visible_sat_tiles();
+            self.camera.center_lonlat = saved_lonlat;
+            self.camera.zoom = saved_zoom;
+
             self.flyto = Some(crate::flyto::FlyTo {
                 start_lonlat: (h.lon, h.lat),
                 start_zoom: 1.0,

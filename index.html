@@ -638,6 +638,84 @@
     }
     footer a { color: #9cb2cf; text-decoration: none; }
     footer a:hover { text-decoration: underline; }
+
+    /* Mobile / narrow-viewport rearrangement. iPhone widths
+       (~375 px) can't fit the top-left orbit-categories pill row,
+       the bottom-left chrome row, the 280 px sat-list panel, and
+       the 320 px time-slider all in the original desktop layout
+       — elements overlap and run off the screen. Reflow + shrink
+       at narrow widths so each element stays visible and
+       reachable. */
+    @media (max-width: 640px) {
+      header {
+        padding: 8px 12px;
+      }
+      header h1 { font-size: 18px; }
+      #aegis-body-switcher button {
+        width: 26px;
+        height: 26px;
+        font-size: 14px;
+      }
+      /* Orbit categories — wrap to multiple rows + shrink the
+         button padding so the 5-button row fits. */
+      #aegis-orbit-categories {
+        flex-wrap: wrap;
+        max-width: calc(100vw - 32px);
+        gap: 2px;
+        padding: 2px;
+      }
+      #aegis-orbit-categories button {
+        padding: 5px 8px;
+        font-size: 11px;
+      }
+      /* Bottom-left chrome row wraps. The slider drops onto its
+         own line under the toggle pills on iPhone-width. */
+      #ui-bottom-left {
+        flex-wrap: wrap;
+        max-width: calc(100vw - 32px);
+        gap: 6px;
+      }
+      #basemap-toggle button,
+      #border-toggle button {
+        padding: 5px 9px;
+        font-size: 11px;
+      }
+      #pitch-control { padding: 3px 10px; }
+      #pitch-control input[type="range"] { width: 90px; }
+      /* Sat-list panel never exceeds the viewport width and gets
+         a bit shorter so it doesn't push under the bottom row. */
+      #aegis-sat-panel {
+        width: calc(100vw - 32px);
+        max-height: 40vh;
+      }
+      #aegis-sat-list { max-height: 28vh; }
+      /* Search bar stays full-width-minus-padding (already
+         responsive via min(480px, calc(100% - 32px)) but the
+         top margin tightens). */
+      #aegis-search { top: 8px; }
+      /* Time slider — narrower range input + smaller time text
+         + tighter padding so the pill fits a phone. */
+      #aegis-time-slider {
+        bottom: 96px; /* clear the bottom-left wrapped row */
+        padding: 5px 10px;
+        gap: 6px;
+      }
+      #aegis-time-slider .time { min-width: 13ch; font-size: 11px; }
+      #aegis-time-slider input[type="range"] {
+        width: min(220px, calc(100vw - 220px));
+      }
+      #aegis-time-slider button { padding: 3px 8px; font-size: 11px; }
+      /* Attribution chip stays bottom-right but at a smaller
+         pill so it doesn't bump into the time slider. */
+      #aegis-attribution .toggle {
+        padding: 3px 9px;
+        font-size: 10px;
+      }
+      #aegis-attribution .panel {
+        width: calc(100vw - 32px);
+        right: 0;
+      }
+    }
   </style>
 </head>
 <body>
