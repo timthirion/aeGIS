@@ -609,9 +609,10 @@
       color: #e6e8eb;
       font-weight: 500;
       font-variant-numeric: tabular-nums;
-      /* "14:32" UTC clock — five chars + a hair of breathing room.
-         The full "HH:MM:SS UTC" was too wide for a one-row layout. */
-      min-width: 5ch;
+      /* "14:32 UTC" — nine chars. Wide enough for the explicit
+         timezone, narrow enough that the four-control row still
+         fits a 1000 px desktop. */
+      min-width: 9ch;
       text-align: center;
     }
     #aegis-time-slider input[type="range"] {
@@ -767,7 +768,7 @@
         />
       </div>
       <div id="aegis-time-slider" role="group" aria-label="Simulation time">
-        <span class="time" id="aegis-time-text">00:00</span>
+        <span class="time" id="aegis-time-text">00:00 UTC</span>
         <input
           type="range"
           id="aegis-time-range"
@@ -1510,13 +1511,13 @@
       if (!text || !range || !nowBtn) return;
 
       const pad = (n) => String(n).padStart(2, "0");
-      // Condensed to HH:MM (UTC implicit) so the time pill fits
-      // in the bottom-left row alongside Map/Sat + Borders + Tilt.
+      // HH:MM UTC — explicit timezone so the time pill isn't
+      // ambiguous about which clock the user is scrubbing.
       const formatTime = (unix_s) => {
         const sod = ((Math.floor(unix_s) % 86400) + 86400) % 86400;
         const h = Math.floor(sod / 3600);
         const m = Math.floor((sod % 3600) / 60);
-        return `${pad(h)}:${pad(m)}`;
+        return `${pad(h)}:${pad(m)} UTC`;
       };
 
       let dragging = false;
