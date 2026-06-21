@@ -172,10 +172,17 @@ impl Camera {
     }
 
     /// East-tangent unit vector at the camera centre. Derived from
-    /// the surface normal × world-up (or world-Z near the poles);
-    /// used as the rotation axis for pitch so tilting reads as
-    /// "lean the camera north" — the user sees more sky in front
-    /// and less behind.
+    /// `world_up × surface_normal` (or `+Z × n` near the poles);
+    /// used as the rotation axis for pitch so tilting moves the
+    /// camera south of the target along the local tangent plane.
+    ///
+    /// The order matters: the previous draft computed `n × up`,
+    /// which gives the *west* direction. Under positive pitch
+    /// that rotated the radial-outward vector *toward* world-up
+    /// instead of along the tangent plane — at ~35° pitch the
+    /// look direction landed nearly parallel to world-up and
+    /// `look_at`'s implicit up basis flipped, manifesting as
+    /// "the view rolls over my head."
     fn east_tangent_3d(&self) -> [f32; 3] {
         let n = self.surface_point_3d();
         let up_hint = if self.center_lonlat.1.abs() > 89.0 {
@@ -183,10 +190,10 @@ impl Camera {
         } else {
             [0.0_f32, 1.0, 0.0]
         };
-        // east = normalize(cross(n, up_hint))
-        let cx = n[1] * up_hint[2] - n[2] * up_hint[1];
-        let cy = n[2] * up_hint[0] - n[0] * up_hint[2];
-        let cz = n[0] * up_hint[1] - n[1] * up_hint[0];
+        // east = normalize(up_hint × n)
+        let cx = up_hint[1] * n[2] - up_hint[2] * n[1];
+        let cy = up_hint[2] * n[0] - up_hint[0] * n[2];
+        let cz = up_hint[0] * n[1] - up_hint[1] * n[0];
         let len = (cx * cx + cy * cy + cz * cz).sqrt().max(1e-9);
         [cx / len, cy / len, cz / len]
     }
