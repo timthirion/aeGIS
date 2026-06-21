@@ -92,8 +92,8 @@ const SAT_MAX_DISPATCH_PER_FRAME: usize = 8;
 const BLDG_ZOOM_GATE: f64 = 14.0;
 /// Same dwell cadence as satellite tiles.
 const BLDG_DWELL_FRAMES: u32 = 30;
-const BLDG_MAX_INFLIGHT: usize = 4;
-const BLDG_MAX_DISPATCH_PER_FRAME: usize = 4;
+const BLDG_MAX_INFLIGHT: usize = 2;
+const BLDG_MAX_DISPATCH_PER_FRAME: usize = 2;
 /// Maximum tiles held in GPU memory before FIFO eviction.
 const BLDG_TILE_CACHE_MAX: usize = 32;
 /// OFM `building` layer maxzoom — clamp tile dispatch to this.
@@ -395,7 +395,9 @@ struct TileBinding {
 
 /// Fetch completion delivered to the renderer's tile-load channel.
 type TileFetchResult = (TileId, Result<DecodedTile, String>);
-type BldgTileFetchResult = (TileId, Result<crate::buildings::BuildingMesh, String>);
+/// Raw bytes only — CPU-heavy decode + mesh build happens in drain,
+/// one tile per rAF, so the main thread never blocks on a batch.
+type BldgTileFetchResult = (TileId, Result<Vec<u8>, String>);
 
 /// Snapshot of the camera state used to detect "the user has settled
 /// here." We bucket fractional zooms (so a 0.001-zoom drift from
@@ -1244,15 +1246,25 @@ impl Renderer {
                 self.bldg_tile_url_template = Some(url);
             }
         }
-        // Process one completed tile per frame to avoid blocking rAF
+        // One tile per frame: decode MVT + build mesh here (not in the
+        // fetch task) so the main thread never gets multiple CPU bursts
+        // back-to-back from concurrent fetches completing simultaneously.
         match self.bldg_completed_rx.try_recv() {
-            Ok((id, Ok(mesh))) => {
-                self.upload_bldg_tile(id, mesh);
-            }
+            Ok((id, Ok(bytes))) => match crate::mvt::decode_mvt_buildings(&bytes, id) {
+                Ok(buildings) => {
+                    let mesh = crate::buildings::build_mesh(&buildings);
+                    self.upload_bldg_tile(id, mesh);
+                }
+                Err(e) => {
+                    self.bldg_requested.remove(&id);
+                    self.bldg_failed.insert(id);
+                    log::warn!("bldg tile {id:?} decode failed: {e}");
+                }
+            },
             Ok((id, Err(e))) => {
                 self.bldg_requested.remove(&id);
                 self.bldg_failed.insert(id);
-                log::warn!("bldg tile {id:?} failed: {e}");
+                log::warn!("bldg tile {id:?} fetch failed: {e}");
             }
             Err(_) => {}
         }
@@ -2728,13 +2740,7 @@ impl Renderer {
         };
         let url = body::format_tile_url(&template, id.z, id.x, id.y);
         std::thread::spawn(move || {
-            let result: Result<crate::buildings::BuildingMesh, String> = (|| {
-                let bytes =
-                    crate::net::fetch_bytes_blocking(&url).map_err(|e| format!("fetch: {e}"))?;
-                let buildings = crate::mvt::decode_mvt_buildings(&bytes, id)
-                    .map_err(|e| format!("decode: {e}"))?;
-                Ok(crate::buildings::build_mesh(&buildings))
-            })();
+            let result = crate::net::fetch_bytes_blocking(&url).map_err(|e| format!("fetch: {e}"));
             let _ = tx.send((id, result));
         });
     }
@@ -2747,15 +2753,9 @@ impl Renderer {
         };
         let url = body::format_tile_url(&template, id.z, id.x, id.y);
         wasm_bindgen_futures::spawn_local(async move {
-            let result: Result<crate::buildings::BuildingMesh, String> = async {
-                let bytes = crate::net::fetch_bytes_async(&url)
-                    .await
-                    .map_err(|e| format!("fetch: {e}"))?;
-                let buildings = crate::mvt::decode_mvt_buildings(&bytes, id)
-                    .map_err(|e| format!("decode: {e}"))?;
-                Ok(crate::buildings::build_mesh(&buildings))
-            }
-            .await;
+            let result = crate::net::fetch_bytes_async(&url)
+                .await
+                .map_err(|e| format!("fetch: {e}"));
             let _ = tx.send((id, result));
         });
     }
