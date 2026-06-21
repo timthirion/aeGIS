@@ -27,19 +27,12 @@ log = "0.4"
 # Both decoders are pure-Rust.
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 
-# GeoJSON parsing for the M3 vector overlay. Pure-Rust; works on
-# wasm32 with no extra config.
+# GeoJSON parsing for vector overlays (Natural Earth countries). Pure-Rust.
 geojson = { version = "0.24", default-features = false }
 
-# Polygon triangulation for plan 0014 building extrusion. Pure-Rust
+# Polygon triangulation for building extrusion (plan 0014). Pure-Rust
 # port of Mapbox's `earcut`; ISC.
 earcutr = "0.4"
-
-# GZIP decode for the bundled building footprint snapshot
-# (plan 0014). Already in the wasm dep graph transitively via
-# `image`'s `png` feature; promoting to a direct dep keeps the
-# loader's intent visible.
-flate2 = "1"
 
 # Coordinate-format pattern matching for the search bar
 # (plan 0002 M0). Pure-Rust; works on wasm32.

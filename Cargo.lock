@@ -35,7 +35,6 @@ dependencies = [
  "earcutr",
  "ehttp",
  "env_logger",
- "flate2",
  "geojson",
  "image",
  "js-sys",

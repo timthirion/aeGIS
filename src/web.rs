@@ -116,6 +116,7 @@ impl Inner {
         }
         self.renderer.drain_completed_fetches();
         self.renderer.drain_sat_completed_fetches();
+        self.renderer.drain_bldg_completed_fetches();
         // Monotonic seconds since the page loaded. `performance.now()`
         // returns ms — divide for the seconds the fly-to sampler wants.
         let now = web_window().performance().map_or(0.0, |p| p.now() / 1000.0);
@@ -123,6 +124,7 @@ impl Inner {
         self.renderer.tick_orbit(now);
         self.renderer.ensure_visible_tiles();
         self.renderer.ensure_visible_sat_tiles();
+        self.renderer.ensure_visible_bldg_tiles();
         self.renderer.render();
     }
 }
@@ -751,15 +753,6 @@ pub async fn start(host_id: String) -> Result<AegisInstance, JsValue> {
             .borrow_mut()
             .renderer
             .load_satellites(crate::orbit::Category::Stations, ISS_FIXTURE);
-    }
-
-    // Bundled Chicago downtown buildings (plan 0014 M1).
-    {
-        const CHICAGO_BUILDINGS: &[u8] = include_bytes!("../data/buildings/chicago.geojson.gz");
-        inner
-            .borrow_mut()
-            .renderer
-            .load_buildings_gz(CHICAGO_BUILDINGS);
     }
 
     // rAF loop — self-rescheduling closure.

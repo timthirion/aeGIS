@@ -12,6 +12,7 @@ pub mod camera;
 pub mod clock;
 pub mod crs;
 pub mod flyto;
+pub mod mvt;
 pub mod net;
 pub mod orbit;
 pub mod render;
@@ -95,13 +96,6 @@ pub fn run() {
     const ISS_FIXTURE: &str = include_str!("../data/orbits/iss-fixture.txt");
     renderer.load_satellites(orbit::Category::Stations, ISS_FIXTURE);
 
-    // Bundled Chicago downtown buildings (plan 0014 M1). The
-    // gzipped GeoJSON is ~516 KB; the loader gunzips + parses +
-    // builds the mesh in ~50 ms on a modern core (one-shot at
-    // startup, not per-frame).
-    const CHICAGO_BUILDINGS: &[u8] = include_bytes!("../data/buildings/chicago.geojson.gz");
-    renderer.load_buildings_gz(CHICAGO_BUILDINGS);
-
     let mut cursor_px: (f64, f64) = (0.0, 0.0);
     let mut dragging = false;
     // Monotonic clock for the fly-to animation. `Instant::now()` is
@@ -176,11 +170,13 @@ pub fn run() {
                     WindowEvent::RedrawRequested => {
                         renderer.drain_completed_fetches();
                         renderer.drain_sat_completed_fetches();
+                        renderer.drain_bldg_completed_fetches();
                         let now = startup.elapsed().as_secs_f64();
                         renderer.tick_fly_to(now);
                         renderer.tick_orbit(now);
                         renderer.ensure_visible_tiles();
                         renderer.ensure_visible_sat_tiles();
+                        renderer.ensure_visible_bldg_tiles();
                         renderer.render();
                         window.request_redraw();
                     }

@@ -22,7 +22,7 @@
 //! `wasm_bindgen_futures::spawn_local` — single-threaded but
 //! `mpsc::Sender` still works as the in-process handoff.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::mpsc;
 
 use bytemuck::{Pod, Zeroable};
@@ -86,6 +86,21 @@ const SAT_MAX_INFLIGHT: usize = 6;
 /// budgets while still draining a 130-tile sphere-cap selection
 /// in under three seconds.
 const SAT_MAX_DISPATCH_PER_FRAME: usize = 8;
+
+/// Minimum camera zoom before building tiles are fetched or rendered.
+/// OpenFreeMap's `building` layer is published at z ≤ 14.
+const BLDG_ZOOM_GATE: f64 = 14.0;
+/// Same dwell cadence as satellite tiles.
+const BLDG_DWELL_FRAMES: u32 = 30;
+const BLDG_MAX_INFLIGHT: usize = 4;
+const BLDG_MAX_DISPATCH_PER_FRAME: usize = 4;
+/// Maximum tiles held in GPU memory before FIFO eviction.
+const BLDG_TILE_CACHE_MAX: usize = 32;
+/// OFM `building` layer maxzoom — clamp tile dispatch to this.
+const BLDG_TILE_MAX_Z: u8 = 14;
+/// TileJSON endpoint for OpenFreeMap. Returns JSON with a `tiles[0]`
+/// URL template pointing to the current planet snapshot.
+const OFM_TILEJSON_URL: &str = "https://tiles.openfreemap.org/planet";
 
 // The bundled Blue Marble JPEG used to live at
 // `EARTH_JPG_BYTES = include_bytes!("../data/blue-marble/...")`
@@ -380,6 +395,7 @@ struct TileBinding {
 
 /// Fetch completion delivered to the renderer's tile-load channel.
 type TileFetchResult = (TileId, Result<DecodedTile, String>);
+type BldgTileFetchResult = (TileId, Result<crate::buildings::BuildingMesh, String>);
 
 /// Snapshot of the camera state used to detect "the user has settled
 /// here." We bucket fractional zooms (so a 0.001-zoom drift from
@@ -493,13 +509,25 @@ pub struct Renderer {
     building_pipeline: wgpu::RenderPipeline,
     building_bgl: wgpu::BindGroupLayout,
     building_uniform_buf: wgpu::Buffer,
-    /// Loaded city's GPU resources. `None` until `load_buildings`
-    /// runs.
-    building_binding: Option<BuildingBinding>,
-    /// Mirrors `vector::IdentifyIndex` shape so M3's picker can
-    /// surface building names. Built alongside the GPU binding;
-    /// empty until `load_buildings` runs.
-    buildings_identify: vector::IdentifyIndex,
+    /// Streaming building tiles from OpenFreeMap. Keyed by (z=14, x, y).
+    /// Populated by the dwell-gated `ensure_visible_bldg_tiles`.
+    bldg_tiles: HashMap<TileId, BuildingBinding>,
+    bldg_requested: HashSet<TileId>,
+    bldg_failed: HashSet<TileId>,
+    bldg_completed_tx: mpsc::Sender<BldgTileFetchResult>,
+    bldg_completed_rx: mpsc::Receiver<BldgTileFetchResult>,
+    bldg_dwell_snapshot: Option<SatDwellSnapshot>,
+    bldg_dwell_frames: u32,
+    /// Insertion-order queue for FIFO eviction when the tile count
+    /// exceeds `BLDG_TILE_CACHE_MAX`.
+    bldg_lru: VecDeque<TileId>,
+    /// URL template from the OFM TileJSON (versioned path). `None`
+    /// until the one-time TileJSON fetch completes at startup.
+    bldg_tile_url_template: Option<String>,
+    /// True once the TileJSON fetch has been dispatched.
+    bldg_tilejson_requested: bool,
+    bldg_tilejson_tx: mpsc::Sender<String>,
+    bldg_tilejson_rx: mpsc::Receiver<String>,
 
     /// Tiles that have been decoded + uploaded to the GPU.
     tiles: HashMap<TileId, TileBinding>,
@@ -910,8 +938,10 @@ impl Renderer {
         // sampler), so we reuse `tile_bgl`. Separate pipeline because
         // the WGSL is different — the BM shader does equirectangular
         // projection, not inverse Mercator.
-        let (sat_completed_tx, sat_completed_rx) = mpsc::channel();
-        let (completed_tx, completed_rx) = mpsc::channel();
+        let (sat_completed_tx, sat_completed_rx) = mpsc::channel::<TileFetchResult>();
+        let (completed_tx, completed_rx) = mpsc::channel::<TileFetchResult>();
+        let (bldg_completed_tx, bldg_completed_rx) = mpsc::channel::<BldgTileFetchResult>();
+        let (bldg_tilejson_tx, bldg_tilejson_rx) = mpsc::channel::<String>();
 
         // Initial sim clock at wall-clock now, real-time rate.
         let now_mono_s = {
@@ -979,8 +1009,18 @@ impl Renderer {
             building_pipeline,
             building_bgl,
             building_uniform_buf,
-            building_binding: None,
-            buildings_identify: vector::IdentifyIndex::default(),
+            bldg_tiles: HashMap::new(),
+            bldg_requested: HashSet::new(),
+            bldg_failed: HashSet::new(),
+            bldg_completed_tx,
+            bldg_completed_rx,
+            bldg_dwell_snapshot: None,
+            bldg_dwell_frames: 0,
+            bldg_lru: VecDeque::new(),
+            bldg_tile_url_template: None,
+            bldg_tilejson_requested: false,
+            bldg_tilejson_tx,
+            bldg_tilejson_rx,
             tiles: HashMap::new(),
             requested: HashSet::new(),
             failed: HashSet::new(),
@@ -1112,55 +1152,35 @@ impl Renderer {
         self.identify_index = index;
     }
 
-    /// Load a city's bundled building footprints (gzipped GeoJSON).
-    /// Replaces any previously loaded city. Plan 0014 M1.
-    pub fn load_buildings_gz(&mut self, gz_bytes: &[u8]) {
-        let parsed = match crate::buildings::load_buildings_geojson_gz(gz_bytes) {
-            Ok(b) => b,
-            Err(e) => {
-                log::warn!("load_buildings_gz: parse failed: {e}");
-                return;
-            }
-        };
-        let (t, l, d) = crate::buildings::height_source_counts(&parsed);
-        log::info!(
-            "load_buildings_gz: {} buildings ({} tagged, {} levels, {} default)",
-            parsed.len(),
-            t,
-            l,
-            d
-        );
-        let mesh = crate::buildings::build_mesh(&parsed);
-        let identify = crate::buildings::build_identify_index(&parsed);
-
+    /// Upload a decoded building mesh for one MVT tile to the GPU.
+    fn upload_bldg_tile(&mut self, id: TileId, mesh: crate::buildings::BuildingMesh) {
         if mesh.vertices.is_empty() || mesh.indices.is_empty() {
-            log::warn!("load_buildings_gz: empty mesh, skipping upload");
+            self.bldg_requested.remove(&id);
             return;
         }
-
         let vbo = self
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("aegis-building-vbo"),
+                label: Some("aegis-bldg-vbo"),
                 contents: bytemuck::cast_slice(&mesh.vertices),
                 usage: wgpu::BufferUsages::VERTEX,
             });
         let ibo = self
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("aegis-building-ibo"),
+                label: Some("aegis-bldg-ibo"),
                 contents: bytemuck::cast_slice(&mesh.indices),
                 usage: wgpu::BufferUsages::INDEX,
             });
         let per_building_buf = self
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("aegis-building-per-instance"),
+                label: Some("aegis-bldg-per-instance"),
                 contents: bytemuck::cast_slice(&mesh.per_building),
                 usage: wgpu::BufferUsages::STORAGE,
             });
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("aegis-building-bg"),
+            label: Some("aegis-bldg-bg"),
             layout: &self.building_bgl,
             entries: &[
                 wgpu::BindGroupEntry {
@@ -1173,21 +1193,126 @@ impl Renderer {
                 },
             ],
         });
-        log::info!(
-            "load_buildings_gz: uploaded {} verts, {} indices, max_h_world={:.5}",
-            mesh.vertices.len(),
-            mesh.indices.len(),
-            mesh.max_height_world
+        self.bldg_requested.remove(&id);
+        // Maintain FIFO insertion order for eviction
+        self.bldg_lru.retain(|&k| k != id);
+        self.bldg_lru.push_back(id);
+        self.bldg_tiles.insert(
+            id,
+            BuildingBinding {
+                vbo,
+                ibo,
+                _per_building_buf: per_building_buf,
+                bind_group,
+                index_count: mesh.indices.len() as u32,
+                max_height_world: mesh.max_height_world,
+            },
         );
-        self.building_binding = Some(BuildingBinding {
-            vbo,
-            ibo,
-            _per_building_buf: per_building_buf,
-            bind_group,
-            index_count: mesh.indices.len() as u32,
-            max_height_world: mesh.max_height_world,
-        });
-        self.buildings_identify = identify;
+        self.evict_bldg_tiles();
+        log::info!(
+            "bldg tile {id:?}: {} verts, max_h={:.5} (cache={})",
+            mesh.vertices.len(),
+            mesh.max_height_world,
+            self.bldg_tiles.len(),
+        );
+    }
+
+    /// Evict oldest building tiles until the cache is within budget.
+    fn evict_bldg_tiles(&mut self) {
+        while self.bldg_tiles.len() > BLDG_TILE_CACHE_MAX {
+            if let Some(oldest) = self.bldg_lru.pop_front() {
+                self.bldg_tiles.remove(&oldest);
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// Drain one building-tile fetch completion per call. The decode +
+    /// triangulation already ran in the async task; here we only upload
+    /// to GPU (cheap).
+    pub fn drain_bldg_completed_fetches(&mut self) {
+        // Drain the TileJSON URL if it arrived
+        if self.bldg_tile_url_template.is_none() {
+            if let Ok(url) = self.bldg_tilejson_rx.try_recv() {
+                log::info!("OFM tile URL: {url}");
+                self.bldg_tile_url_template = Some(url);
+            }
+        }
+        // Process one completed tile per frame to avoid blocking rAF
+        match self.bldg_completed_rx.try_recv() {
+            Ok((id, Ok(mesh))) => {
+                self.upload_bldg_tile(id, mesh);
+            }
+            Ok((id, Err(e))) => {
+                self.bldg_requested.remove(&id);
+                self.bldg_failed.insert(id);
+                log::warn!("bldg tile {id:?} failed: {e}");
+            }
+            Err(_) => {}
+        }
+    }
+
+    /// Dwell-gated building-tile fetch. Only fires at zoom ≥
+    /// `BLDG_ZOOM_GATE` (OFM buildings aren't useful at globe view).
+    /// Initiates the one-time TileJSON fetch the first time the camera
+    /// settles at street zoom.
+    pub fn ensure_visible_bldg_tiles(&mut self) {
+        if self.active_body != BodyId::Earth {
+            return;
+        }
+        if self.camera.zoom < BLDG_ZOOM_GATE {
+            return;
+        }
+        // Kick off the TileJSON fetch the first time we're eligible
+        if self.bldg_tile_url_template.is_none() {
+            if !self.bldg_tilejson_requested {
+                self.bldg_tilejson_requested = true;
+                self.dispatch_ofm_tilejson();
+            }
+            return;
+        }
+        let canvas = self.size();
+        let snapshot = SatDwellSnapshot::from_camera(&self.camera, canvas);
+        if Some(snapshot) != self.bldg_dwell_snapshot {
+            self.bldg_dwell_snapshot = Some(snapshot);
+            self.bldg_dwell_frames = 0;
+            self.bldg_failed.clear();
+            return;
+        }
+        if self.bldg_dwell_frames < BLDG_DWELL_FRAMES {
+            self.bldg_dwell_frames += 1;
+            return;
+        }
+        self.dispatch_visible_bldg_tiles();
+        self.bldg_dwell_frames = self.bldg_dwell_frames.saturating_add(1);
+    }
+
+    fn dispatch_visible_bldg_tiles(&mut self) {
+        let inflight = self.bldg_requested.len();
+        if inflight >= BLDG_MAX_INFLIGHT {
+            return;
+        }
+        let budget = (BLDG_MAX_INFLIGHT - inflight).min(BLDG_MAX_DISPATCH_PER_FRAME);
+        let canvas = self.size();
+        let visible =
+            self.camera
+                .visible_tiles_capped(canvas, BLDG_TILE_MAX_Z, TileProjection::WebMercator);
+        let mut dispatched = 0;
+        for id in visible {
+            if dispatched >= budget {
+                break;
+            }
+            if self.bldg_tiles.contains_key(&id)
+                || self.bldg_requested.contains(&id)
+                || self.bldg_failed.contains(&id)
+            {
+                continue;
+            }
+            self.bldg_requested.insert(id);
+            self.dispatch_bldg_tile_fetch(id);
+            dispatched += 1;
+        }
     }
 
     /// Inverse-project a canvas pixel back to a `(lon, lat)` on
@@ -1857,6 +1982,12 @@ impl Renderer {
         self.sat_attempts.clear();
         self.sat_dwell_snapshot = None;
         self.sat_dwell_frames = 0;
+        self.bldg_tiles.clear();
+        self.bldg_requested.clear();
+        self.bldg_failed.clear();
+        self.bldg_dwell_snapshot = None;
+        self.bldg_dwell_frames = 0;
+        self.bldg_lru.clear();
         // Snap the camera to the new body's home view. M4 may
         // upgrade this to a fly-to once a body-aware spherical
         // transition is fleshed out.
@@ -2569,6 +2700,98 @@ impl Renderer {
         });
     }
 
+    // -----------------------------------------------------------------
+    // OpenFreeMap building tile streaming
+    // -----------------------------------------------------------------
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn dispatch_bldg_tile_fetch(&self, id: TileId) {
+        let tx = self.bldg_completed_tx.clone();
+        let Some(template) = self.bldg_tile_url_template.clone() else {
+            return;
+        };
+        let url = body::format_tile_url(&template, id.z, id.x, id.y);
+        std::thread::spawn(move || {
+            let result: Result<crate::buildings::BuildingMesh, String> = (|| {
+                let bytes =
+                    crate::net::fetch_bytes_blocking(&url).map_err(|e| format!("fetch: {e}"))?;
+                let buildings = crate::mvt::decode_mvt_buildings(&bytes, id)
+                    .map_err(|e| format!("decode: {e}"))?;
+                Ok(crate::buildings::build_mesh(&buildings))
+            })();
+            let _ = tx.send((id, result));
+        });
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn dispatch_bldg_tile_fetch(&self, id: TileId) {
+        let tx = self.bldg_completed_tx.clone();
+        let Some(template) = self.bldg_tile_url_template.clone() else {
+            return;
+        };
+        let url = body::format_tile_url(&template, id.z, id.x, id.y);
+        wasm_bindgen_futures::spawn_local(async move {
+            let result: Result<crate::buildings::BuildingMesh, String> = async {
+                let bytes = crate::net::fetch_bytes_async(&url)
+                    .await
+                    .map_err(|e| format!("fetch: {e}"))?;
+                let buildings = crate::mvt::decode_mvt_buildings(&bytes, id)
+                    .map_err(|e| format!("decode: {e}"))?;
+                Ok(crate::buildings::build_mesh(&buildings))
+            }
+            .await;
+            let _ = tx.send((id, result));
+        });
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn dispatch_ofm_tilejson(&self) {
+        let tx = self.bldg_tilejson_tx.clone();
+        std::thread::spawn(move || {
+            let result = (|| -> Option<String> {
+                let bytes = crate::net::fetch_bytes_blocking(OFM_TILEJSON_URL).ok()?;
+                let json: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+                json.get("tiles")?
+                    .as_array()?
+                    .first()?
+                    .as_str()
+                    .map(String::from)
+            })();
+            if let Some(url) = result {
+                let _ = tx.send(url);
+            } else {
+                log::warn!("OFM TileJSON: failed to extract tiles[0] URL");
+            }
+        });
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn dispatch_ofm_tilejson(&self) {
+        let tx = self.bldg_tilejson_tx.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            let result = async {
+                let bytes = crate::net::fetch_bytes_async(OFM_TILEJSON_URL)
+                    .await
+                    .map_err(|e| format!("{e}"))?;
+                let json: serde_json::Value =
+                    serde_json::from_slice(&bytes).map_err(|e| format!("{e}"))?;
+                json.get("tiles")
+                    .and_then(|t| t.as_array())
+                    .and_then(|a| a.first())
+                    .and_then(|u| u.as_str())
+                    .map(String::from)
+                    .ok_or_else(|| "tiles[0] not found in TileJSON".to_string())
+            }
+            .await;
+            match result {
+                Ok(url) => {
+                    let _ = tx.send(url);
+                }
+                Err(e) => log::warn!("OFM TileJSON fetch failed: {e}"),
+            }
+        });
+    }
+
     /// Draw one frame.
     ///
     /// Single-projection 3D scene: every vertex (tile + vector)
@@ -2586,10 +2809,11 @@ impl Renderer {
         // buildings loaded we pass 0.0 and the call falls through
         // to the existing `altitude * 0.1` near.
         let min_near_floor = self
-            .building_binding
-            .as_ref()
-            .map(|b| b.max_height_world * 0.5)
-            .unwrap_or(0.0);
+            .bldg_tiles
+            .values()
+            .map(|b| b.max_height_world)
+            .fold(0.0_f32, f32::max)
+            * 0.5;
         let view_proj = self
             .camera
             .view_projection_matrix_with_floor(canvas, min_near_floor);
@@ -3059,17 +3283,15 @@ impl Renderer {
             pass.set_bind_group(0, &self.south_cap_bind_group, &[]);
             pass.draw(0..CAP_DRAW_VERTS, 0..1);
 
-            // Extruded buildings (plan 0014 M1). Earth-only;
-            // gated on zoom > 14 so we don't burn fragment work
-            // when buildings are invisible anyway. The depth
-            // attachment on this pass keeps building-vs-building
-            // occlusion correct in the single indexed draw call.
-            if let Some(binding) = &self.building_binding {
-                if self.active_body == BodyId::Earth
-                    && self.active_body_ref().buildings.is_some()
-                    && self.camera.zoom > 14.0
-                {
-                    pass.set_pipeline(&self.building_pipeline);
+            // Extruded buildings — streamed from OpenFreeMap. Earth-only,
+            // gated on zoom ≥ BLDG_ZOOM_GATE. One indexed draw per tile.
+            if self.active_body == BodyId::Earth
+                && self.active_body_ref().buildings.is_some()
+                && self.camera.zoom >= BLDG_ZOOM_GATE
+                && !self.bldg_tiles.is_empty()
+            {
+                pass.set_pipeline(&self.building_pipeline);
+                for binding in self.bldg_tiles.values() {
                     pass.set_bind_group(0, &binding.bind_group, &[]);
                     pass.set_vertex_buffer(0, binding.vbo.slice(..));
                     pass.set_index_buffer(binding.ibo.slice(..), wgpu::IndexFormat::Uint32);

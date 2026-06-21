@@ -1,17 +1,9 @@
-//! 3D-building data + mesh prep for plan 0014.
+//! 3D-building mesh prep for plan 0014 (streaming MVT path, plan 0015+).
 //!
-//! Loads a trimmed GeoJSON FeatureCollection of OSM building footprints
-//! (see `data/buildings/README.md`), assigns each building a height in
-//! metres from its OSM tags, projects the footprint to normalised-
-//! Mercator world coords, and builds:
-//!
-//! 1. a `Vec<Building>` — the source-of-truth per-building data
-//!    (footprint, height, name, OSM way id, height-source flag),
-//! 2. a `BuildingMesh` — packed VBO + IBO + per-building storage
-//!    buffer the renderer uploads in a single pass,
-//! 3. an [`IdentifyIndex`](crate::vector::IdentifyIndex) — the same
-//!    polygon hit-test plumbing the country-outline picker uses,
-//!    so a click at street zoom can answer "which building is this."
+//! Callers supply a `Vec<Building>` — either decoded from MVT tiles
+//! (see `crate::mvt`) or from any other source — and call
+//! [`build_mesh`] to produce the packed VBO + IBO + per-building
+//! storage buffer the renderer uploads in a single pass.
 //!
 //! The vertex format encodes a building as: per-vertex `(world_xy,
 //! height_world, building_idx, face_kind, normal)` + per-building
@@ -20,9 +12,6 @@
 //! by `height_world`. See `src/shaders/building.wgsl`.
 
 use bytemuck::{Pod, Zeroable};
-use geojson::{GeoJson, Value};
-
-use crate::{crs, vector};
 
 /// Default building height in metres when no OSM tag is present.
 /// Small enough that an untagged skyscraper is visibly suspicious
@@ -107,246 +96,6 @@ pub struct BuildingVertex {
 pub struct BuildingPerInstance {
     pub centroid_normal: [f32; 3],
     pub _pad: f32,
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum LoadError {
-    #[error("parse: {0}")]
-    Parse(#[from] Box<geojson::Error>),
-    #[error("io: {0}")]
-    Io(#[from] std::io::Error),
-}
-
-impl From<geojson::Error> for LoadError {
-    fn from(e: geojson::Error) -> Self {
-        LoadError::Parse(Box::new(e))
-    }
-}
-
-/// Parse a gzipped GeoJSON FeatureCollection of building footprints.
-/// Convenience wrapper around `load_buildings_geojson` for the
-/// bundled `chicago.geojson.gz` shape — gunzips first, then parses.
-pub fn load_buildings_geojson_gz(gz_bytes: &[u8]) -> Result<Vec<Building>, LoadError> {
-    use std::io::Read;
-    let mut decoder = flate2::read::GzDecoder::new(gz_bytes);
-    let mut buf = String::new();
-    decoder.read_to_string(&mut buf)?;
-    load_buildings_geojson(&buf)
-}
-
-/// Parse a GeoJSON FeatureCollection of building footprints. Each
-/// `Polygon` (or `MultiPolygon` — the outer rings get split into
-/// separate `Building`s sharing one OSM id) becomes one `Building`
-/// with its height resolved per the `Tagged → Levels → Default`
-/// priority chain. Features without polygon geometries are silently
-/// skipped.
-pub fn load_buildings_geojson(source: &str) -> Result<Vec<Building>, LoadError> {
-    let parsed: GeoJson = source.parse()?;
-    let mut out = Vec::new();
-    if let GeoJson::FeatureCollection(fc) = parsed {
-        for f in &fc.features {
-            ingest_feature(f, &mut out);
-        }
-    }
-    Ok(out)
-}
-
-fn ingest_feature(f: &geojson::Feature, out: &mut Vec<Building>) {
-    let Some(geom) = &f.geometry else { return };
-    let props = f.properties.as_ref();
-    let osm_way_id = props
-        .and_then(|p| p.get("osm_way_id").and_then(|v| v.as_u64()))
-        .unwrap_or(0);
-    let name = props
-        .and_then(|p| p.get("name").and_then(|v| v.as_str()))
-        .filter(|s| !s.is_empty())
-        .map(String::from);
-    let (height_m, height_source) = resolve_height(props);
-
-    match &geom.value {
-        Value::Polygon(rings) => {
-            if let Some(b) =
-                polygon_to_building(rings, osm_way_id, name.clone(), height_m, height_source)
-            {
-                out.push(b);
-            }
-        }
-        Value::MultiPolygon(polys) => {
-            for rings in polys {
-                if let Some(b) =
-                    polygon_to_building(rings, osm_way_id, name.clone(), height_m, height_source)
-                {
-                    out.push(b);
-                }
-            }
-        }
-        _ => {}
-    }
-}
-
-fn resolve_height(props: Option<&geojson::JsonObject>) -> (f32, HeightSource) {
-    let Some(p) = props else {
-        return (DEFAULT_HEIGHT_M, HeightSource::Default);
-    };
-    if let Some(s) = p.get("building:height").and_then(|v| v.as_str()) {
-        if let Some(h) = parse_height_metres(s) {
-            return (h, HeightSource::Tagged);
-        }
-    }
-    if let Some(n) = p.get("building:height").and_then(|v| v.as_f64()) {
-        return (n as f32, HeightSource::Tagged);
-    }
-    if let Some(s) = p.get("building:levels").and_then(|v| v.as_str()) {
-        if let Ok(n) = s.trim().parse::<f32>() {
-            return (n * METRES_PER_LEVEL, HeightSource::Levels);
-        }
-    }
-    if let Some(n) = p.get("building:levels").and_then(|v| v.as_f64()) {
-        return (n as f32 * METRES_PER_LEVEL, HeightSource::Levels);
-    }
-    (DEFAULT_HEIGHT_M, HeightSource::Default)
-}
-
-/// Parse a height string the way OSM serves it — bare number,
-/// number with trailing `m`, or number with `meters`/`metres` —
-/// into metres. Returns `None` if the string isn't a clean number
-/// at the front.
-fn parse_height_metres(s: &str) -> Option<f32> {
-    let s = s.trim();
-    let digits: String = s
-        .chars()
-        .take_while(|c| c.is_ascii_digit() || *c == '.' || *c == '-')
-        .collect();
-    digits.parse::<f32>().ok()
-}
-
-fn polygon_to_building(
-    rings: &[Vec<Vec<f64>>],
-    osm_way_id: u64,
-    name: Option<String>,
-    height_m: f32,
-    height_source: HeightSource,
-) -> Option<Building> {
-    if rings.is_empty() || rings[0].len() < 3 {
-        return None;
-    }
-    let outer_lonlat: Vec<[f64; 2]> = rings[0]
-        .iter()
-        .filter_map(|c| {
-            if c.len() >= 2 {
-                Some([c[0], c[1]])
-            } else {
-                None
-            }
-        })
-        .collect();
-    if outer_lonlat.len() < 3 {
-        return None;
-    }
-    // Drop the duplicate closing vertex if GeoJSON serves a closed
-    // ring; the triangulator + wall emitter both want a non-closed
-    // ring and add the closing edge themselves.
-    let outer_lonlat = strip_closing_vertex(outer_lonlat);
-    if outer_lonlat.len() < 3 {
-        return None;
-    }
-
-    let project = |c: [f64; 2]| {
-        let (wx, wy) = crs::lonlat_to_world(c[0], c[1]);
-        [wx as f32, wy as f32]
-    };
-    let mut footprint_world: Vec<[f32; 2]> = outer_lonlat.iter().copied().map(project).collect();
-    if signed_area(&footprint_world) < 0.0 {
-        footprint_world.reverse();
-    }
-
-    let mut holes_world: Vec<Vec<[f32; 2]>> = Vec::new();
-    for hole in rings.iter().skip(1) {
-        let hole_lonlat: Vec<[f64; 2]> = hole
-            .iter()
-            .filter_map(|c| {
-                if c.len() >= 2 {
-                    Some([c[0], c[1]])
-                } else {
-                    None
-                }
-            })
-            .collect();
-        if hole_lonlat.len() < 3 {
-            continue;
-        }
-        let hole_lonlat = strip_closing_vertex(hole_lonlat);
-        let mut hole_world: Vec<[f32; 2]> = hole_lonlat.iter().copied().map(project).collect();
-        if signed_area(&hole_world) > 0.0 {
-            hole_world.reverse();
-        }
-        holes_world.push(hole_world);
-    }
-
-    let (centroid_lon, centroid_lat) = centroid_lonlat(&outer_lonlat);
-    let bbox_lonlat = bbox_of(&outer_lonlat);
-
-    Some(Building {
-        osm_way_id,
-        name,
-        height_m,
-        height_source,
-        footprint_world,
-        holes_world,
-        centroid_lonlat: (centroid_lon, centroid_lat),
-        bbox_lonlat,
-    })
-}
-
-fn strip_closing_vertex(ring: Vec<[f64; 2]>) -> Vec<[f64; 2]> {
-    if ring.len() >= 2
-        && (ring[0][0] - ring[ring.len() - 1][0]).abs() < 1e-12
-        && (ring[0][1] - ring[ring.len() - 1][1]).abs() < 1e-12
-    {
-        let mut r = ring;
-        r.pop();
-        r
-    } else {
-        ring
-    }
-}
-
-fn signed_area(ring: &[[f32; 2]]) -> f32 {
-    let mut a = 0.0_f32;
-    let n = ring.len();
-    if n < 3 {
-        return 0.0;
-    }
-    for i in 0..n {
-        let j = (i + 1) % n;
-        a += ring[i][0] * ring[j][1] - ring[j][0] * ring[i][1];
-    }
-    a * 0.5
-}
-
-fn centroid_lonlat(ring: &[[f64; 2]]) -> (f64, f64) {
-    let n = ring.len() as f64;
-    let mut lon = 0.0;
-    let mut lat = 0.0;
-    for c in ring {
-        lon += c[0];
-        lat += c[1];
-    }
-    (lon / n, lat / n)
-}
-
-fn bbox_of(ring: &[[f64; 2]]) -> [f64; 4] {
-    let mut min_lon = f64::INFINITY;
-    let mut min_lat = f64::INFINITY;
-    let mut max_lon = f64::NEG_INFINITY;
-    let mut max_lat = f64::NEG_INFINITY;
-    for c in ring {
-        min_lon = min_lon.min(c[0]);
-        max_lon = max_lon.max(c[0]);
-        min_lat = min_lat.min(c[1]);
-        max_lat = max_lat.max(c[1]);
-    }
-    [min_lon, min_lat, max_lon, max_lat]
 }
 
 /// Build the GPU mesh (one indexed-draw VBO + storage buffer of
@@ -559,96 +308,21 @@ fn lonlat_to_sphere(lon_deg: f64, lat_deg: f64) -> [f64; 3] {
     [lat.cos() * lon.sin(), lat.sin(), lat.cos() * lon.cos()]
 }
 
-/// Build the `IdentifyIndex` that the renderer's click handler
-/// uses to answer "which building was clicked." Reuses the same
-/// polygon-pick plumbing as the country-outline overlay.
-pub fn build_identify_index(buildings: &[Building]) -> vector::IdentifyIndex {
-    let features: Vec<vector::IdentifyFeature> = buildings
-        .iter()
-        .map(|b| {
-            let name = b
-                .name
-                .clone()
-                .unwrap_or_else(|| format!("Building #{}", b.osm_way_id));
-            // IdentifyFeature wants the polygon in (lon, lat).
-            // Reconstruct from the centroid-bbox is wrong — we'd
-            // lose the actual footprint. Use the original
-            // lon/lat ring stored on the Building.
-            let outer = footprint_world_to_lonlat(&b.footprint_world);
-            let mut polygons: Vec<Vec<Vec<[f64; 2]>>> = Vec::with_capacity(1);
-            let mut rings: Vec<Vec<[f64; 2]>> = vec![outer];
-            for hole in &b.holes_world {
-                rings.push(footprint_world_to_lonlat(hole));
-            }
-            polygons.push(rings);
-            vector::IdentifyFeature {
-                name,
-                bbox: b.bbox_lonlat,
-                polygons,
-            }
-        })
-        .collect();
-    vector::IdentifyIndex { features }
-}
-
-fn footprint_world_to_lonlat(ring: &[[f32; 2]]) -> Vec<[f64; 2]> {
-    ring.iter()
-        .map(|v| {
-            let (lon, lat) = crs::world_to_lonlat(v[0] as f64, v[1] as f64);
-            [lon, lat]
-        })
-        .collect()
-}
-
-/// Counts of buildings by height-source, for diagnostic logging
-/// + the M0 coverage test. `(tagged, levels, default)`.
-pub fn height_source_counts(buildings: &[Building]) -> (usize, usize, usize) {
-    let mut t = 0;
-    let mut l = 0;
-    let mut d = 0;
-    for b in buildings {
-        match b.height_source {
-            HeightSource::Tagged => t += 1,
-            HeightSource::Levels => l += 1,
-            HeightSource::Default => d += 1,
-        }
-    }
-    (t, l, d)
-}
-
-/// Total footprint area in normalised-Mercator units squared,
-/// summed across the buildings whose `height_source` is in
-/// `selected`. Used by the M0 coverage assertion (`tagged + levels`
-/// must cover ≥ X% of total footprint area in the Chicago bbox).
-pub fn footprint_area_by_source(buildings: &[Building], selected: &[HeightSource]) -> f32 {
-    let mut total = 0.0_f32;
-    for b in buildings {
-        if !selected.contains(&b.height_source) {
-            continue;
-        }
-        total += signed_area(&b.footprint_world).abs();
-    }
-    total
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn parse_height_metres_handles_bare_number() {
-        assert_eq!(parse_height_metres("346"), Some(346.0));
-    }
-
-    #[test]
-    fn parse_height_metres_handles_trailing_m() {
-        assert_eq!(parse_height_metres("346 m"), Some(346.0));
-        assert_eq!(parse_height_metres("346m"), Some(346.0));
-    }
-
-    #[test]
-    fn parse_height_metres_handles_decimal() {
-        assert_eq!(parse_height_metres("12.5"), Some(12.5));
+    fn signed_area(ring: &[[f32; 2]]) -> f32 {
+        let n = ring.len();
+        if n < 3 {
+            return 0.0;
+        }
+        let mut a = 0.0_f32;
+        for i in 0..n {
+            let j = (i + 1) % n;
+            a += ring[i][0] * ring[j][1] - ring[j][0] * ring[i][1];
+        }
+        a * 0.5
     }
 
     #[test]
@@ -695,75 +369,27 @@ mod tests {
     }
 
     #[test]
-    fn load_buildings_geojson_gz_unpacks_bundled_chicago() {
-        // Smoke test: the bundled snapshot loads, has > 1000
-        // features, and Aon Center / Sears Tower are in the set.
-        // Skip-when-missing so this still passes if someone clones
-        // the repo without LFS-style data hooks.
-        const BYTES: &[u8] = include_bytes!("../data/buildings/chicago.geojson.gz");
-        let buildings = load_buildings_geojson_gz(BYTES).expect("gunzip + parse");
-        assert!(buildings.len() > 1000, "got {} buildings", buildings.len());
-        // The chicago snapshot is dense enough that at least a
-        // few hundred have tagged heights or levels — exact count
-        // is volatile but the order of magnitude isn't.
-        let (t, l, d) = height_source_counts(&buildings);
-        assert!(
-            t + l >= 200,
-            "expected ≥200 tagged+levels buildings, got tagged={t} levels={l} default={d}"
-        );
-    }
-
-    #[test]
-    fn coverage_threshold_meets_v1_bar() {
-        const BYTES: &[u8] = include_bytes!("../data/buildings/chicago.geojson.gz");
-        let buildings = load_buildings_geojson_gz(BYTES).expect("gunzip + parse");
-        let total = footprint_area_by_source(
-            &buildings,
-            &[
-                HeightSource::Tagged,
-                HeightSource::Levels,
-                HeightSource::Default,
-            ],
-        );
-        let covered =
-            footprint_area_by_source(&buildings, &[HeightSource::Tagged, HeightSource::Levels]);
-        let ratio = covered / total.max(1e-12);
-        // The plan target is ≥50% by footprint area. If this
-        // drops below the threshold the snapshot regressed; re-
-        // snap the data or lower the bar with a justification.
-        assert!(
-            ratio >= 0.40,
-            "tagged+levels covers {ratio:.2} of footprint area, threshold 0.40"
-        );
-    }
-
-    #[test]
     fn build_mesh_produces_geometry_and_max_height() {
-        const BYTES: &[u8] = include_bytes!("../data/buildings/chicago.geojson.gz");
-        let buildings = load_buildings_geojson_gz(BYTES).expect("gunzip + parse");
-        let mesh = build_mesh(&buildings);
-        assert!(!mesh.vertices.is_empty(), "expected verts");
-        assert!(!mesh.indices.is_empty(), "expected indices");
-        assert!(
-            mesh.indices.len().is_multiple_of(3),
-            "indices not a multiple of 3: {}",
-            mesh.indices.len()
-        );
-        // The tallest building's h_world should be at least
-        // Aon Center's (5.4e-5). Sears Tower might be in the
-        // bbox depending on bounds.
+        // Synthetic 10 m × 10 m building in Chicago (world coords ≈ tile 14).
+        let outer: Vec<[f32; 2]> = vec![[0.26, 0.38], [0.261, 0.38], [0.261, 0.381], [0.26, 0.381]];
+        let b = Building {
+            osm_way_id: 1,
+            name: None,
+            height_m: 442.0, // Sears Tower
+            height_source: HeightSource::Tagged,
+            footprint_world: outer,
+            holes_world: vec![],
+            centroid_lonlat: (-87.63, 41.88),
+            bbox_lonlat: [-87.64, 41.87, -87.62, 41.89],
+        };
+        let mesh = build_mesh(&[b]);
+        assert!(!mesh.vertices.is_empty());
+        assert!(!mesh.indices.is_empty());
+        assert!(mesh.indices.len().is_multiple_of(3));
         assert!(
             mesh.max_height_world > 4e-5,
-            "max_height_world={} (expected at least 4e-5)",
+            "got {}",
             mesh.max_height_world
         );
-    }
-
-    #[test]
-    fn build_identify_index_contains_polygon_for_each_building() {
-        const BYTES: &[u8] = include_bytes!("../data/buildings/chicago.geojson.gz");
-        let buildings = load_buildings_geojson_gz(BYTES).expect("gunzip + parse");
-        let idx = build_identify_index(&buildings);
-        assert_eq!(idx.features.len(), buildings.len());
     }
 }
