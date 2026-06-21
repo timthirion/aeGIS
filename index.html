@@ -586,7 +586,11 @@
     #aegis-time-slider {
       position: absolute;
       left: 50%;
-      bottom: 16px;
+      /* Raised above the bottom-left chrome row (Map/Satellite +
+         Borders + Tilt) so the two pills don't overlap at narrower
+         desktop widths where the centered time slider stretches
+         into the left row's footprint. */
+      bottom: 64px;
       transform: translateX(-50%);
       z-index: 10;
       display: none;
