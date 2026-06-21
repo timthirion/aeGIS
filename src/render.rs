@@ -662,6 +662,10 @@ pub struct Renderer {
     /// the (Earth-shaped) outlines regardless of this flag. Default
     /// true; toggle lives in the bottom-left "Borders" pill.
     borders_visible: bool,
+    /// User-controlled 3D-building visibility. When false, building
+    /// tiles are not dispatched and the draw call is skipped.
+    /// Default true; toggle lives in the bottom-left "Buildings" pill.
+    bldg_visible: bool,
     /// NORAD ids the user has explicitly hidden via the per-row
     /// checkbox in the satellite-list panel. Hidden satellites
     /// skip both the dot draw and any trail draw. The set is
@@ -1081,6 +1085,7 @@ impl Renderer {
             hovered_satellite: None,
             trails_enabled: true,
             borders_visible: true,
+            bldg_visible: true,
             hidden_satellites: HashSet::new(),
             orbit_frame_positions: Vec::new(),
         }
@@ -1259,6 +1264,9 @@ impl Renderer {
     /// settles at street zoom.
     pub fn ensure_visible_bldg_tiles(&mut self) {
         if self.active_body != BodyId::Earth {
+            return;
+        }
+        if !self.bldg_visible {
             return;
         }
         if self.camera.zoom < BLDG_ZOOM_GATE {
@@ -2251,6 +2259,14 @@ impl Renderer {
     /// Turn the country-outline vector overlay on or off.
     pub fn set_borders_visible(&mut self, visible: bool) {
         self.borders_visible = visible;
+    }
+
+    pub fn bldg_visible(&self) -> bool {
+        self.bldg_visible
+    }
+
+    pub fn set_bldg_visible(&mut self, visible: bool) {
+        self.bldg_visible = visible;
     }
 
     /// Show or hide a single satellite by NORAD id. Hidden
@@ -3288,6 +3304,7 @@ impl Renderer {
             if self.active_body == BodyId::Earth
                 && self.active_body_ref().buildings.is_some()
                 && self.camera.zoom >= BLDG_ZOOM_GATE
+                && self.bldg_visible
                 && !self.bldg_tiles.is_empty()
             {
                 pass.set_pipeline(&self.building_pipeline);

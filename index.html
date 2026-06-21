@@ -125,7 +125,8 @@
       align-items: center;
     }
     #basemap-toggle,
-    #border-toggle {
+    #border-toggle,
+    #buildings-toggle {
       display: inline-flex;
       padding: 3px;
       background: rgba(11, 14, 18, 0.78);
@@ -138,7 +139,8 @@
       user-select: none;
     }
     #basemap-toggle button,
-    #border-toggle button {
+    #border-toggle button,
+    #buildings-toggle button {
       appearance: none;
       border: none;
       background: transparent;
@@ -151,15 +153,17 @@
       transition: background-color 120ms, color 120ms;
     }
     #basemap-toggle button:hover,
-    #border-toggle button:hover { color: #e6e8eb; }
+    #border-toggle button:hover,
+    #buildings-toggle button:hover { color: #e6e8eb; }
     #basemap-toggle button[aria-pressed="true"],
-    #border-toggle button[aria-pressed="true"] {
+    #border-toggle button[aria-pressed="true"],
+    #buildings-toggle button[aria-pressed="true"] {
       background: #2a3340;
       color: #e6e8eb;
     }
-    /* Borders only make sense on Earth — same data-body gate the
-       country outlines themselves use. */
+    /* Borders and buildings only make sense on Earth. */
     body:not([data-body="earth"]) #border-toggle { display: none; }
+    body:not([data-body="earth"]) #buildings-toggle { display: none; }
 
     /* Camera pitch slider — same chrome palette as the toggle
        pills, but a horizontal slider instead of a button. Lives
@@ -680,7 +684,8 @@
         gap: 6px;
       }
       #basemap-toggle button,
-      #border-toggle button {
+      #border-toggle button,
+      #buildings-toggle button {
         padding: 5px 9px;
         font-size: 11px;
       }
@@ -754,6 +759,14 @@
           aria-pressed="true"
           title="Toggle country outlines"
         >Borders</button>
+      </div>
+      <div id="buildings-toggle" role="group" aria-label="3D buildings">
+        <button
+          type="button"
+          id="buildings-toggle-btn"
+          aria-pressed="true"
+          title="Toggle 3D buildings"
+        >Buildings</button>
       </div>
       <div id="pitch-control" role="group" aria-label="Camera pitch">
         <label for="pitch-range">Tilt</label>
@@ -888,6 +901,7 @@
         aegis = await start("aegis-host");
         wireBasemapToggle(aegis);
         wireBorderToggle(aegis);
+        wireBuildingsToggle(aegis);
         wirePitchSlider(aegis);
         wireBodySwitcher(aegis);
         wireOrbitCategories(aegis);
@@ -1418,6 +1432,17 @@
       btn.addEventListener("click", () => {
         const next = btn.getAttribute("aria-pressed") !== "true";
         instance.setBordersVisible(next);
+        btn.setAttribute("aria-pressed", next ? "true" : "false");
+      });
+    }
+
+    function wireBuildingsToggle(instance) {
+      const btn = document.getElementById("buildings-toggle-btn");
+      if (!btn) return;
+      btn.setAttribute("aria-pressed", instance.buildingsVisible() ? "true" : "false");
+      btn.addEventListener("click", () => {
+        const next = btn.getAttribute("aria-pressed") !== "true";
+        instance.setBuildingsVisible(next);
         btn.setAttribute("aria-pressed", next ? "true" : "false");
       });
     }

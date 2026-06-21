@@ -351,6 +351,18 @@ impl AegisInstance {
         self.inner.borrow().renderer.borders_visible()
     }
 
+    /// Toggle 3D building extrusions on or off.
+    #[wasm_bindgen(js_name = setBuildingsVisible)]
+    pub fn set_buildings_visible(&self, visible: bool) {
+        self.inner.borrow_mut().renderer.set_bldg_visible(visible);
+    }
+
+    /// Whether 3D buildings are currently enabled.
+    #[wasm_bindgen(js_name = buildingsVisible)]
+    pub fn buildings_visible(&self) -> bool {
+        self.inner.borrow().renderer.bldg_visible()
+    }
+
     /// Inverse-project canvas pixel `(x, y)` (CSS pixels, top-left
     /// origin) back to a sphere lon/lat, return the country name
     /// at that hit, and as a side effect set the feature as the
